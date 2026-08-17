@@ -225,10 +225,13 @@ points, counts, object shows, and run events cannot expose a foreign node.
 Configuration supports multiple persisted destinations and one explicit
 default; jobs retain destination IDs across restart.
 
-The first real integration test intentionally uses a fresh development
-database. `CREATE TABLE IF NOT EXISTS` creates schema but does not migrate it.
-Phase 3D must introduce `schema_version` and ordered transactional migrations
-before RPM upgrades or reuse of older databases are supported.
+Phase 3D.1 centralizes SQLite format ownership in a versioned schema manager.
+Fresh databases are created directly at `CURRENT_SCHEMA_VERSION`; known current
+unversioned databases are adopted without rebuilding operational tables, and
+the immediately preceding Phase 3C artifact layout is migrated transactionally.
+Unknown, malformed, damaged, or newer schemas fail closed. See
+[`database-schema.md`](database-schema.md). RPM packaging and upgrade policy are
+still not implemented.
 
 StorageDestination is Node-owned local operational configuration. Names and the
 single default are scoped by `node_id`; job creation and runtime routing enforce

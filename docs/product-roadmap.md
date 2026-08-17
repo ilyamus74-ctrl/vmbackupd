@@ -53,6 +53,8 @@ will consume equivalent API operations rather than invoke the console client.
 - Phase 3B.1: first-real-backup safety hardening.
 - Phase 3C: long-running daemon process, UNIX-domain local API, `vmbackupctl`,
   and configuration model.
+- Phase 3D.1: SQLite schema versioning, safe known-unversioned adoption, and
+  ordered transactional migration infrastructure.
 - Integration: first real FULL backup on the development laptop.
 - Phase 3D: RPM packaging, systemd service, filesystem/system-user ownership,
   and DNF installation, update, and removal.

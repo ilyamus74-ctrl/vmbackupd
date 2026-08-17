@@ -16,6 +16,7 @@ from .models import (
     new_id, utcnow,
 )
 from .state_machine import InvalidStateTransition, validate_transition
+from .schema import ensure_current_schema, get_schema_version
 
 
 class DomainInvariantError(ValueError):
@@ -30,150 +31,20 @@ class SQLiteRepository:
         self.connection.execute("PRAGMA busy_timeout = 5000")
         if str(database) != ":memory:":
             self.connection.execute("PRAGMA journal_mode = WAL")
-        self._create_schema()
+        try:
+            self.schema_version = ensure_current_schema(self.connection)
+        except Exception:
+            self.connection.close()
+            raise
+
+    def get_database_schema_version(self) -> int:
+        version = get_schema_version(self.connection)
+        if version is None:
+            raise RuntimeError("repository database is unexpectedly unversioned")
+        return version
 
     def close(self) -> None:
         self.connection.close()
-
-    def _create_schema(self) -> None:
-        self.connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS nodes (
-                id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS vms (
-                id TEXT PRIMARY KEY, node_id TEXT NOT NULL REFERENCES nodes(id),
-                name TEXT NOT NULL, external_id TEXT NOT NULL, libvirt_domain_uuid TEXT,
-                created_at TEXT NOT NULL,
-                UNIQUE(node_id, external_id)
-            );
-            CREATE TABLE IF NOT EXISTS backup_jobs (
-                id TEXT PRIMARY KEY, vm_id TEXT NOT NULL REFERENCES vms(id),
-                name TEXT NOT NULL, storage_destination_id TEXT REFERENCES storage_destinations(id),
-                enabled INTEGER NOT NULL,
-                max_incrementals_per_chain INTEGER NOT NULL CHECK(max_incrementals_per_chain >= 0),
-                restore_points_to_retain INTEGER NOT NULL CHECK(restore_points_to_retain >= 0),
-                minimum_full_chains INTEGER NOT NULL CHECK(minimum_full_chains >= 1),
-                interval_seconds INTEGER NOT NULL CHECK(interval_seconds >= 60),
-                misfire_grace_seconds INTEGER NOT NULL CHECK(misfire_grace_seconds >= 0),
-                catch_up_mode TEXT NOT NULL CHECK(catch_up_mode = 'RUN_ONCE'),
-                overlap_policy TEXT NOT NULL CHECK(overlap_policy = 'SKIP_IF_BUSY'),
-                next_run_at TEXT,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS storage_destinations (
-                id TEXT PRIMARY KEY, node_id TEXT NOT NULL REFERENCES nodes(id),
-                name TEXT NOT NULL,
-                control_root TEXT NOT NULL, backup_data_root TEXT NOT NULL,
-                backup_data_mode INTEGER NOT NULL,
-                backup_data_uid INTEGER, backup_data_gid INTEGER,
-                minimum_free_bytes INTEGER NOT NULL,
-                minimum_free_percent REAL NOT NULL,
-                is_default INTEGER NOT NULL, created_at TEXT NOT NULL,
-                UNIQUE(node_id, name)
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS one_default_storage_destination
-                ON storage_destinations(node_id) WHERE is_default = 1;
-            CREATE TABLE IF NOT EXISTS backup_chains (
-                id TEXT PRIMARY KEY, vm_id TEXT NOT NULL REFERENCES vms(id),
-                status TEXT NOT NULL CHECK(status IN ('ACTIVE', 'CLOSED')),
-                created_at TEXT NOT NULL, closed_at TEXT
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS one_active_chain_per_vm
-                ON backup_chains(vm_id) WHERE status = 'ACTIVE';
-            CREATE UNIQUE INDEX IF NOT EXISTS one_libvirt_uuid_per_node
-                ON vms(node_id, libvirt_domain_uuid) WHERE libvirt_domain_uuid IS NOT NULL;
-            CREATE TABLE IF NOT EXISTS job_runs (
-                id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES backup_jobs(id),
-                state TEXT NOT NULL, planned_kind TEXT,
-                planned_chain_id TEXT, planned_sequence INTEGER,
-                parent_restore_point_id TEXT REFERENCES restore_points(id),
-                error TEXT, cleanup_error TEXT, cleanup_attempts INTEGER NOT NULL DEFAULT 0,
-                scheduled_for TEXT, is_catch_up INTEGER NOT NULL DEFAULT 0,
-                missed_schedule_slots INTEGER NOT NULL DEFAULT 0,
-                recovery_required INTEGER NOT NULL DEFAULT 0, recovery_reason TEXT,
-                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                CHECK((planned_kind IS NULL AND planned_chain_id IS NULL AND
-                       planned_sequence IS NULL AND parent_restore_point_id IS NULL) OR
-                      (planned_kind IS NOT NULL AND planned_chain_id IS NOT NULL AND
-                       planned_sequence IS NOT NULL)),
-                UNIQUE(job_id, scheduled_for)
-            );
-            CREATE TABLE IF NOT EXISTS restore_points (
-                id TEXT PRIMARY KEY, chain_id TEXT NOT NULL REFERENCES backup_chains(id),
-                job_run_id TEXT NOT NULL UNIQUE REFERENCES job_runs(id), kind TEXT NOT NULL,
-                sequence INTEGER NOT NULL CHECK(sequence >= 0),
-                backup_object_id TEXT,
-                parent_restore_point_id TEXT REFERENCES restore_points(id),
-                libvirt_checkpoint_name TEXT,
-                status TEXT NOT NULL CHECK(status = 'AVAILABLE'), created_at TEXT NOT NULL,
-                UNIQUE(chain_id, sequence)
-            );
-            CREATE TABLE IF NOT EXISTS backup_artifacts (
-                id TEXT PRIMARY KEY, job_run_id TEXT NOT NULL REFERENCES job_runs(id),
-                restore_point_id TEXT REFERENCES restore_points(id),
-                kind TEXT NOT NULL CHECK(kind IN ('DISK', 'DOMAIN_XML', 'MANIFEST')),
-                disk_target TEXT, object_id TEXT NOT NULL UNIQUE, format TEXT,
-                size_bytes INTEGER CHECK(size_bytes IS NULL OR size_bytes >= 0),
-                checksum_algorithm TEXT, checksum TEXT,
-                planned_capacity INTEGER CHECK(planned_capacity IS NULL OR planned_capacity > 0),
-                prepared_device INTEGER, prepared_inode INTEGER,
-                state TEXT NOT NULL CHECK(state IN
-                    ('PLANNED', 'WRITING', 'COMPLETE', 'VERIFIED', 'PUBLISHED')),
-                created_at TEXT NOT NULL, verified_at TEXT,
-                CHECK((kind = 'DISK' AND disk_target IS NOT NULL) OR
-                      (kind != 'DISK' AND disk_target IS NULL)),
-                UNIQUE(job_run_id, kind, disk_target)
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS one_nondisk_artifact_kind_per_run
-                ON backup_artifacts(job_run_id, kind) WHERE kind != 'DISK';
-            CREATE UNIQUE INDEX IF NOT EXISTS one_disk_artifact_target_per_run
-                ON backup_artifacts(job_run_id, disk_target) WHERE kind = 'DISK';
-            CREATE TABLE IF NOT EXISTS run_disks (
-                run_id TEXT NOT NULL REFERENCES job_runs(id), target_dev TEXT NOT NULL,
-                source_type TEXT NOT NULL, source_path TEXT, source_format TEXT,
-                backup_enabled INTEGER NOT NULL,
-                planned_artifact_id TEXT REFERENCES backup_artifacts(id),
-                PRIMARY KEY(run_id, target_dev)
-            );
-            CREATE TABLE IF NOT EXISTS libvirt_backup_operations (
-                run_id TEXT PRIMARY KEY REFERENCES job_runs(id), domain_uuid TEXT NOT NULL,
-                domain_name TEXT NOT NULL, connection_uri TEXT NOT NULL,
-                backup_mode TEXT NOT NULL CHECK(backup_mode IN ('FULL', 'INCREMENTAL')),
-                checkpoint_name TEXT, incremental_base_checkpoint TEXT,
-                backup_xml TEXT NOT NULL, checkpoint_xml TEXT,
-                external_state TEXT NOT NULL CHECK(external_state IN
-                    ('PLANNED', 'START_REQUESTED', 'RUNNING', 'COMPLETED',
-                     'ABORT_REQUESTED', 'UNKNOWN')),
-                started_at TEXT, last_polled_at TEXT, completed_at TEXT
-                , active_match_observed_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS events (
-                id TEXT PRIMARY KEY, job_run_id TEXT REFERENCES job_runs(id),
-                node_id TEXT REFERENCES nodes(id),
-                event_type TEXT NOT NULL, message TEXT NOT NULL,
-                from_state TEXT, to_state TEXT, created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS daemon_instances (
-                instance_id TEXT PRIMARY KEY, node_id TEXT NOT NULL REFERENCES nodes(id),
-                started_at TEXT NOT NULL, last_heartbeat_at TEXT NOT NULL, stopped_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS execution_leases (
-                vm_id TEXT PRIMARY KEY REFERENCES vms(id),
-                run_id TEXT NOT NULL UNIQUE REFERENCES job_runs(id),
-                daemon_instance_id TEXT NOT NULL REFERENCES daemon_instances(instance_id),
-                acquired_at TEXT NOT NULL, lease_expires_at TEXT NOT NULL,
-                heartbeat_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS node_controller_leases (
-                node_id TEXT PRIMARY KEY REFERENCES nodes(id),
-                daemon_instance_id TEXT NOT NULL UNIQUE REFERENCES daemon_instances(instance_id),
-                acquired_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL,
-                expires_at TEXT NOT NULL
-            );
-            """
-        )
-        self.connection.commit()
 
     def add_node(self, value: Node) -> None:
         self._insert("nodes", value, ("id", "name", "created_at"))

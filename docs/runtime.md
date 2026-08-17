@@ -138,6 +138,12 @@ The API remains available in diagnostic-only mode and rejects `backup.run` with
 success for external work. Future systemd integration may choose process-level
 restart policy.
 
+Both the API and runtime connections independently pass through schema-version
+validation before use. SQLite's migration write transaction serializes the
+first opener; a second connection to an already-current database performs no
+schema mutation. WAL and busy-timeout coordination remain unchanged, and no
+connection crosses thread ownership boundaries.
+
 At startup, expired leases and leases owned by a fenced previous controller are
 removed and record `LEASE_EXPIRED`. An unsafe associated run is marked for
 recovery and is not restarted.

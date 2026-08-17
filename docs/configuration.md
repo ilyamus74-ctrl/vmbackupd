@@ -31,3 +31,8 @@ Each BackupJob persists a destination ID. Runtime execution routes planning,
 filesystem preparation, and free-space checks through that destination so path
 planning cannot disagree with execution. `storage.list/show` reports each
 destination and current free bytes.
+
+Database paths are opened through the versioned schema manager. Configuration
+cannot opt out of validation, force adoption of an unknown layout, request a
+downgrade, or replace an unsupported database. See
+[`database-schema.md`](database-schema.md).

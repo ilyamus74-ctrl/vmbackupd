@@ -32,6 +32,8 @@ shutdown removes only the socket owned by that server instance.
 Only definitive stale results such as connection refusal permit unlink;
 permission, resource, and other ambiguous probe failures leave it untouched.
 
-`daemon.status` exposes `runtime_state` and a safe `runtime_last_error`. If the
-worker is `FAILED`, diagnostic reads stay available but `backup.run` returns
-`RUNTIME_UNAVAILABLE` and creates no run.
+`daemon.status` exposes `runtime_state`, a safe `runtime_last_error`, and the
+validated `database_schema_version`. The latter is additive diagnostic data and
+does not change API protocol version 1. If the worker is `FAILED`, diagnostic
+reads stay available but `backup.run` returns `RUNTIME_UNAVAILABLE` and creates
+no run.

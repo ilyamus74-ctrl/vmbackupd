@@ -18,9 +18,13 @@ from .repository import SQLiteRepository
 from .retention import RetentionPlan, RetentionPlanner
 from .runtime import DaemonRuntime
 from .scheduler import IntervalScheduler
+from .schema import (
+    CURRENT_SCHEMA_VERSION, SchemaError, SchemaMigrationError, UnsupportedSchemaError,
+)
 
 __all__ = [
     "BackupPlanner",
+    "CURRENT_SCHEMA_VERSION",
     "BackupPolicy",
     "BackupIdentity",
     "BackupInspection",
@@ -46,11 +50,14 @@ __all__ = [
     "QemuImageInspector",
     "QemuOutputImagePreparer",
     "SchedulePolicy",
+    "SchemaError",
+    "SchemaMigrationError",
     "SQLiteRepository",
     "StagingPathPlanner",
     "StagingFilesystem",
     "SubprocessCommandRunner",
     "SystemClock",
+    "UnsupportedSchemaError",
     "VirshLibvirtDriver",
     "VirshBackupDriver",
 ]

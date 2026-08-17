@@ -80,6 +80,7 @@ class VmbackupApplication:
                 "libvirt_uri": self.config.libvirt.uri,
                 "libvirt_mutation_enabled": self.config.libvirt.allow_mutation,
                 "database_path": str(self.config.daemon.database_path),
+                "database_schema_version": self.repository.get_database_schema_version(),
                 "control_root": default.control_root,
                 "backup_data_root": default.backup_data_root,
                 "free_backup_data_bytes": self._free(default),

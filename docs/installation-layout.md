@@ -55,6 +55,8 @@ Phase 3C provides configuration and foreground entry points but deliberately
 does not install these paths. RPM ownership, socket parent creation, service
 units, and system accounts remain Phase 3D work.
 
-The first integration run uses a fresh development database. Phase 3D packaging
-must add `schema_version` and ordered migrations before upgrades are supported;
-conditional table creation does not migrate an older schema.
+Phase 3D.1 adds `schema_version`, structural validation, and ordered
+transactional migrations. It can adopt the known unversioned integration
+schema without rebuilding backup metadata. RPM upgrade/rollback policy is not
+yet implemented, so operators should make an external database copy before a
+package upgrade; vmbackupd does not create automatic `.bak` files.
