@@ -8,8 +8,9 @@ from pathlib import Path
 
 from .models import (
     BackupChain, BackupChainStatus, BackupJob, BackupKind, BackupPolicy, CatchUpMode,
-    DaemonInstance, Event, ExecutionLease, JobRun, Node, RestorePoint,
-    RestorePointStatus, RetentionPolicy, RunState, SchedulePolicy, VM, new_id, utcnow,
+    DaemonInstance, Event, ExecutionLease, JobRun, Node, NodeControllerLease,
+    OverlapPolicy, RestorePoint, RestorePointStatus, RetentionPolicy, RunState,
+    SchedulePolicy, VM, new_id, utcnow,
 )
 from .state_machine import InvalidStateTransition, validate_transition
 
@@ -48,6 +49,7 @@ class SQLiteRepository:
                 interval_seconds INTEGER NOT NULL CHECK(interval_seconds >= 60),
                 misfire_grace_seconds INTEGER NOT NULL CHECK(misfire_grace_seconds >= 0),
                 catch_up_mode TEXT NOT NULL CHECK(catch_up_mode = 'RUN_ONCE'),
+                overlap_policy TEXT NOT NULL CHECK(overlap_policy = 'SKIP_IF_BUSY'),
                 next_run_at TEXT,
                 created_at TEXT NOT NULL
             );
@@ -99,6 +101,12 @@ class SQLiteRepository:
                 acquired_at TEXT NOT NULL, lease_expires_at TEXT NOT NULL,
                 heartbeat_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS node_controller_leases (
+                node_id TEXT PRIMARY KEY REFERENCES nodes(id),
+                daemon_instance_id TEXT NOT NULL UNIQUE REFERENCES daemon_instances(instance_id),
+                acquired_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
             """
         )
         self.connection.commit()
@@ -111,7 +119,7 @@ class SQLiteRepository:
 
     def add_job(self, value: BackupJob) -> None:
         self.connection.execute(
-            "INSERT INTO backup_jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO backup_jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (value.id, value.vm_id, value.name, int(value.enabled),
              value.backup_policy.max_incrementals_per_chain,
              value.retention_policy.restore_points_to_retain,
@@ -119,6 +127,7 @@ class SQLiteRepository:
              value.schedule_policy.interval_seconds,
              value.schedule_policy.misfire_grace_seconds,
              value.schedule_policy.catch_up_mode,
+             value.schedule_policy.overlap_policy,
              value.next_run_at.isoformat() if value.next_run_at else None,
              value.created_at.isoformat()),
         )
@@ -325,11 +334,19 @@ class SQLiteRepository:
             self._insert_transition_event(run_id, RunState.CLEANUP, RunState.FAILED)
         return self.get_run(run_id)
 
-    def schedule_due_job(self, job_id: str, now: datetime) -> JobRun | None:
+    def schedule_due_job(
+        self, job_id: str, now: datetime, daemon_instance_id: str | None = None
+    ) -> JobRun | None:
         """Atomically apply RUN_ONCE scheduling and advance the persisted cursor."""
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             job = self.get_job(job_id)
+            if daemon_instance_id is not None:
+                node_row = self.connection.execute(
+                    "SELECT node_id FROM vms WHERE id = ?", (job.vm_id,)
+                ).fetchone()
+                assert node_row is not None
+                self._assert_controller(daemon_instance_id, node_row["node_id"], now)
             due = job.next_run_at
             if not job.enabled or due is None or due > now:
                 self.connection.commit()
@@ -340,6 +357,23 @@ class SQLiteRepository:
             is_catch_up = represented > 1 or (
                 now - due
             ).total_seconds() > job.schedule_policy.misfire_grace_seconds
+            busy = self.connection.execute(
+                """SELECT id FROM job_runs WHERE job_id = ?
+                   AND state NOT IN ('SUCCESS', 'FAILED') ORDER BY created_at LIMIT 1""",
+                (job.id,),
+            ).fetchone()
+            if busy is not None:
+                self.connection.execute(
+                    "UPDATE backup_jobs SET next_run_at = ? WHERE id = ?",
+                    (next_run_at.isoformat(), job.id),
+                )
+                self._insert_event(Event(
+                    job_run_id=busy["id"], event_type="JOB_SCHEDULE_SKIPPED_BUSY",
+                    message=f"SKIP_IF_BUSY skipped {represented} due occurrence(s)",
+                    created_at=now,
+                ))
+                self.connection.commit()
+                return None
             run = JobRun(
                 job_id=job.id,
                 scheduled_for=due,
@@ -468,6 +502,112 @@ class SQLiteRepository:
             stopped_at=datetime.fromisoformat(row["stopped_at"]) if row["stopped_at"] else None,
         )
 
+    def acquire_controller(
+        self, node_id: str, daemon_instance_id: str, now: datetime, lease_seconds: int
+    ) -> NodeControllerLease:
+        if lease_seconds < 1:
+            raise ValueError("controller lease_seconds must be positive")
+        daemon = self.get_daemon(daemon_instance_id)
+        if daemon.node_id != node_id or daemon.stopped_at is not None:
+            raise DomainInvariantError("daemon cannot control this node")
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self.connection.execute(
+                "SELECT * FROM node_controller_leases WHERE node_id = ?", (node_id,)
+            ).fetchone()
+            taken_over = False
+            if existing is not None:
+                if datetime.fromisoformat(existing["expires_at"]) > now:
+                    raise DomainInvariantError("node already has a live controller")
+                self.connection.execute(
+                    "DELETE FROM node_controller_leases WHERE node_id = ?", (node_id,)
+                )
+                taken_over = True
+            expires = now + timedelta(seconds=lease_seconds)
+            self.connection.execute(
+                "INSERT INTO node_controller_leases VALUES (?, ?, ?, ?, ?)",
+                (node_id, daemon_instance_id, now.isoformat(), now.isoformat(),
+                 expires.isoformat()),
+            )
+            self._insert_event(Event(
+                job_run_id=None,
+                event_type="CONTROLLER_TAKEN_OVER" if taken_over else "CONTROLLER_ACQUIRED",
+                message=f"controller {daemon_instance_id} acquired node {node_id}",
+                created_at=now,
+            ))
+            self.connection.commit()
+            return NodeControllerLease(node_id, daemon_instance_id, now, now, expires)
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def renew_controller(
+        self, node_id: str, daemon_instance_id: str, now: datetime, lease_seconds: int
+    ) -> NodeControllerLease:
+        expires = now + timedelta(seconds=lease_seconds)
+        with self.connection:
+            cursor = self.connection.execute(
+                """UPDATE node_controller_leases SET heartbeat_at = ?, expires_at = ?
+                   WHERE node_id = ? AND daemon_instance_id = ? AND expires_at > ?""",
+                (now.isoformat(), expires.isoformat(), node_id, daemon_instance_id,
+                 now.isoformat()),
+            )
+            if cursor.rowcount != 1:
+                raise DomainInvariantError("controller lease is absent, expired, or fenced")
+        lease = self.get_controller(node_id)
+        assert lease is not None
+        return lease
+
+    def get_controller(self, node_id: str) -> NodeControllerLease | None:
+        row = self.connection.execute(
+            "SELECT * FROM node_controller_leases WHERE node_id = ?", (node_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return NodeControllerLease(
+            node_id=row["node_id"], daemon_instance_id=row["daemon_instance_id"],
+            acquired_at=datetime.fromisoformat(row["acquired_at"]),
+            heartbeat_at=datetime.fromisoformat(row["heartbeat_at"]),
+            expires_at=datetime.fromisoformat(row["expires_at"]),
+        )
+
+    def release_controller(self, node_id: str, daemon_instance_id: str, now: datetime) -> bool:
+        with self.connection:
+            cursor = self.connection.execute(
+                """DELETE FROM node_controller_leases
+                   WHERE node_id = ? AND daemon_instance_id = ?""",
+                (node_id, daemon_instance_id),
+            )
+            if cursor.rowcount:
+                self._insert_event(Event(
+                    job_run_id=None, event_type="CONTROLLER_RELEASED",
+                    message=f"controller {daemon_instance_id} released node {node_id}",
+                    created_at=now,
+                ))
+        return bool(cursor.rowcount)
+
+    def stop_daemon(self, instance_id: str, now: datetime) -> DaemonInstance:
+        cursor = self.connection.execute(
+            "UPDATE daemon_instances SET stopped_at = ? WHERE instance_id = ? AND stopped_at IS NULL",
+            (now.isoformat(), instance_id),
+        )
+        self.connection.commit()
+        if cursor.rowcount != 1:
+            raise DomainInvariantError("daemon is already stopped or unknown")
+        return self.get_daemon(instance_id)
+
+    def _assert_controller(self, daemon_instance_id: str, node_id: str, now: datetime) -> None:
+        row = self.connection.execute(
+            """SELECT ncl.daemon_instance_id, ncl.expires_at, di.stopped_at
+               FROM node_controller_leases ncl
+               JOIN daemon_instances di ON di.instance_id = ncl.daemon_instance_id
+               WHERE ncl.node_id = ?""", (node_id,),
+        ).fetchone()
+        if (row is None or row["daemon_instance_id"] != daemon_instance_id
+                or row["stopped_at"] is not None
+                or datetime.fromisoformat(row["expires_at"]) <= now):
+            raise DomainInvariantError("daemon does not hold the live node controller lease")
+
     def acquire_lease(
         self, run_id: str, daemon_instance_id: str, now: datetime, lease_seconds: int
     ) -> ExecutionLease | None:
@@ -489,6 +629,7 @@ class SQLiteRepository:
             ).fetchone()
             if vm is None or daemon.node_id != vm["node_id"]:
                 raise DomainInvariantError("daemon cannot lease a VM owned by another node")
+            self._assert_controller(daemon_instance_id, vm["node_id"], now)
             existing = self.connection.execute(
                 "SELECT * FROM execution_leases WHERE vm_id = ?", (row["vm_id"],)
             ).fetchone()
@@ -549,6 +690,12 @@ class SQLiteRepository:
     ) -> ExecutionLease:
         expires = now + timedelta(seconds=lease_seconds)
         with self.connection:
+            context = self._run_context(run_id)
+            node = self.connection.execute(
+                "SELECT node_id FROM vms WHERE id = ?", (context["vm_id"],)
+            ).fetchone()
+            assert node is not None
+            self._assert_controller(daemon_instance_id, node["node_id"], now)
             cursor = self.connection.execute(
                 """UPDATE execution_leases SET heartbeat_at = ?, lease_expires_at = ?
                    WHERE run_id = ? AND daemon_instance_id = ? AND lease_expires_at > ?""",
@@ -591,6 +738,27 @@ class SQLiteRepository:
                 self._insert_event(Event(job_run_id=lease.run_id, event_type="LEASE_EXPIRED",
                                          message="stale daemon lease removed during startup",
                                          created_at=now))
+        return removed
+
+    def remove_fenced_leases(
+        self, current_instance_id: str, node_id: str, now: datetime
+    ) -> list[ExecutionLease]:
+        rows = self.connection.execute(
+            """SELECT el.* FROM execution_leases el
+               JOIN vms vm ON vm.id = el.vm_id
+               WHERE vm.node_id = ? AND el.daemon_instance_id != ?""",
+            (node_id, current_instance_id),
+        ).fetchall()
+        removed = [self._lease(row) for row in rows]
+        with self.connection:
+            for lease in removed:
+                self.connection.execute(
+                    "DELETE FROM execution_leases WHERE vm_id = ?", (lease.vm_id,)
+                )
+                self._insert_event(Event(
+                    job_run_id=lease.run_id, event_type="LEASE_EXPIRED",
+                    message="VM lease removed after controller fencing", created_at=now,
+                ))
         return removed
 
     def get_lease_for_run(self, run_id: str) -> ExecutionLease | None:
@@ -650,7 +818,8 @@ class SQLiteRepository:
                                              row["minimum_full_chains"]),
             schedule_policy=SchedulePolicy(row["interval_seconds"],
                                            row["misfire_grace_seconds"],
-                                           CatchUpMode(row["catch_up_mode"])),
+                                           CatchUpMode(row["catch_up_mode"]),
+                                           OverlapPolicy(row["overlap_policy"])),
             next_run_at=datetime.fromisoformat(row["next_run_at"]) if row["next_run_at"] else None,
             created_at=datetime.fromisoformat(row["created_at"]),
         )

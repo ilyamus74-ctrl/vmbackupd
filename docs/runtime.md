@@ -28,6 +28,24 @@ The runtime constructs its scheduler with a node ID. Only jobs whose VM belongs
 to that node are considered; knowledge of a remote node's metadata never gives
 the local daemon authority to schedule or execute its jobs.
 
+The persisted overlap policy is `SKIP_IF_BUSY`. If a due job already has any
+non-terminal run, the scheduler creates no new run, advances `next_run_at`
+beyond the current time, and records `JOB_SCHEDULE_SKIPPED_BUSY` with the number
+of coalesced occurrences. Repeated ticks cannot build an unlimited backlog.
+`RUN_ONCE` catch-up remains unchanged when the job is not busy.
+
+## Cooperative execution
+
+Runtime execution is non-blocking by contract. `BackupExecutor.advance_run`
+and `advance_cleanup` perform at most one short initiation, poll, or state
+advance, then return the persisted run. They may leave its state unchanged while
+simulated external work continues. Each tick gives every eligible local run at
+most one step, so one long VM does not prevent another VM from progressing.
+
+The mock executor provides deterministic backup and cleanup poll counts. Its
+synchronous `execute` helper remains only for direct Phase 1 tests; the daemon
+runtime never calls that blocking convenience API.
+
 ## VM execution leases
 
 Before a queued or safely resumable run executes, the daemon atomically acquires
@@ -45,10 +63,25 @@ A valid lease is never stolen merely because another daemon instance owns it.
 An expired lease can be reclaimed, but it cannot be renewed or resurrected:
 renewal requires the stored expiration to be strictly later than the supplied
 time. Acquisition and startup recovery both mark an unsafe old run for
-reconciliation before reclaiming its expired lease. Progress callbacks renew a
-valid held lease. Routine renewals update `heartbeat_at` and `lease_expires_at`
+reconciliation before reclaiming its expired lease. Every normal runtime tick
+renews all valid VM leases owned by the current daemon, even when a long-running
+state remains unchanged. The executor does not manage leases. Routine renewals
+update `heartbeat_at` and `lease_expires_at`
 without appending `LEASE_RENEWED` events, avoiding unlimited event history.
 Acquisition, release, and expiration remain persistent lifecycle events.
+
+## Node controller lease and fencing
+
+Each node has at most one live persisted controller lease. Runtime startup must
+atomically acquire it before recovery. A second startup is refused while the
+lease is valid and does not touch VM leases or recovery state. An expired lease
+may be taken over, producing `CONTROLLER_TAKEN_OVER`.
+
+Controller ownership fences scheduling and VM lease acquisition or renewal.
+After takeover, the old delayed process cannot continue controlling work.
+Routine controller heartbeat updates only the controller row. Clean `stop`
+marks the daemon stopped and releases controller ownership, but deliberately
+leaves active VM execution state for conservative recovery by a later owner.
 
 ## VM recovery quarantine
 
@@ -78,15 +111,21 @@ Startup examines every non-terminal run:
   after a crash. They are left in their current state, marked
   `recovery_required`, and receive `RUN_RECOVERY_REQUIRED`.
 
+Those unsafe states are healthy while they retain a valid VM lease owned by the
+current controller and are not marked for recovery. The runtime continues to
+poll them cooperatively. After controller takeover, leases owned by the fenced
+controller are removed; abandoned unsafe work then requires reconciliation,
+while safe states may resume under fresh ownership.
+
 Unsafe recovery never calls successful finalization and therefore never
 publishes a restore point. The database cannot know whether a future real
 backend left a snapshot, partial transfer, or verified object. Explicit
 repository operations can later clear the recovery marker after backend-specific
 reconciliation, but Phase 2 does not pretend to perform that reconciliation.
 
-At startup, expired leases owned by older daemon instances are removed and
-record `LEASE_EXPIRED`. An unsafe associated run is marked for recovery and is
-not restarted. A non-expired lease owned by another instance remains intact.
+At startup, expired leases and leases owned by a fenced previous controller are
+removed and record `LEASE_EXPIRED`. An unsafe associated run is marked for
+recovery and is not restarted.
 
 ## Unexpected executor exceptions
 
@@ -100,7 +139,8 @@ the run in `CLEANUP`, and releases the lease for a later retry.
 
 ## Executor boundary
 
-`DaemonRuntime` depends on the small `BackupExecutor` protocol rather than mock
-implementation details. `MockBackupEngine` is the only Phase 2 executor. A
+`DaemonRuntime` depends on the small cooperative `BackupExecutor` protocol
+rather than mock implementation details. `MockBackupEngine` is the only Phase 2
+executor. A
 future libvirt executor can implement the boundary after recovery semantics are
 defined against real external state.

@@ -2,7 +2,7 @@
 
 from .engine import MockBackupEngine
 from .clock import FakeClock, SystemClock
-from .models import BackupPolicy, RetentionPolicy, SchedulePolicy
+from .models import BackupPolicy, OverlapPolicy, RetentionPolicy, SchedulePolicy
 from .planner import BackupPlanner
 from .repository import SQLiteRepository
 from .retention import RetentionPlan, RetentionPlanner
@@ -16,6 +16,7 @@ __all__ = [
     "FakeClock",
     "IntervalScheduler",
     "MockBackupEngine",
+    "OverlapPolicy",
     "RetentionPlan",
     "RetentionPlanner",
     "RetentionPolicy",

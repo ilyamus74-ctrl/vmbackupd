@@ -77,7 +77,8 @@ Phase 2 adds orchestration above, rather than inside, the repository:
 - `IntervalScheduler` applies persisted interval schedules with idempotent
   `RUN_ONCE` catch-up behavior;
 - `DaemonRuntime` persists daemon identity and heartbeat, coordinates VM-level
-  leases, drives the executor, retries cleanup, and performs startup recovery;
+  leases, owns the node controller lease, cooperatively advances the executor,
+  retries cleanup, and performs startup recovery;
 - `BackupExecutor` separates runtime orchestration from the mock engine so a
   future backend can implement execution without changing scheduling or lease
   rules;
@@ -99,3 +100,17 @@ be renewed, and ordinary lease heartbeat renewal updates only the lease row
 rather than producing an unbounded event stream. Unexpected executor exceptions
 either enter recoverable cleanup while still safe or require explicit backend
 reconciliation after an unsafe state has been reached.
+
+Phase 2.2 gives each eligible run at most one cooperative executor step per
+tick. Lease renewal is tick-driven rather than transition-driven, so a healthy
+backup may remain in an unsafe state for hours while other VMs progress fairly.
+
+A persisted controller lease permits only one active daemon per node and fences
+expired owners from scheduling or VM lease acquisition and renewal. Healthy
+unsafe work has a valid lease owned by the current controller; abandoned unsafe
+work after takeover requires reconciliation. Clean shutdown releases controller
+ownership without claiming that external work completed.
+
+Interval schedules use `SKIP_IF_BUSY`. Due occurrences are coalesced into an
+observable skip and the cursor advances into the future, preventing slow jobs
+from accumulating an unbounded queue.

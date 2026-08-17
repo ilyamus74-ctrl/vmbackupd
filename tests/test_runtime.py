@@ -27,8 +27,21 @@ def queued_run(repository, job):
     return run
 
 
-def daemon(repository, node, clock, name):
-    return repository.start_daemon(node.id, clock.now(), instance_id=name)
+def daemon(repository, node, clock, name, controller_seconds=3600):
+    instance = repository.start_daemon(node.id, clock.now(), instance_id=name)
+    repository.acquire_controller(
+        node.id, instance.instance_id, clock.now(), controller_seconds
+    )
+    return instance
+
+
+def run_until_terminal(runtime, repository, run_id, limit=20):
+    for _ in range(limit):
+        runtime.tick()
+        run = repository.get_run(run_id)
+        if run.state in (RunState.SUCCESS, RunState.FAILED):
+            return run
+    raise AssertionError("run did not become terminal")
 
 
 def advance_to(repository, job, target):
@@ -80,11 +93,11 @@ def test_jobs_for_different_vms_can_hold_leases(runtime_domain):
 
 def test_expired_lease_can_be_reclaimed(runtime_domain):
     repository, node, _, first, second, clock = runtime_domain
-    old = daemon(repository, node, clock, "old")
-    new = daemon(repository, node, clock, "new")
+    old = daemon(repository, node, clock, "old", controller_seconds=60)
     first_run, second_run = queued_run(repository, first), queued_run(repository, second)
     repository.acquire_lease(first_run.id, old.instance_id, NOW, 60)
     clock.advance(seconds=61)
+    new = daemon(repository, node, clock, "new")
     lease = repository.acquire_lease(second_run.id, new.instance_id, clock.now(), 60)
     assert lease is not None and lease.run_id == second_run.id
     assert "LEASE_EXPIRED" in [e.event_type for e in repository.list_events(first_run.id)]
@@ -93,10 +106,9 @@ def test_expired_lease_can_be_reclaimed(runtime_domain):
 def test_nonexpired_lease_cannot_be_stolen(runtime_domain):
     repository, node, _, first, second, clock = runtime_domain
     old = daemon(repository, node, clock, "old")
-    new = daemon(repository, node, clock, "new")
     repository.acquire_lease(queued_run(repository, first).id, old.instance_id, NOW, 60)
     assert repository.acquire_lease(
-        queued_run(repository, second).id, new.instance_id, NOW + timedelta(seconds=59), 60
+        queued_run(repository, second).id, old.instance_id, NOW + timedelta(seconds=59), 60
     ) is None
 
 
@@ -104,7 +116,7 @@ def test_daemon_heartbeat_persists(runtime_domain):
     repository, node, _, _, _, clock = runtime_domain
     runtime = DaemonRuntime(repository, node.id, clock, MockBackupEngine(repository))
     instance = runtime.start()
-    clock.advance(seconds=30)
+    clock.advance(seconds=29)
     runtime.heartbeat()
     assert repository.get_daemon(instance).last_heartbeat_at == clock.now()
     assert [e.event_type for e in repository.list_all_events()].count("DAEMON_STARTED") == 1
@@ -117,7 +129,7 @@ def test_safe_prebackup_state_resumes_after_restart(runtime_domain):
     runtime = DaemonRuntime(repository, node.id, clock, MockBackupEngine(repository))
     runtime.start()
     assert not repository.get_run(run.id).recovery_required
-    runtime.tick()
+    run_until_terminal(runtime, repository, run.id)
     assert repository.get_run(run.id).state is RunState.SUCCESS
     assert len(repository.list_restore_points(vm.id)) == 1
 
@@ -129,6 +141,8 @@ def test_cleanup_is_retried_on_startup(runtime_domain):
     repository.transition_run(run.id, RunState.CLEANUP, "interrupted")
     runtime = DaemonRuntime(repository, node.id, clock, MockBackupEngine(repository))
     runtime.start()
+    assert repository.get_run(run.id).state is RunState.CLEANUP
+    runtime.tick()
     assert repository.get_run(run.id).state is RunState.FAILED
     assert "CLEANUP_RETRY" in [e.event_type for e in repository.list_events(run.id)]
 
@@ -153,7 +167,7 @@ def test_unsafe_restart_requires_recovery_and_never_publishes(runtime_domain, un
 def test_stale_unsafe_lease_is_removed_without_restart(runtime_domain):
     repository, node, vm, first, _, clock = runtime_domain
     run = advance_to(repository, first, RunState.PRECHECK)
-    old = daemon(repository, node, clock, "dead-daemon")
+    old = daemon(repository, node, clock, "dead-daemon", controller_seconds=30)
     repository.acquire_lease(run.id, old.instance_id, NOW, 30)
     repository.transition_run(run.id, RunState.PREPARING)
     repository.plan_run(run.id)

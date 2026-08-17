@@ -48,6 +48,10 @@ class CatchUpMode(StrEnum):
     RUN_ONCE = "RUN_ONCE"
 
 
+class OverlapPolicy(StrEnum):
+    SKIP_IF_BUSY = "SKIP_IF_BUSY"
+
+
 @dataclass(frozen=True, slots=True)
 class BackupPolicy:
     max_incrementals_per_chain: int = 2
@@ -74,6 +78,7 @@ class SchedulePolicy:
     interval_seconds: int = 3600
     misfire_grace_seconds: int = 0
     catch_up_mode: CatchUpMode = CatchUpMode.RUN_ONCE
+    overlap_policy: OverlapPolicy = OverlapPolicy.SKIP_IF_BUSY
 
     def __post_init__(self) -> None:
         if self.interval_seconds < 60:
@@ -82,6 +87,8 @@ class SchedulePolicy:
             raise ValueError("misfire_grace_seconds must be non-negative")
         if self.catch_up_mode is not CatchUpMode.RUN_ONCE:
             raise ValueError("only RUN_ONCE catch-up is supported")
+        if self.overlap_policy is not OverlapPolicy.SKIP_IF_BUSY:
+            raise ValueError("only SKIP_IF_BUSY overlap is supported")
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,3 +191,12 @@ class ExecutionLease:
     acquired_at: datetime
     lease_expires_at: datetime
     heartbeat_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class NodeControllerLease:
+    node_id: str
+    daemon_instance_id: str
+    acquired_at: datetime
+    heartbeat_at: datetime
+    expires_at: datetime

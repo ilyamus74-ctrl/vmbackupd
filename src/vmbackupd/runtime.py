@@ -1,10 +1,10 @@
-"""Local daemon orchestration for scheduling, leases, and conservative recovery."""
+"""Cooperative local orchestration with controller and VM lease fencing."""
 
 from __future__ import annotations
 
 from .clock import Clock
 from .executor import BackupExecutor
-from .models import Event, JobRun, RunState
+from .models import Event, ExecutionLease, JobRun, RunState
 from .repository import SQLiteRepository
 from .scheduler import IntervalScheduler
 
@@ -26,98 +26,156 @@ class DaemonRuntime:
         executor: BackupExecutor,
         *,
         lease_seconds: int = 300,
+        controller_lease_seconds: int = 30,
     ) -> None:
         self.repository = repository
         self.node_id = node_id
         self.clock = clock
         self.executor = executor
         self.lease_seconds = lease_seconds
+        self.controller_lease_seconds = controller_lease_seconds
         self.scheduler = IntervalScheduler(repository, clock, node_id)
         self.instance_id: str | None = None
 
     def start(self) -> str:
-        daemon = self.repository.start_daemon(self.node_id, self.clock.now())
+        now = self.clock.now()
+        daemon = self.repository.start_daemon(self.node_id, now)
+        try:
+            self.repository.acquire_controller(
+                self.node_id, daemon.instance_id, now, self.controller_lease_seconds
+            )
+        except Exception:
+            self.repository.stop_daemon(daemon.instance_id, now)
+            raise
         self.instance_id = daemon.instance_id
         self.recover_startup()
         return daemon.instance_id
 
+    def stop(self) -> None:
+        instance = self._instance()
+        now = self.clock.now()
+        self.repository.release_controller(self.node_id, instance, now)
+        self.repository.stop_daemon(instance, now)
+        self.instance_id = None
+
     def heartbeat(self) -> None:
-        self.repository.heartbeat_daemon(self._instance(), self.clock.now())
+        instance = self._instance()
+        now = self.clock.now()
+        self.repository.renew_controller(
+            self.node_id, instance, now, self.controller_lease_seconds
+        )
+        self.repository.heartbeat_daemon(instance, now)
 
     def recover_startup(self) -> None:
-        instance_id = self._instance()
+        instance = self._instance()
         now = self.clock.now()
-        expired = self.repository.remove_expired_leases(instance_id, now, self.node_id)
-        unsafe_expired_runs = {lease.run_id for lease in expired}
+        fenced = self.repository.remove_fenced_leases(instance, self.node_id, now)
+        fenced_runs = {lease.run_id for lease in fenced}
+        self.repository.remove_expired_leases(instance, now, self.node_id)
         for run in self.repository.list_runs_for_node(self.node_id, nonterminal_only=True):
             if run.state in UNSAFE_STATES:
-                reason = "backend reconciliation required after daemon restart"
-                if run.id in unsafe_expired_runs:
-                    reason += "; stale execution lease was removed"
+                lease = self.repository.get_lease_for_run(run.id)
+                healthy = lease is not None and self._lease_is_current_and_valid(lease)
+                if healthy:
+                    continue
+                reason = "backend reconciliation required after controller takeover"
+                if run.id in fenced_runs:
+                    reason += "; fenced VM lease was removed"
                 self.repository.mark_recovery_required(run.id, reason, now)
-            elif run.state is RunState.CLEANUP:
-                self._retry_cleanup_with_lease(run)
 
     def tick(self) -> list[JobRun]:
-        self._instance()
+        instance = self._instance()
         self.heartbeat()
-        self.scheduler.tick()
-        completed: list[JobRun] = []
+        self.scheduler.tick(instance)
+        self._renew_owned_vm_leases()
+        progressed: list[JobRun] = []
         for run in self.repository.list_runs_for_node(self.node_id, nonterminal_only=True):
+            run = self.repository.get_run(run.id)
             if run.recovery_required:
                 continue
             if run.state is RunState.CLEANUP:
-                completed.append(self._retry_cleanup_with_lease(run))
+                progressed.append(self._advance_cleanup(run))
                 continue
-            if run.state is RunState.SCHEDULED:
-                run = self.repository.transition_run(run.id, RunState.QUEUED)
-            if run.state not in SAFE_STATES:
-                continue
-            lease = self.repository.acquire_lease(
-                run.id, self._instance(), self.clock.now(), self.lease_seconds
-            )
-            if lease is None:
-                continue
-
-            def renew(_: JobRun, run_id: str = run.id) -> None:
-                current = self.repository.get_run(run_id)
-                if current.state not in (RunState.SUCCESS, RunState.FAILED):
-                    self.repository.renew_lease(
-                        run_id, self._instance(), self.clock.now(), self.lease_seconds
+            if run.state in UNSAFE_STATES:
+                lease = self.repository.get_lease_for_run(run.id)
+                if lease is None or not self._lease_is_current_and_valid(lease):
+                    progressed.append(self.repository.mark_recovery_required(
+                        run.id, "unsafe run lost valid controller-owned execution lease",
+                        self.clock.now(),
+                    ))
+                    continue
+            elif run.state in SAFE_STATES:
+                lease = self.repository.get_lease_for_run(run.id)
+                if lease is None:
+                    lease = self.repository.acquire_lease(
+                        run.id, instance, self.clock.now(), self.lease_seconds
                     )
+                if lease is None:
+                    continue
+            else:
+                continue
+            progressed.append(self._advance_run(run))
+        return progressed
 
-            try:
-                result = self.executor.execute_run(run.id, renew)
-            except Exception as exc:
-                result = self._handle_executor_exception(run.id, exc)
-            finally:
-                self.repository.release_lease(run.id, self._instance(), self.clock.now())
-            completed.append(result)
-        return completed
+    def _renew_owned_vm_leases(self) -> None:
+        instance = self._instance()
+        now = self.clock.now()
+        for lease in self.repository.list_leases():
+            if lease.daemon_instance_id != instance:
+                continue
+            if lease.lease_expires_at <= now:
+                run = self.repository.get_run(lease.run_id)
+                self.repository.release_lease(run.id, instance, now)
+                if run.state in UNSAFE_STATES:
+                    self.repository.mark_recovery_required(
+                        run.id, "unsafe run execution lease expired", now
+                    )
+                continue
+            self.repository.renew_lease(
+                lease.run_id, instance, now, self.lease_seconds
+            )
 
-    def _retry_cleanup_with_lease(self, run: JobRun) -> JobRun:
-        lease = self.repository.acquire_lease(
-            run.id, self._instance(), self.clock.now(), self.lease_seconds
-        )
+    def _advance_run(self, run: JobRun) -> JobRun:
+        try:
+            result = self.executor.advance_run(run.id)
+        except Exception as exc:
+            result = self._handle_executor_exception(run.id, exc)
+            self.repository.release_lease(run.id, self._instance(), self.clock.now())
+            return result
+        if result.state in (RunState.SUCCESS, RunState.FAILED):
+            self.repository.release_lease(run.id, self._instance(), self.clock.now())
+        return result
+
+    def _advance_cleanup(self, run: JobRun) -> JobRun:
+        instance = self._instance()
+        lease = self.repository.get_lease_for_run(run.id)
+        if lease is None:
+            lease = self.repository.acquire_lease(
+                run.id, instance, self.clock.now(), self.lease_seconds
+            )
         if lease is None:
             return run
         self.repository.record_event(Event(
             job_run_id=run.id, event_type="CLEANUP_RETRY",
-            message="retrying cleanup after daemon recovery", created_at=self.clock.now(),
+            message="advancing cooperative cleanup", created_at=self.clock.now(),
         ))
+        previous_attempts = run.cleanup_attempts
         try:
-            return self.executor.retry_cleanup(run.id)
+            result = self.executor.advance_cleanup(run.id)
         except Exception as exc:
             self.repository.record_event(Event(
                 job_run_id=run.id, event_type="EXECUTOR_EXCEPTION",
                 message=f"cleanup executor raised {type(exc).__name__}: {exc}",
                 created_at=self.clock.now(),
             ))
-            return self.repository.record_cleanup_failure(
+            result = self.repository.record_cleanup_failure(
                 run.id, f"unexpected cleanup exception: {type(exc).__name__}: {exc}"
             )
-        finally:
-            self.repository.release_lease(run.id, self._instance(), self.clock.now())
+        if (result.state is not RunState.CLEANUP
+                or result.cleanup_attempts > previous_attempts
+                or result.cleanup_error is not None):
+            self.repository.release_lease(run.id, instance, self.clock.now())
+        return result
 
     def _handle_executor_exception(self, run_id: str, exc: Exception) -> JobRun:
         now = self.clock.now()
@@ -135,7 +193,11 @@ class DaemonRuntime:
             return self.repository.record_cleanup_failure(run_id, message)
         return current
 
+    def _lease_is_current_and_valid(self, lease: ExecutionLease) -> bool:
+        return (lease.daemon_instance_id == self._instance()
+                and lease.lease_expires_at > self.clock.now())
+
     def _instance(self) -> str:
         if self.instance_id is None:
-            raise RuntimeError("daemon runtime has not been started")
+            raise RuntimeError("daemon runtime is not an active controller")
         return self.instance_id

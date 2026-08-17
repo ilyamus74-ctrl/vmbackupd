@@ -46,11 +46,25 @@ def setup_repository():
     return repository, node, vm, first, second, clock
 
 
+def controlled_daemon(repository, node, now, name, seconds=3600):
+    daemon = repository.start_daemon(node.id, now, instance_id=name)
+    repository.acquire_controller(node.id, daemon.instance_id, now, seconds)
+    return daemon
+
+
+def run_until_terminal(runtime, repository, run_id, limit=20):
+    for _ in range(limit):
+        runtime.tick()
+        run = repository.get_run(run_id)
+        if run.state in (RunState.SUCCESS, RunState.FAILED):
+            return run
+    raise AssertionError("run did not become terminal")
+
+
 def test_expired_unsafe_lease_quarantines_vm_until_explicit_resolution():
     repository, node, vm, first, second, clock = setup_repository()
     other_vm, other_job = add_vm_job(repository, node, "other")
-    old = repository.start_daemon(node.id, NOW, instance_id="old")
-    new = repository.start_daemon(node.id, NOW, instance_id="new")
+    old = controlled_daemon(repository, node, NOW, "old", seconds=30)
 
     unsafe = add_run(repository, first, RunState.PRECHECK)
     repository.acquire_lease(unsafe.id, old.instance_id, NOW, 30)
@@ -58,6 +72,7 @@ def test_expired_unsafe_lease_quarantines_vm_until_explicit_resolution():
     queued = add_run(repository, second)
     other = add_run(repository, other_job)
     clock.advance(seconds=31)
+    new = controlled_daemon(repository, node, clock.now(), "new")
 
     assert repository.acquire_lease(queued.id, new.instance_id, clock.now(), 60) is None
     assert repository.get_run(unsafe.id).recovery_required
@@ -74,7 +89,7 @@ def test_expired_unsafe_lease_quarantines_vm_until_explicit_resolution():
 @pytest.mark.parametrize("offset", [0, 1])
 def test_expired_lease_cannot_be_renewed(offset):
     repository, node, _, first, _, clock = setup_repository()
-    owner = repository.start_daemon(node.id, NOW, instance_id="owner")
+    owner = controlled_daemon(repository, node, NOW, "owner")
     run = add_run(repository, first)
     repository.acquire_lease(run.id, owner.instance_id, NOW, 60)
     clock.advance(seconds=60 + offset)
@@ -84,7 +99,7 @@ def test_expired_lease_cannot_be_renewed(offset):
 
 def test_lease_renewal_before_expiry_succeeds_without_event_stream():
     repository, node, _, first, _, clock = setup_repository()
-    owner = repository.start_daemon(node.id, NOW, instance_id="owner")
+    owner = controlled_daemon(repository, node, NOW, "owner")
     run = add_run(repository, first)
     repository.acquire_lease(run.id, owner.instance_id, NOW, 60)
     clock.advance(seconds=59)
@@ -95,17 +110,19 @@ def test_lease_renewal_before_expiry_succeeds_without_event_stream():
 
 def test_cleanup_waits_for_vm_lease_then_acquires_and_releases_it():
     repository, node, _, first, second, clock = setup_repository()
-    old = repository.start_daemon(node.id, NOW, instance_id="other-owner")
-    blocker = add_run(repository, first)
-    repository.acquire_lease(blocker.id, old.instance_id, NOW, 300)
-    cleanup = add_run(repository, second, RunState.CLEANUP)
-
     runtime = DaemonRuntime(repository, node.id, clock, MockBackupEngine(repository))
     runtime.start()
+    blocker = add_run(repository, first)
+    repository.acquire_lease(blocker.id, runtime.instance_id, NOW, 300)
+    cleanup = add_run(repository, second, RunState.CLEANUP)
+
+    runtime.tick()
     assert repository.get_run(cleanup.id).state is RunState.CLEANUP
     assert "CLEANUP_RETRY" not in [e.event_type for e in repository.list_events(cleanup.id)]
 
-    repository.release_lease(blocker.id, old.instance_id, clock.now())
+    repository.release_lease(blocker.id, runtime.instance_id, clock.now())
+    repository.transition_run(blocker.id, RunState.CLEANUP, "test blocker complete")
+    repository.finish_cleanup(blocker.id)
     runtime.tick()
     assert repository.get_run(cleanup.id).state is RunState.FAILED
     assert repository.get_lease_for_run(cleanup.id) is None
@@ -116,10 +133,10 @@ def test_cleanup_waits_for_vm_lease_then_acquires_and_releases_it():
 
 
 class CleanupRaisesExecutor:
-    def execute_run(self, run_id, on_progress=None):
+    def advance_run(self, run_id):
         raise AssertionError("not used")
 
-    def retry_cleanup(self, run_id):
+    def advance_cleanup(self, run_id):
         raise RuntimeError("cleanup exploded")
 
 
@@ -128,21 +145,24 @@ def test_cleanup_exception_remains_retryable_and_releases_lease():
     cleanup = add_run(repository, first, RunState.CLEANUP)
     runtime = DaemonRuntime(repository, node.id, clock, CleanupRaisesExecutor())
     runtime.start()
+    runtime.tick()
     persisted = repository.get_run(cleanup.id)
     assert persisted.state is RunState.CLEANUP
     assert "cleanup exploded" in persisted.cleanup_error
     assert repository.get_lease_for_run(cleanup.id) is None
     assert "LEASE_RELEASED" in [e.event_type for e in repository.list_events(cleanup.id)]
+    runtime.stop()
     retry_runtime = DaemonRuntime(repository, node.id, clock, MockBackupEngine(repository))
     retry_runtime.start()
+    retry_runtime.tick()
     assert repository.get_run(cleanup.id).state is RunState.FAILED
 
 
 class RaisesBeforeUnsafeExecutor:
-    def execute_run(self, run_id, on_progress=None):
+    def advance_run(self, run_id):
         raise RuntimeError("precheck crashed")
 
-    def retry_cleanup(self, run_id):
+    def advance_cleanup(self, run_id):
         raise AssertionError("not used")
 
 
@@ -150,14 +170,14 @@ class RaisesAfterBackingUpExecutor:
     def __init__(self, repository):
         self.repository = repository
 
-    def execute_run(self, run_id, on_progress=None):
+    def advance_run(self, run_id):
         self.repository.transition_run(run_id, RunState.PRECHECK)
         self.repository.transition_run(run_id, RunState.PREPARING)
         self.repository.plan_run(run_id)
         self.repository.transition_run(run_id, RunState.BACKING_UP)
         raise RuntimeError("backend crashed")
 
-    def retry_cleanup(self, run_id):
+    def advance_cleanup(self, run_id):
         raise AssertionError("not used")
 
 
@@ -209,17 +229,19 @@ def test_node_ownership_scopes_scheduling_execution_and_leases():
 
     runtime = DaemonRuntime(repository, eu.id, clock, MockBackupEngine(repository))
     runtime.start()
-    runtime.tick()
+    run_until_terminal(runtime, repository, eu_runs[0].id)
     assert repository.get_run(eu_runs[0].id).state is RunState.SUCCESS
     assert repository.get_run(ua_runs[0].id).state is RunState.SCHEDULED
     assert len(repository.list_restore_points(eu_vm.id)) == 1
     assert repository.list_restore_points(ua_vm.id) == []
 
-    ua_daemon = repository.start_daemon(ua.id, NOW, instance_id="ua-daemon")
+    ua_daemon = controlled_daemon(repository, ua, NOW, "ua-daemon")
     assert repository.acquire_lease(ua_runs[0].id, ua_daemon.instance_id, NOW, 60) is not None
     repository.release_lease(ua_runs[0].id, ua_daemon.instance_id, NOW)
+    repository.release_controller(ua.id, ua_daemon.instance_id, NOW)
+    repository.stop_daemon(ua_daemon.instance_id, NOW)
     ua_runtime = DaemonRuntime(repository, ua.id, clock, MockBackupEngine(repository))
     ua_runtime.start()
-    ua_runtime.tick()
+    run_until_terminal(ua_runtime, repository, ua_runs[0].id)
     assert repository.get_run(ua_runs[0].id).state is RunState.SUCCESS
     assert len(repository.list_restore_points(ua_vm.id)) == 1
