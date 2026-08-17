@@ -69,3 +69,33 @@ finalization.
 
 `MockBackupEngine` drives these same operations deterministically and can inject
 backup or cleanup failures. It performs no actual backup I/O.
+
+## Local runtime layer
+
+Phase 2 adds orchestration above, rather than inside, the repository:
+
+- `IntervalScheduler` applies persisted interval schedules with idempotent
+  `RUN_ONCE` catch-up behavior;
+- `DaemonRuntime` persists daemon identity and heartbeat, coordinates VM-level
+  leases, drives the executor, retries cleanup, and performs startup recovery;
+- `BackupExecutor` separates runtime orchestration from the mock engine so a
+  future backend can implement execution without changing scheduling or lease
+  rules;
+- `Clock` isolates wall-clock time and makes scheduler and lease behavior
+  deterministic in tests.
+
+Unsafe post-backup states are never resumed speculatively. They remain unchanged
+with a persisted recovery marker until a future backend can reconcile external
+state. Full scheduler, lease, event, and recovery details are in
+[`runtime.md`](runtime.md).
+
+Node ownership is an invariant at both query and lease boundaries. A runtime
+schedules, recovers, and executes only runs for VMs owned by its own persisted
+node, and SQLite repository operations reject cross-node lease acquisition.
+
+An unresolved unsafe run also quarantines its VM independently of the lease
+table. Cleanup is serialized through that same VM lease. Expired leases cannot
+be renewed, and ordinary lease heartbeat renewal updates only the lease row
+rather than producing an unbounded event stream. Unexpected executor exceptions
+either enter recoverable cleanup while still safe or require explicit backend
+reconciliation after an unsafe state has been reached.

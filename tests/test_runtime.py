@@ -1,0 +1,168 @@
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from vmbackupd.clock import FakeClock
+from vmbackupd.engine import MockBackupEngine
+from vmbackupd.models import BackupJob, JobRun, Node, RunState, VM
+from vmbackupd.repository import SQLiteRepository
+from vmbackupd.runtime import DaemonRuntime
+
+
+NOW = datetime(2026, 2, 1, tzinfo=timezone.utc)
+
+
+def add_job(repository, node, name, vm=None):
+    if vm is None:
+        vm = VM(node_id=node.id, name=name, external_id=name)
+        repository.add_vm(vm)
+    job = BackupJob(vm_id=vm.id, name=f"job-{name}")
+    repository.add_job(job)
+    return vm, job
+
+
+def queued_run(repository, job):
+    run = JobRun(job_id=job.id, state=RunState.QUEUED)
+    repository.add_run(run)
+    return run
+
+
+def daemon(repository, node, clock, name):
+    return repository.start_daemon(node.id, clock.now(), instance_id=name)
+
+
+def advance_to(repository, job, target):
+    run = JobRun(job_id=job.id)
+    repository.add_run(run)
+    path = [RunState.QUEUED, RunState.PRECHECK, RunState.PREPARING]
+    for state in path:
+        repository.transition_run(run.id, state)
+        if state is target:
+            return repository.get_run(run.id)
+    repository.plan_run(run.id)
+    for state in (RunState.BACKING_UP, RunState.TRANSFERRING,
+                  RunState.VERIFYING, RunState.FINALIZING):
+        repository.transition_run(run.id, state)
+        if state is target:
+            return repository.get_run(run.id)
+    raise AssertionError(target)
+
+
+@pytest.fixture
+def runtime_domain():
+    repository = SQLiteRepository()
+    node = Node(name="runtime-node")
+    repository.add_node(node)
+    vm, first = add_job(repository, node, "first")
+    _, second = add_job(repository, node, "second", vm)
+    clock = FakeClock(NOW)
+    yield repository, node, vm, first, second, clock
+    repository.close()
+
+
+def test_two_jobs_for_same_vm_cannot_hold_leases(runtime_domain):
+    repository, node, _, first, second, clock = runtime_domain
+    owner = daemon(repository, node, clock, "owner")
+    run_a, run_b = queued_run(repository, first), queued_run(repository, second)
+    assert repository.acquire_lease(run_a.id, owner.instance_id, NOW, 60) is not None
+    assert repository.acquire_lease(run_b.id, owner.instance_id, NOW, 60) is None
+    assert repository.get_run(run_b.id).state is RunState.QUEUED
+
+
+def test_jobs_for_different_vms_can_hold_leases(runtime_domain):
+    repository, node, _, first, _, clock = runtime_domain
+    _, other = add_job(repository, node, "other-vm")
+    owner = daemon(repository, node, clock, "owner")
+    assert repository.acquire_lease(queued_run(repository, first).id, owner.instance_id, NOW, 60)
+    assert repository.acquire_lease(queued_run(repository, other).id, owner.instance_id, NOW, 60)
+    assert len(repository.list_leases()) == 2
+
+
+def test_expired_lease_can_be_reclaimed(runtime_domain):
+    repository, node, _, first, second, clock = runtime_domain
+    old = daemon(repository, node, clock, "old")
+    new = daemon(repository, node, clock, "new")
+    first_run, second_run = queued_run(repository, first), queued_run(repository, second)
+    repository.acquire_lease(first_run.id, old.instance_id, NOW, 60)
+    clock.advance(seconds=61)
+    lease = repository.acquire_lease(second_run.id, new.instance_id, clock.now(), 60)
+    assert lease is not None and lease.run_id == second_run.id
+    assert "LEASE_EXPIRED" in [e.event_type for e in repository.list_events(first_run.id)]
+
+
+def test_nonexpired_lease_cannot_be_stolen(runtime_domain):
+    repository, node, _, first, second, clock = runtime_domain
+    old = daemon(repository, node, clock, "old")
+    new = daemon(repository, node, clock, "new")
+    repository.acquire_lease(queued_run(repository, first).id, old.instance_id, NOW, 60)
+    assert repository.acquire_lease(
+        queued_run(repository, second).id, new.instance_id, NOW + timedelta(seconds=59), 60
+    ) is None
+
+
+def test_daemon_heartbeat_persists(runtime_domain):
+    repository, node, _, _, _, clock = runtime_domain
+    runtime = DaemonRuntime(repository, node.id, clock, MockBackupEngine(repository))
+    instance = runtime.start()
+    clock.advance(seconds=30)
+    runtime.heartbeat()
+    assert repository.get_daemon(instance).last_heartbeat_at == clock.now()
+    assert [e.event_type for e in repository.list_all_events()].count("DAEMON_STARTED") == 1
+    assert "DAEMON_HEARTBEAT" not in [e.event_type for e in repository.list_all_events()]
+
+
+def test_safe_prebackup_state_resumes_after_restart(runtime_domain):
+    repository, node, vm, first, _, clock = runtime_domain
+    run = advance_to(repository, first, RunState.PRECHECK)
+    runtime = DaemonRuntime(repository, node.id, clock, MockBackupEngine(repository))
+    runtime.start()
+    assert not repository.get_run(run.id).recovery_required
+    runtime.tick()
+    assert repository.get_run(run.id).state is RunState.SUCCESS
+    assert len(repository.list_restore_points(vm.id)) == 1
+
+
+def test_cleanup_is_retried_on_startup(runtime_domain):
+    repository, node, _, first, _, clock = runtime_domain
+    run = JobRun(job_id=first.id)
+    repository.add_run(run)
+    repository.transition_run(run.id, RunState.CLEANUP, "interrupted")
+    runtime = DaemonRuntime(repository, node.id, clock, MockBackupEngine(repository))
+    runtime.start()
+    assert repository.get_run(run.id).state is RunState.FAILED
+    assert "CLEANUP_RETRY" in [e.event_type for e in repository.list_events(run.id)]
+
+
+@pytest.mark.parametrize("unsafe_state", [
+    RunState.BACKING_UP, RunState.TRANSFERRING, RunState.VERIFYING, RunState.FINALIZING,
+])
+def test_unsafe_restart_requires_recovery_and_never_publishes(runtime_domain, unsafe_state):
+    repository, node, vm, first, _, clock = runtime_domain
+    run = advance_to(repository, first, unsafe_state)
+    runtime = DaemonRuntime(repository, node.id, clock, MockBackupEngine(repository))
+    runtime.start()
+    recovered = repository.get_run(run.id)
+    assert recovered.state is unsafe_state
+    assert recovered.recovery_required
+    assert repository.list_restore_points(vm.id) == []
+    runtime.tick()
+    assert repository.get_run(run.id).state is unsafe_state
+    assert repository.list_restore_points(vm.id) == []
+
+
+def test_stale_unsafe_lease_is_removed_without_restart(runtime_domain):
+    repository, node, vm, first, _, clock = runtime_domain
+    run = advance_to(repository, first, RunState.PRECHECK)
+    old = daemon(repository, node, clock, "dead-daemon")
+    repository.acquire_lease(run.id, old.instance_id, NOW, 30)
+    repository.transition_run(run.id, RunState.PREPARING)
+    repository.plan_run(run.id)
+    repository.transition_run(run.id, RunState.BACKING_UP)
+    clock.advance(seconds=31)
+    runtime = DaemonRuntime(repository, node.id, clock, MockBackupEngine(repository))
+    runtime.start()
+    assert repository.get_lease_for_run(run.id) is None
+    assert repository.get_run(run.id).recovery_required
+    runtime.tick()
+    assert repository.get_run(run.id).state is RunState.BACKING_UP
+    assert repository.list_restore_points(vm.id) == []

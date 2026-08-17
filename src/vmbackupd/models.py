@@ -44,6 +44,10 @@ class RestorePointStatus(StrEnum):
     AVAILABLE = "AVAILABLE"
 
 
+class CatchUpMode(StrEnum):
+    RUN_ONCE = "RUN_ONCE"
+
+
 @dataclass(frozen=True, slots=True)
 class BackupPolicy:
     max_incrementals_per_chain: int = 2
@@ -63,6 +67,21 @@ class RetentionPolicy:
             raise ValueError("restore_points_to_retain must be non-negative")
         if self.minimum_full_chains < 1:
             raise ValueError("minimum_full_chains must be at least 1")
+
+
+@dataclass(frozen=True, slots=True)
+class SchedulePolicy:
+    interval_seconds: int = 3600
+    misfire_grace_seconds: int = 0
+    catch_up_mode: CatchUpMode = CatchUpMode.RUN_ONCE
+
+    def __post_init__(self) -> None:
+        if self.interval_seconds < 60:
+            raise ValueError("interval_seconds must be at least 60")
+        if self.misfire_grace_seconds < 0:
+            raise ValueError("misfire_grace_seconds must be non-negative")
+        if self.catch_up_mode is not CatchUpMode.RUN_ONCE:
+            raise ValueError("only RUN_ONCE catch-up is supported")
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +106,8 @@ class BackupJob:
     name: str
     backup_policy: BackupPolicy = field(default_factory=BackupPolicy)
     retention_policy: RetentionPolicy = field(default_factory=RetentionPolicy)
+    schedule_policy: SchedulePolicy = field(default_factory=SchedulePolicy)
+    next_run_at: datetime | None = None
     enabled: bool = True
     id: str = field(default_factory=new_id)
     created_at: datetime = field(default_factory=utcnow)
@@ -104,6 +125,11 @@ class JobRun:
     error: str | None = None
     cleanup_error: str | None = None
     cleanup_attempts: int = 0
+    scheduled_for: datetime | None = None
+    is_catch_up: bool = False
+    missed_schedule_slots: int = 0
+    recovery_required: bool = False
+    recovery_reason: str | None = None
     created_at: datetime = field(default_factory=utcnow)
     updated_at: datetime = field(default_factory=utcnow)
 
@@ -132,10 +158,29 @@ class RestorePoint:
 
 @dataclass(frozen=True, slots=True)
 class Event:
-    job_run_id: str
+    job_run_id: str | None
     event_type: str
     message: str
     from_state: RunState | None = None
     to_state: RunState | None = None
     id: str = field(default_factory=new_id)
     created_at: datetime = field(default_factory=utcnow)
+
+
+@dataclass(frozen=True, slots=True)
+class DaemonInstance:
+    node_id: str
+    started_at: datetime
+    last_heartbeat_at: datetime
+    instance_id: str = field(default_factory=new_id)
+    stopped_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionLease:
+    vm_id: str
+    run_id: str
+    daemon_instance_id: str
+    acquired_at: datetime
+    lease_expires_at: datetime
+    heartbeat_at: datetime
