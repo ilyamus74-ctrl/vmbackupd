@@ -10,7 +10,7 @@ from .libvirt_backend import (
 )
 from .libvirt_execution import (
     LibvirtBackupExecutor, LibvirtExecutionSafetyError, QemuImageInspector,
-    StagingFilesystem, VirshBackupDriver,
+    QemuOutputImagePreparer, StagingFilesystem, VirshBackupDriver,
 )
 from .models import BackupPolicy, OverlapPolicy, RetentionPolicy, SchedulePolicy
 from .planner import BackupPlanner
@@ -44,6 +44,7 @@ __all__ = [
     "RetentionPolicy",
     "RecoveryEvidence",
     "QemuImageInspector",
+    "QemuOutputImagePreparer",
     "SchedulePolicy",
     "SQLiteRepository",
     "StagingPathPlanner",

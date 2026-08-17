@@ -84,10 +84,15 @@ def test_invalid_configuration_is_rejected(tmp_path, replacement):
 def test_qemu_user_group_names_resolve_or_fail(tmp_path):
     path = write_config(tmp_path, '\nbackup_data_user = "qemu-test"\nbackup_data_group = "qemu-group"\n')
     config = load_config(path, user_lookup=lambda name: SimpleNamespace(pw_uid=123),
-                         group_lookup=lambda name: SimpleNamespace(gr_gid=456))
+                         group_lookup=lambda name: SimpleNamespace(gr_gid=456),
+                         effective_uid=123)
     assert (config.storage.default.backup_data_uid, config.storage.default.backup_data_gid) == (123, 456)
     with pytest.raises(ConfigError, match="unknown backup data user"):
         load_config(path, user_lookup=lambda name: (_ for _ in ()).throw(KeyError(name)))
+    with pytest.raises(ConfigError, match="account running vmbackupd"):
+        load_config(path, user_lookup=lambda name: SimpleNamespace(pw_uid=123),
+                    group_lookup=lambda name: SimpleNamespace(gr_gid=456),
+                    effective_uid=999)
 
 
 def test_multiple_storage_destinations_default_and_validation(tmp_path):

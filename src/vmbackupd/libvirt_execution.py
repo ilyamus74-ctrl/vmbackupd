@@ -44,7 +44,7 @@ class VirshBackupDriver:
     def begin_backup(self, domain: str, backup_xml_file: str) -> CommandResult:
         result = self.runner.run(
             ("virsh", "--connect", self.connection_uri, "backup-begin", domain,
-             backup_xml_file),
+             backup_xml_file, "--reuse-external"),
             timeout=self.timeout,
         )
         if result.returncode != 0:
@@ -85,8 +85,76 @@ class QemuImageInspector:
             ) from exc
 
 
+class QemuOutputImagePreparer:
+    """Exclusively creates and identity-checks one fresh qcow2 backup target."""
+
+    def __init__(
+        self, runner: CommandRunner, staging: "StagingFilesystem",
+        inspector: QemuImageInspector | None = None, *, timeout: float = 30,
+    ) -> None:
+        self.runner = runner
+        self.staging = staging
+        self.inspector = inspector or QemuImageInspector(runner)
+        self.timeout = timeout
+
+    def prepare(
+        self, run_id: str, artifact: BackupArtifact, capacity: int,
+    ) -> os.stat_result:
+        destination = self.staging.require_data_path(run_id, artifact.object_id)
+        if artifact.format != "qcow2" or capacity <= 0:
+            raise LibvirtExecutionSafetyError("prepared output must be positive-size qcow2")
+        if destination.exists() or destination.is_symlink():
+            raise LibvirtExecutionSafetyError(f"artifact destination already exists: {destination}")
+        temporary = destination.with_name(f".{destination.name}.prepare-{artifact.id}")
+        if temporary.exists() or temporary.is_symlink():
+            raise LibvirtExecutionSafetyError("prepared output temporary path already exists")
+        created = False
+        linked_identity: tuple[int, int] | None = None
+        succeeded = False
+        try:
+            result = self.runner.run(
+                ("qemu-img", "create", "-f", "qcow2", str(temporary), str(capacity)),
+                timeout=self.timeout,
+            )
+            if result.returncode != 0:
+                raise CommandError(result)
+            created = True
+            temporary_info = temporary.lstat()
+            if not stat.S_ISREG(temporary_info.st_mode) or stat.S_ISLNK(temporary_info.st_mode):
+                raise LibvirtExecutionSafetyError("qemu-img did not create a regular output")
+            if temporary_info.st_uid != os.geteuid():
+                raise LibvirtExecutionSafetyError("prepared output is not owned by vmbackupd")
+            image = self.inspector.inspect(str(temporary))
+            if image.format != artifact.format or image.virtual_size != capacity:
+                raise LibvirtExecutionSafetyError(
+                    "prepared output format or virtual capacity does not match its plan"
+                )
+            os.chmod(temporary, 0o660, follow_symlinks=False)
+            if self.staging.backup_data_gid is not None:
+                self.staging.chown_group(temporary)
+            os.link(temporary, destination, follow_symlinks=False)
+            final_info = destination.lstat()
+            linked_identity = (final_info.st_dev, final_info.st_ino)
+            if (stat.S_ISLNK(final_info.st_mode) or not stat.S_ISREG(final_info.st_mode)
+                    or (final_info.st_dev, final_info.st_ino)
+                    != (temporary_info.st_dev, temporary_info.st_ino)):
+                raise LibvirtExecutionSafetyError("prepared output identity changed during publish")
+            directory_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            succeeded = True
+            return final_info
+        finally:
+            if not succeeded and linked_identity is not None:
+                self.staging.remove_exact_prepared(destination, *linked_identity)
+            if created and temporary.exists() and not temporary.is_symlink():
+                temporary.unlink()
+
+
 class StagingFilesystem:
-    """Separates daemon control files from QEMU-created backup data."""
+    """Separates daemon control files from QEMU-written backup data."""
 
     def __init__(
         self, control_root: str | Path,
@@ -108,6 +176,8 @@ class StagingFilesystem:
             raise ValueError("backup data mode must not be world-writable")
         if backup_data_uid is not None and backup_data_uid < 0:
             raise ValueError("backup_data_uid must be non-negative")
+        if backup_data_uid is not None and backup_data_uid != os.geteuid():
+            raise ValueError("backup_data_uid must identify the vmbackupd process owner")
         if backup_data_gid is not None and backup_data_gid < 0:
             raise ValueError("backup_data_gid must be non-negative")
         self.backup_data_uid = backup_data_uid
@@ -115,6 +185,19 @@ class StagingFilesystem:
         self.backup_data_mode = backup_data_mode
         self._chown = chown
         self.root = self.control_root
+
+    def chown_group(self, path: str | Path) -> None:
+        if self.backup_data_gid is not None:
+            self._chown(path, -1, self.backup_data_gid)
+
+    @staticmethod
+    def remove_exact_prepared(path: str | Path, device: int, inode: int) -> None:
+        candidate = Path(path)
+        if candidate.is_symlink() or not candidate.exists():
+            return
+        info = candidate.lstat()
+        if stat.S_ISREG(info.st_mode) and (info.st_dev, info.st_ino) == (device, inode):
+            candidate.unlink()
 
     def run_directory(self, run_id: str) -> Path:
         if not run_id or run_id in {".", ".."} or any(
@@ -158,12 +241,8 @@ class StagingFilesystem:
         os.chmod(run_dir, 0o700)
         data_run_dir.mkdir(mode=self.backup_data_mode)
         os.chmod(data_run_dir, self.backup_data_mode)
-        if self.backup_data_uid is not None or self.backup_data_gid is not None:
-            self._chown(
-                data_run_dir,
-                self.backup_data_uid if self.backup_data_uid is not None else -1,
-                self.backup_data_gid if self.backup_data_gid is not None else -1,
-            )
+        if self.backup_data_gid is not None:
+            self._chown(data_run_dir, -1, self.backup_data_gid)
         return run_dir
 
     def _require_direct_path(
@@ -235,7 +314,7 @@ class StagingFilesystem:
         return usage.free, usage.total
 
     def cleanup_metadata(self, run_id: str, artifacts: list[BackupArtifact]) -> None:
-        """Remove only control files in a never-started run; never disk targets."""
+        """Remove exact prepared targets and control files before external start only."""
         run_dir = self.run_directory(run_id)
         allowed = {self.backup_xml_path(run_id)}
         allowed.update(Path(a.object_id) for a in artifacts if a.kind is not ArtifactKind.DISK)
@@ -244,6 +323,20 @@ class StagingFilesystem:
             if path.is_symlink():
                 raise LibvirtExecutionSafetyError("refusing cleanup through symlink")
             if path.exists() and path.is_file():
+                path.unlink()
+        for artifact in artifacts:
+            if artifact.kind is not ArtifactKind.DISK:
+                continue
+            path = self.require_data_path(run_id, artifact.object_id)
+            if artifact.prepared_device is None or artifact.prepared_inode is None:
+                continue
+            if path.is_symlink():
+                raise LibvirtExecutionSafetyError("refusing prepared-target symlink cleanup")
+            if path.exists():
+                info = path.lstat()
+                if ((info.st_dev, info.st_ino)
+                        != (artifact.prepared_device, artifact.prepared_inode)):
+                    raise LibvirtExecutionSafetyError("refusing substituted target cleanup")
                 path.unlink()
         if run_dir.exists() and not run_dir.is_symlink() and not any(run_dir.iterdir()):
             run_dir.rmdir()
@@ -266,6 +359,7 @@ class LibvirtBackupExecutor:
         self, repository: SQLiteRepository, read_driver: VirshLibvirtDriver,
         mutation_driver: VirshBackupDriver, staging: StagingFilesystem,
         image_inspector: QemuImageInspector, *, allow_libvirt_mutation: bool = False,
+        output_preparer: QemuOutputImagePreparer | None = None,
         minimum_free_bytes: int = 0, minimum_free_percent: float = 0,
         clock: Clock | None = None,
     ) -> None:
@@ -276,6 +370,7 @@ class LibvirtBackupExecutor:
         self.mutation_driver = mutation_driver
         self.staging = staging
         self.image_inspector = image_inspector
+        self.output_preparer = output_preparer
         self.allow_libvirt_mutation = allow_libvirt_mutation
         self.minimum_free_bytes = minimum_free_bytes
         self.minimum_free_percent = minimum_free_percent
@@ -381,7 +476,7 @@ class LibvirtBackupExecutor:
             raise LibvirtExecutionSafetyError("; ".join(
                 f"{issue.code}: {issue.message}" for issue in preflight.errors
             ))
-        estimate = self._capacity_estimate(operation.domain_uuid, plan.disks)
+        estimate, capacities = self._capacity_estimate(operation.domain_uuid, plan.disks)
         free, total = self.staging.free_space()
         reserve = max(self.minimum_free_bytes, int(total * self.minimum_free_percent / 100))
         if estimate > free - reserve:
@@ -389,6 +484,23 @@ class LibvirtBackupExecutor:
                 f"insufficient staging space: estimate={estimate}, free={free}, reserve={reserve}"
             )
         run_dir = self.staging.prepare_new_run(run.id, plan.artifacts)
+        if self.output_preparer is None:
+            raise LibvirtExecutionSafetyError("output image preparation is not configured")
+        for artifact in plan.artifacts:
+            if artifact.kind is not ArtifactKind.DISK:
+                continue
+            capacity = capacities[artifact.disk_target or ""]
+            prepared = self.output_preparer.prepare(run.id, artifact, capacity)
+            try:
+                self.repository.record_prepared_artifact(
+                    artifact.id, capacity=capacity,
+                    device=prepared.st_dev, inode=prepared.st_ino,
+                )
+            except Exception:
+                self.staging.remove_exact_prepared(
+                    artifact.object_id, prepared.st_dev, prepared.st_ino
+                )
+                raise
         domain_artifact = self._artifact(plan.artifacts, ArtifactKind.DOMAIN_XML)
         self.staging.atomic_write(run.id, domain_artifact.object_id, current_xml.encode())
         self.repository.transition_artifact_state(
@@ -504,11 +616,24 @@ class LibvirtBackupExecutor:
             info = path.lstat() if path.exists() or path.is_symlink() else None
             if (info is None or stat.S_ISLNK(info.st_mode)
                     or not stat.S_ISREG(info.st_mode) or info.st_size <= 0):
-                raise LibvirtExecutionSafetyError(f"invalid disk artifact: {path}")
+                return self._quarantine(run.id, f"artifact access failed: invalid disk {path}")
+            if (artifact.prepared_device is None or artifact.prepared_inode is None
+                    or (info.st_dev, info.st_ino)
+                    != (artifact.prepared_device, artifact.prepared_inode)):
+                return self._quarantine(run.id, f"artifact identity changed: {path}")
+            try:
+                descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                os.close(descriptor)
+            except OSError as exc:
+                return self._quarantine(run.id, f"artifact access failed: {path}: {exc}")
             image = self.image_inspector.inspect(str(path))
             if image.format != artifact.format:
                 raise LibvirtExecutionSafetyError(
                     f"disk artifact format mismatch for {artifact.disk_target}"
+                )
+            if artifact.planned_capacity is None or image.virtual_size != artifact.planned_capacity:
+                raise LibvirtExecutionSafetyError(
+                    f"disk artifact virtual size mismatch for {artifact.disk_target}"
                 )
             current = self.repository.get_artifact(artifact.id)
             if current.state is ArtifactState.COMPLETE:
@@ -587,8 +712,11 @@ class LibvirtBackupExecutor:
         self.staging.cleanup_metadata(run_id, self.repository.list_artifacts_for_run(run_id))
         return self.repository.finish_cleanup(run_id)
 
-    def _capacity_estimate(self, domain: str, disks: tuple[RunDisk, ...]) -> int:
+    def _capacity_estimate(
+        self, domain: str, disks: tuple[RunDisk, ...],
+    ) -> tuple[int, dict[str, int]]:
         total = 0
+        capacities: dict[str, int] = {}
         for disk in disks:
             if not disk.backup_enabled:
                 continue
@@ -604,9 +732,10 @@ class LibvirtBackupExecutor:
                     "Capacity must be positive"
                 )
             total += info.capacity
+            capacities[disk.target_dev] = info.capacity
         if total <= 0:
             raise LibvirtExecutionSafetyError("backup capacity cannot be estimated safely")
-        return total
+        return total, capacities
 
     @staticmethod
     def _require_same_inventory(frozen: tuple[RunDisk, ...], current: tuple) -> None:

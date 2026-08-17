@@ -12,7 +12,8 @@ from .command import SubprocessCommandRunner
 from .config import AppConfig
 from .libvirt_backend import VirshLibvirtDriver
 from .libvirt_execution import (
-    LibvirtBackupExecutor, QemuImageInspector, StagingFilesystem, VirshBackupDriver,
+    LibvirtBackupExecutor, QemuImageInspector, QemuOutputImagePreparer,
+    StagingFilesystem, VirshBackupDriver,
 )
 from .local_api import ApiServer
 from .models import StorageDestination
@@ -143,9 +144,11 @@ class RuntimeWorker:
                     backup_data_gid=destination.backup_data_gid,
                     backup_data_mode=destination.backup_data_mode,
                 )
+                inspector = QemuImageInspector(runner)
                 return LibvirtBackupExecutor(
                     repository, read_driver, mutation_driver, staging,
-                    QemuImageInspector(runner),
+                    inspector,
+                    output_preparer=QemuOutputImagePreparer(runner, staging, inspector),
                     allow_libvirt_mutation=self.config.libvirt.allow_mutation,
                     minimum_free_bytes=destination.minimum_free_bytes,
                     minimum_free_percent=destination.minimum_free_percent, clock=clock,

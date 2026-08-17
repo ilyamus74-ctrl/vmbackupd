@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import grp
+import os
 import pwd
 import tomllib
 from dataclasses import dataclass
@@ -85,7 +86,9 @@ def load_config(
     path: str | Path = DEFAULT_CONFIG_PATH, *,
     user_lookup: Callable[[str], object] = pwd.getpwnam,
     group_lookup: Callable[[str], object] = grp.getgrnam,
+    effective_uid: int | None = None,
 ) -> AppConfig:
+    daemon_uid = os.geteuid() if effective_uid is None else effective_uid
     try:
         with Path(path).open("rb") as stream:
             raw = tomllib.load(stream)
@@ -126,6 +129,10 @@ def load_config(
                 uid = int(user_lookup(str(user)).pw_uid) if user is not None else None
             except KeyError as exc:
                 raise ConfigError(f"unknown backup data user: {user}") from exc
+            if uid is not None and uid != daemon_uid:
+                raise ConfigError(
+                    "backup data user must be the account running vmbackupd"
+                )
             try:
                 gid = int(group_lookup(str(group)).gr_gid) if group is not None else None
             except KeyError as exc:

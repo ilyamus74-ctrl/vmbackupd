@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -15,7 +16,7 @@ from vmbackupd.libvirt_backend import (
 )
 from vmbackupd.libvirt_execution import (
     ImageInfo, LibvirtBackupExecutor, LibvirtExecutionSafetyError,
-    QemuImageInspector, StagingFilesystem, VirshBackupDriver,
+    QemuImageInspector, QemuOutputImagePreparer, StagingFilesystem, VirshBackupDriver,
 )
 from vmbackupd.models import (
     ArtifactKind, ArtifactState, BackupArtifact, BackupJob, BackupKind, BackupPolicy, JobRun,
@@ -107,6 +108,22 @@ class Mutation:
         return CommandResult(("virsh",), "", "", 0)
 
 
+class PreparedImages:
+    def __init__(self):
+        self.paths = []
+
+    def prepare(self, run_id, artifact, capacity):
+        path = Path(artifact.object_id)
+        self.paths.append((path, capacity))
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o660)
+        try:
+            os.write(descriptor, b"prepared")
+        finally:
+            os.close(descriptor)
+        os.chmod(path, 0o660)
+        return path.lstat()
+
+
 @pytest.fixture
 def execution(tmp_path):
     repository = SQLiteRepository()
@@ -135,12 +152,13 @@ def execution(tmp_path):
     repository.close()
 
 
-def executor(execution, *, allow=True, mutation=None, images=None, **kwargs):
+def executor(execution, *, allow=True, mutation=None, images=None, prepared=None, **kwargs):
     repository, _, _, _, driver, staging, clock = execution
     mutation = mutation or Mutation(repository)
     value = LibvirtBackupExecutor(
         repository, driver, mutation, staging, images or Images(),
-        allow_libvirt_mutation=allow, clock=clock, **kwargs,
+        allow_libvirt_mutation=allow, output_preparer=prepared or PreparedImages(),
+        clock=clock, **kwargs,
     )
     return value, mutation
 
@@ -180,7 +198,7 @@ def test_phase3b_rejects_checkpoint_bearing_full(execution, column):
     assert mutation.calls == []
 
 
-def test_start_creates_directory_and_control_files_but_not_disk_targets(execution):
+def test_start_creates_control_files_and_fresh_prepared_disk_targets(execution):
     value, mutation = executor(execution)
     run = execution[3]
     value.advance_run(run.id)
@@ -188,12 +206,18 @@ def test_start_creates_directory_and_control_files_but_not_disk_targets(executio
     assert run_dir.is_dir()
     assert (run_dir / "domain.xml").is_file()
     assert (run_dir / "backup.xml").is_file()
-    assert not (run_dir / "vda.qcow2").exists()
-    assert not (run_dir / "vdb.qcow2").exists()
     data_dir = execution[5].data_run_directory(run.id)
     assert data_dir.is_dir()
-    assert not (data_dir / "vda.qcow2").exists()
-    assert not (data_dir / "vdb.qcow2").exists()
+    assert (data_dir / "vda.qcow2").is_file()
+    assert (data_dir / "vdb.qcow2").is_file()
+    assert (data_dir / "vda.qcow2").stat().st_mode & 0o777 == 0o660
+    disk_artifacts = [
+        artifact for artifact in execution[0].list_artifacts_for_run(run.id)
+        if artifact.kind is ArtifactKind.DISK
+    ]
+    assert all(artifact.planned_capacity == 1024 for artifact in disk_artifacts)
+    assert all(artifact.prepared_device is not None for artifact in disk_artifacts)
+    assert all(artifact.prepared_inode is not None for artifact in disk_artifacts)
     assert mutation.calls
 
 
@@ -257,7 +281,9 @@ def test_capacity_sums_enabled_disks_and_excludes_disabled(execution):
         disks[1].source_path, disks[1].source_format, False,
         disks[1].planned_artifact_id,
     )
-    assert value._capacity_estimate("domain-uuid", (disks[0], disabled)) == 100
+    assert value._capacity_estimate("domain-uuid", (disks[0], disabled)) == (
+        100, {"vda": 100}
+    )
     assert driver.block_info_calls == [("domain-uuid", "vda")]
 
 
@@ -371,8 +397,9 @@ def prepare_verification(execution):
 def test_missing_disk_or_qemu_inspection_failure_blocks_verification(execution):
     value, _, data_dir = prepare_verification(execution)
     (data_dir / "vdb.qcow2").unlink()
-    with pytest.raises(LibvirtExecutionSafetyError, match="invalid disk artifact"):
-        value.advance_run(execution[3].id)
+    result = value.advance_run(execution[3].id)
+    assert result.recovery_required
+    assert "artifact access failed" in (result.recovery_reason or "")
     assert execution[0].get_run(execution[3].id).state is RunState.VERIFYING
 
 
@@ -407,17 +434,137 @@ def test_manifest_contains_all_disks_and_verified_artifacts_finalize_atomically(
     assert len(execution[0].list_restore_points(execution[1].id)) == 1
 
 
-def test_mutating_driver_surface_is_exact_argv_without_reuse_external(tmp_path):
+def test_mutating_driver_surface_is_exact_argv_with_restricted_reuse_external(tmp_path):
     command = (
         "virsh", "--connect", "test:///default", "backup-begin", "domain-uuid",
-        str(tmp_path / "backup.xml"),
+        str(tmp_path / "backup.xml"), "--reuse-external",
     )
     runner = FakeCommandRunner({command: (0, "", "")})
     VirshBackupDriver(runner, "test:///default", timeout=3).begin_backup(
         "domain-uuid", str(tmp_path / "backup.xml")
     )
     assert runner.calls == [(command, 3)]
-    assert "--reuse-external" not in command
+    assert command[-1] == "--reuse-external"
+
+
+def test_qemu_output_preparation_is_argv_only_exclusive_and_identity_checked(tmp_path):
+    control, data = tmp_path / "control", tmp_path / "data"
+    staging = StagingFilesystem(control, data)
+    artifact = filesystem_artifacts(control, data)[0]
+    staging.prepare_new_run("safe-run", filesystem_artifacts(control, data))
+
+    class CreateRunner:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, argv, *, timeout=None):
+            args = tuple(argv)
+            self.calls.append((args, timeout))
+            if args[1:4] == ("create", "-f", "qcow2"):
+                Path(args[4]).write_bytes(b"qcow2-header")
+                return CommandResult(args, "", "", 0)
+            if args[:3] == ("qemu-img", "info", "--output=json"):
+                return CommandResult(
+                    args, '{"format":"qcow2","virtual-size":4096}', "", 0
+                )
+            raise AssertionError(args)
+
+    runner = CreateRunner()
+    prepared = QemuOutputImagePreparer(runner, staging).prepare(
+        "safe-run", artifact, 4096
+    )
+    destination = Path(artifact.object_id)
+    assert destination.is_file()
+    assert (prepared.st_dev, prepared.st_ino) == (
+        destination.stat().st_dev, destination.stat().st_ino
+    )
+    assert destination.stat().st_mode & 0o777 == 0o660
+    assert runner.calls[0][0][:4] == ("qemu-img", "create", "-f", "qcow2")
+    assert runner.calls[0][0][-1] == "4096"
+    assert runner.calls[1][0][:3] == ("qemu-img", "info", "--output=json")
+
+
+@pytest.mark.parametrize("collision", ["file", "symlink"])
+def test_output_preparer_never_clobbers_existing_destination(tmp_path, collision):
+    control, data = tmp_path / "control", tmp_path / "data"
+    staging = StagingFilesystem(control, data)
+    artifacts = filesystem_artifacts(control, data)
+    staging.prepare_new_run("safe-run", artifacts)
+    destination = Path(artifacts[0].object_id)
+    if collision == "file":
+        destination.write_bytes(b"existing")
+    else:
+        destination.symlink_to(data / "elsewhere")
+    runner = FakeCommandRunner()
+    with pytest.raises(LibvirtExecutionSafetyError, match="already exists"):
+        QemuOutputImagePreparer(runner, staging).prepare("safe-run", artifacts[0], 4096)
+    if collision == "file":
+        assert destination.read_bytes() == b"existing"
+    else:
+        assert destination.is_symlink()
+    assert runner.calls == []
+
+
+def test_failure_before_start_requested_cleans_only_prepared_identity(execution):
+    class FailsSecond(PreparedImages):
+        def prepare(self, run_id, artifact, capacity):
+            if len(self.paths) == 1:
+                raise LibvirtExecutionSafetyError("second preparation failed")
+            return super().prepare(run_id, artifact, capacity)
+
+    prepared = FailsSecond()
+    value, mutation = executor(execution, prepared=prepared)
+    result = value.advance_run(execution[3].id)
+    first_path = prepared.paths[0][0]
+    assert result.state is RunState.CLEANUP
+    assert execution[0].get_libvirt_operation(result.id).external_state is LibvirtExternalState.PLANNED
+    assert first_path.exists()
+    assert value.advance_cleanup(result.id).state is RunState.FAILED
+    assert not first_path.exists()
+    assert mutation.calls == []
+
+
+def test_failure_after_start_requested_preserves_prepared_targets(execution):
+    mutation = Mutation(execution[0], error=TimeoutError("ambiguous"))
+    value, _ = executor(execution, mutation=mutation)
+    result = value.advance_run(execution[3].id)
+    paths = [Path(a.object_id) for a in execution[0].list_artifacts_for_run(result.id)
+             if a.kind is ArtifactKind.DISK]
+    assert result.recovery_required
+    assert all(path.exists() for path in paths)
+
+
+def test_completed_target_inode_substitution_is_quarantined(execution):
+    value, _, data_dir = prepare_verification(execution)
+    target = data_dir / "vda.qcow2"
+    target.unlink()
+    target.write_bytes(b"replacement")
+    result = value.advance_run(execution[3].id)
+    assert result.recovery_required
+    assert "artifact identity changed" in (result.recovery_reason or "")
+
+
+def test_unreadable_completed_target_is_quarantined(execution, monkeypatch):
+    value, _, data_dir = prepare_verification(execution)
+    target = data_dir / "vda.qcow2"
+    original_open = os.open
+
+    def deny_target(path, flags, *args, **kwargs):
+        if Path(path) == target and flags & os.O_RDONLY == os.O_RDONLY:
+            raise PermissionError("denied")
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr("vmbackupd.libvirt_execution.os.open", deny_target)
+    result = value.advance_run(execution[3].id)
+    assert result.recovery_required
+    assert "artifact access failed" in (result.recovery_reason or "")
+
+
+def test_completed_output_virtual_capacity_must_match_prepared_plan(execution):
+    value, _, _ = prepare_verification(execution)
+    value.image_inspector = Images(virtual_size=999)
+    with pytest.raises(LibvirtExecutionSafetyError, match="virtual size mismatch"):
+        value.advance_run(execution[3].id)
 
 
 def test_qemu_image_inspector_is_read_only_json_argv():
@@ -536,7 +683,7 @@ def test_data_directory_mode_and_optional_ownership_are_explicit(tmp_path):
     calls = []
     control, data = tmp_path / "control", tmp_path / "data"
     staging = StagingFilesystem(
-        control, data, backup_data_uid=123, backup_data_gid=456,
+        control, data, backup_data_uid=os.geteuid(), backup_data_gid=456,
         backup_data_mode=0o750,
         chown=lambda path, uid, gid: calls.append((Path(path), uid, gid)),
     )
@@ -544,12 +691,12 @@ def test_data_directory_mode_and_optional_ownership_are_explicit(tmp_path):
     data_dir = staging.data_run_directory("safe-run")
     assert data_dir.stat().st_mode & 0o777 == 0o750
     assert staging.run_directory("safe-run").stat().st_mode & 0o777 == 0o700
-    assert calls == [(data_dir, 123, 456)]
+    assert calls == [(data_dir, -1, 456)]
     assert not any(data_dir.iterdir())
 
 
 @pytest.mark.parametrize(("uid", "gid", "expected"), [
-    (123, None, (123, -1)),
+    (os.geteuid(), None, None),
     (None, 456, (-1, 456)),
     (None, None, None),
 ])
@@ -562,6 +709,14 @@ def test_optional_data_ownership_is_deterministic(tmp_path, uid, gid, expected):
     )
     staging.prepare_new_run("safe-run", filesystem_artifacts(control, data))
     assert calls == ([] if expected is None else [expected])
+
+
+def test_data_directory_cannot_be_transferred_to_a_different_user(tmp_path):
+    with pytest.raises(ValueError, match="process owner"):
+        StagingFilesystem(
+            tmp_path / "control", tmp_path / "data",
+            backup_data_uid=os.geteuid() + 1,
+        )
 
 
 def test_world_writable_data_mode_is_forbidden(tmp_path):

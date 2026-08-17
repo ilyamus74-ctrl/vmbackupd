@@ -177,6 +177,15 @@ including independently configurable roots and free-space accounting on the
 data filesystem. Data-directory mode and optional ownership are explicit; no
 QEMU UID/GID is embedded in the backend.
 
+Live integration established that system libvirt may leave a QEMU-created push
+target `root:root` mode 0600. The execution boundary therefore prepares each
+fresh qcow2 target itself after capacity checks, records its device/inode and
+virtual capacity, and passes restricted `--reuse-external` to `backup-begin`.
+This is not general existing-file reuse: collisions, symlinks, cross-run paths,
+and identity substitution are fatal. Before `START_REQUESTED`, cleanup may
+remove only an identity-matching prepared target; afterward output is preserved
+for verification or reconciliation.
+
 Fast completed backups are accepted without active-match observation only for
 an uninterrupted executor call fenced by the live node controller and VM lease.
 Recovery and takeover paths retain conservative identity requirements.

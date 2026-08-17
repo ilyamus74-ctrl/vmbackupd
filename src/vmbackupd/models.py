@@ -224,6 +224,9 @@ class BackupArtifact:
     size_bytes: int | None = None
     checksum_algorithm: str | None = None
     checksum: str | None = None
+    planned_capacity: int | None = None
+    prepared_device: int | None = None
+    prepared_inode: int | None = None
     id: str = field(default_factory=new_id)
     created_at: datetime = field(default_factory=utcnow)
     verified_at: datetime | None = None
@@ -235,6 +238,8 @@ class BackupArtifact:
             raise ValueError("non-DISK artifact cannot have disk_target")
         if self.size_bytes is not None and self.size_bytes < 0:
             raise ValueError("artifact size_bytes must be non-negative")
+        if self.planned_capacity is not None and self.planned_capacity <= 0:
+            raise ValueError("artifact planned_capacity must be positive")
 
 
 @dataclass(frozen=True, slots=True)

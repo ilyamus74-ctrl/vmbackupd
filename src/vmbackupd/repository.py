@@ -116,6 +116,8 @@ class SQLiteRepository:
                 disk_target TEXT, object_id TEXT NOT NULL UNIQUE, format TEXT,
                 size_bytes INTEGER CHECK(size_bytes IS NULL OR size_bytes >= 0),
                 checksum_algorithm TEXT, checksum TEXT,
+                planned_capacity INTEGER CHECK(planned_capacity IS NULL OR planned_capacity > 0),
+                prepared_device INTEGER, prepared_inode INTEGER,
                 state TEXT NOT NULL CHECK(state IN
                     ('PLANNED', 'WRITING', 'COMPLETE', 'VERIFIED', 'PUBLISHED')),
                 created_at TEXT NOT NULL, verified_at TEXT,
@@ -455,11 +457,13 @@ class SQLiteRepository:
         self.connection.execute(
             """INSERT INTO backup_artifacts
                (id, job_run_id, restore_point_id, kind, disk_target, object_id, format,
-                size_bytes, checksum_algorithm, checksum, state, created_at, verified_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                size_bytes, checksum_algorithm, checksum, planned_capacity,
+                prepared_device, prepared_inode, state, created_at, verified_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (artifact.id, artifact.job_run_id, artifact.restore_point_id, artifact.kind,
              artifact.disk_target, artifact.object_id, artifact.format, artifact.size_bytes,
-             artifact.checksum_algorithm, artifact.checksum, artifact.state,
+             artifact.checksum_algorithm, artifact.checksum, artifact.planned_capacity,
+             artifact.prepared_device, artifact.prepared_inode, artifact.state,
              artifact.created_at.isoformat(),
              artifact.verified_at.isoformat() if artifact.verified_at else None),
         )
@@ -579,11 +583,14 @@ class SQLiteRepository:
                     """INSERT INTO backup_artifacts
                        (id, job_run_id, restore_point_id, kind, disk_target, object_id,
                         format, size_bytes, checksum_algorithm, checksum, state,
+                        planned_capacity, prepared_device, prepared_inode,
                         created_at, verified_at)
-                       VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (artifact.id, run_id, artifact.kind, artifact.disk_target,
                      artifact.object_id, artifact.format, artifact.size_bytes,
                      artifact.checksum_algorithm, artifact.checksum, artifact.state,
+                     artifact.planned_capacity, artifact.prepared_device,
+                     artifact.prepared_inode,
                      artifact.created_at.isoformat(),
                      artifact.verified_at.isoformat() if artifact.verified_at else None),
                 )
@@ -731,6 +738,24 @@ class SQLiteRepository:
             )
         return self.get_artifact(artifact_id)
 
+    def record_prepared_artifact(
+        self, artifact_id: str, *, capacity: int, device: int, inode: int,
+    ) -> BackupArtifact:
+        artifact = self.get_artifact(artifact_id)
+        if artifact.kind is not ArtifactKind.DISK or artifact.state is not ArtifactState.PLANNED:
+            raise DomainInvariantError("only a planned disk artifact may be prepared")
+        if capacity <= 0 or device < 0 or inode <= 0:
+            raise DomainInvariantError("invalid prepared artifact identity")
+        if artifact.prepared_device is not None or artifact.prepared_inode is not None:
+            raise DomainInvariantError("artifact target was already prepared")
+        with self.connection:
+            self.connection.execute(
+                """UPDATE backup_artifacts SET planned_capacity = ?, prepared_device = ?,
+                   prepared_inode = ? WHERE id = ?""",
+                (capacity, device, inode, artifact_id),
+            )
+        return self.get_artifact(artifact_id)
+
     def get_persisted_libvirt_plan(self, run_id: str) -> PersistedLibvirtPlan | None:
         operation = self.get_libvirt_operation(run_id)
         if operation is None:
@@ -792,8 +817,13 @@ class SQLiteRepository:
                     )
                     for artifact in synthetic:
                         self.connection.execute(
-                            """INSERT INTO backup_artifacts VALUES
-                               (?, ?, NULL, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?)""",
+                            """INSERT INTO backup_artifacts
+                               (id, job_run_id, restore_point_id, kind, disk_target,
+                                object_id, format, size_bytes, checksum_algorithm, checksum,
+                                planned_capacity, prepared_device, prepared_inode, state,
+                                created_at, verified_at)
+                               VALUES (?, ?, NULL, ?, ?, ?, ?, NULL, NULL, NULL,
+                                       NULL, NULL, NULL, ?, ?, ?)""",
                             (artifact.id, run_id, artifact.kind, artifact.disk_target,
                              artifact.object_id, artifact.format, artifact.state,
                              artifact.created_at.isoformat(), now.isoformat()),
@@ -1608,6 +1638,8 @@ class SQLiteRepository:
             disk_target=row["disk_target"], object_id=row["object_id"],
             format=row["format"], size_bytes=row["size_bytes"],
             checksum_algorithm=row["checksum_algorithm"], checksum=row["checksum"],
+            planned_capacity=row["planned_capacity"],
+            prepared_device=row["prepared_device"], prepared_inode=row["prepared_inode"],
             state=ArtifactState(row["state"]),
             created_at=datetime.fromisoformat(row["created_at"]),
             verified_at=datetime.fromisoformat(row["verified_at"]) if row["verified_at"] else None,

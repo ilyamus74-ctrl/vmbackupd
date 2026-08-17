@@ -19,8 +19,9 @@ name = "local-root"
 control_root = "/var/lib/vmbackupd/control/local-root"
 backup_data_root = "/var/lib/libvirt/images/vmbackupd"
 backup_data_mode = "0750"
-# Set these to accounts present on the target host.
-# backup_data_user = "qemu"
+# If set, backup_data_user must be the account running vmbackupd.
+# backup_data_user = "vmbackupd"
+# Set the group through which QEMU can write prepared targets.
 # backup_data_group = "qemu"
 minimum_free_bytes = 0
 minimum_free_percent = 5

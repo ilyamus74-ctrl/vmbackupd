@@ -12,12 +12,16 @@ executor.
 `VirshBackupDriver` exposes one mutation and invokes it with an argv list:
 
 ```text
-virsh --connect URI backup-begin DOMAIN BACKUP_XML_FILE
+virsh --connect URI backup-begin DOMAIN BACKUP_XML_FILE --reuse-external
 ```
 
-It does not use `--reuse-external`, and submission has a short configurable
-timeout. There is no abort, checkpoint, snapshot, block-job, or guest-freeze
-mutation. Ambiguous state is quarantined instead of aborted or retried.
+`--reuse-external` is narrowly permitted because
+vmbackupd has just created every referenced target exclusively for this exact
+run and persisted its device/inode identity. It never means reuse an arbitrary
+existing image or an artifact from another run. Submission has a short
+configurable timeout. There is no abort, checkpoint, snapshot, block-job, or
+guest-freeze mutation. Ambiguous state is quarantined instead of aborted or
+retried.
 
 `StagingFilesystem` separates private control state from QEMU output:
 
@@ -44,11 +48,21 @@ filesystem; byte and percentage reserves must remain after the estimate. A
 missing, malformed, zero, or negative libvirt capacity refuses the backup
 before staging or `backup-begin`.
 
-The control directory is mode 0700. vmbackupd may create the QEMU data directory
-with an explicit non-world-writable mode and optional configured UID/GID, but
-disk destinations are never pre-created. Disk and control artifact paths must
-be direct children of their respective run directories. No symlink may be
-followed and a pre-existing directory is conservatively refused.
+The control directory is mode 0700. The data run directory defaults to 0750;
+QEMU only needs traversal because it writes an already prepared file. After the
+capacity/reserve check, vmbackupd creates each qcow2 target through argv-only
+`qemu-img create`, validates its format and full virtual capacity, publishes it
+to the final name with no-clobber semantics, and records device/inode identity.
+The prepared file is daemon-owned, mode 0660, and uses the configured backup
+data group when supplied. Disk and control artifact paths must be direct
+children of their respective run directories. No symlink may be followed and a
+pre-existing directory or target is conservatively refused.
+
+This is required by observed `qemu:///system` DAC behavior: when libvirt/QEMU
+creates a push target itself it can leave it `root:root` mode 0600, unreadable
+to an unprivileged vmbackupd after completion. Restricted `--reuse-external`
+lets QEMU temporarily access a target whose durable ownership was established
+by vmbackupd. No privileged post-backup chmod/chown repair is attempted.
 The immediately inspected domain XML and persisted backup XML are written using
 temporary-file, fsync, and rename semantics. That `domain.xml` is the restore
 configuration and is not replaced with a later domain definition.
@@ -99,8 +113,14 @@ point, chain lifecycle changes, and SUCCESS together. Phase 3B does not run a
 long `qemu-img check` or compute full-image hashes inside a daemon tick.
 
 Before external start, cleanup may remove only daemon-owned metadata inside the
-run directory. Once `START_REQUESTED` exists, automatic filesystem cleanup is
-refused because QEMU may own output state.
+run directory and prepared disk targets whose persisted device/inode still
+match. A prepared image alone does not imply that libvirt was called. Once
+`START_REQUESTED` exists, automatic filesystem cleanup is refused because QEMU
+may own output state; RUNNING and UNKNOWN targets are likewise preserved.
+
+Before completed output is inspected, vmbackupd requires the path to remain the
+same prepared regular file and proves it is readable. Substitution or access
+failure quarantines the run without chmod/chown and without publication.
 
 ## Development integration profile
 

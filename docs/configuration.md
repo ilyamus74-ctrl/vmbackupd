@@ -15,8 +15,12 @@ reserves, and optional user/group names.
 Paths are absolute and traversal-free; roots differ; modes are octal and not
 world-writable; intervals and reserves are bounded. User/group names resolve
 through the host account database at startup and unknown names fail startup.
-Numeric Fedora QEMU identities are not product defaults. Configuration and
-persisted destination metadata must agree.
+When `backup_data_user` is present it must resolve to the account actually
+running vmbackupd; the daemon cannot give away ownership of the 0750 run
+directory it uses to prepare targets. `backup_data_group` identifies the group
+through which QEMU may write mode-0660 prepared images. Numeric Fedora QEMU
+identities are not product defaults. Configuration and persisted destination
+metadata must agree.
 Every configured destination is persisted idempotently, and SQLite retains
 exactly one default per Node. `StorageDestination` names are unique within a
 Node, so different hosts may use the same names with different local paths.

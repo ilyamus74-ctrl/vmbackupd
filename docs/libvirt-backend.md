@@ -15,6 +15,21 @@ be concurrently modified. `qemu-img info` remains the read-only structural
 inspector for completed backup output after libvirt/QEMU has finished writing
 it.
 
+## Restricted external-target reuse
+
+FULL push execution uses `--reuse-external` only with a target freshly created
+by vmbackupd inside the exact frozen run data directory. Preparation is
+exclusive and no-clobber; qcow2 format, virtual capacity, direct-child path,
+regular-file type, ownership, and device/inode identity are checked before
+`START_REQUESTED`. Any pre-existing destination is a collision, never reusable
+input. The persisted identity is checked again after completion before output
+`qemu-img info` verification.
+
+This boundary addresses libvirt system-session DAC behavior that can otherwise
+leave QEMU-created output as `root:root` mode 0600. vmbackupd establishes mode
+0660 and the configured QEMU-access group before start. It does not introduce a
+root helper or repair permissions after backup.
+
 Phase 3A prepares persistent multi-disk backup plans and performs read-only
 libvirt inspection. It never modifies a domain, backup, checkpoint, or snapshot,
 and it creates no staging files.
