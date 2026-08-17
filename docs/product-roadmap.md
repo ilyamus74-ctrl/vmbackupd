@@ -62,6 +62,18 @@ will consume equivalent API operations rather than invoke the console client.
 - Later: restore execution, retention deletion, deeper verification, and remote
   replication.
 
+Future retention deletion is constrained by a permanent fail-safe contract:
+**no new valid backup means no automatic deletion**. Automatic expiration is a
+post-success action, permitted only after an `AVAILABLE` restore point has been
+atomically published and only for older eligible closed chains belonging to the
+same VM, job, and storage destination. Retention never reclaims old backups to
+make space before a replacement succeeds. Disabling/removing a job or changing
+its policy is not a destructive backup operation; explicit operator deletion
+and purge workflows remain separate future features.
+
 GitHub, COPR, and Fedora repositories are future publishing channels. Choosing
 one does not change the daemon/API/client architecture or permit
 distribution-specific backup logic.
+
+Phase 3C implements the shared local control boundary. The future Cockpit client
+must use the same logical methods and must not bypass the application service.

@@ -120,6 +120,26 @@ def test_failed_full_keeps_previous_active_chain(domain):
     assert len(repository.list_chains(vm.id)) == 1
 
 
+def test_failed_replacement_preserves_published_backup_and_active_chain(domain):
+    repository, _, _ = domain
+    vm, job = add_domain(repository, "retention-failsafe", 0)
+    engine = MockBackupEngine(repository)
+
+    successful = engine.execute(job.id)
+    points_before = repository.list_restore_points(vm.id)
+    assert len(points_before) == 1
+    artifacts_before = repository.list_artifacts_for_restore_point(points_before[0].id)
+    active_chain_id = successful.planned_chain_id
+
+    failed = engine.execute(job.id, fail_at=RunState.VERIFYING)
+
+    assert failed.state is RunState.FAILED
+    assert repository.list_restore_points(vm.id) == points_before
+    assert repository.list_artifacts_for_restore_point(points_before[0].id) == artifacts_before
+    assert repository.get_chain(active_chain_id).status is BackupChainStatus.ACTIVE
+    assert len(repository.list_chains(vm.id)) == 1
+
+
 def test_successful_full_closes_previous_and_activates_new(domain):
     repository, _, _ = domain
     vm, job = add_domain(repository, "replace-ok", 0)

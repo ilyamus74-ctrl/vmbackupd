@@ -11,7 +11,8 @@ from .models import (
     BackupJob, BackupKind, BackupPolicy, CatchUpMode, DaemonInstance, Event,
     ExecutionLease, JobRun, LibvirtBackupOperation, LibvirtExternalState, Node,
     NodeControllerLease, OverlapPolicy, PersistedLibvirtPlan, RestorePoint,
-    RestorePointStatus, RetentionPolicy, RunDisk, RunState, SchedulePolicy, VM,
+    RestorePointStatus, RetentionPolicy, RunDisk, RunState, SchedulePolicy,
+    StorageDestination, VM,
     new_id, utcnow,
 )
 from .state_machine import InvalidStateTransition, validate_transition
@@ -26,6 +27,9 @@ class SQLiteRepository:
         self.connection = sqlite3.connect(str(database))
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
+        self.connection.execute("PRAGMA busy_timeout = 5000")
+        if str(database) != ":memory:":
+            self.connection.execute("PRAGMA journal_mode = WAL")
         self._create_schema()
 
     def close(self) -> None:
@@ -45,7 +49,8 @@ class SQLiteRepository:
             );
             CREATE TABLE IF NOT EXISTS backup_jobs (
                 id TEXT PRIMARY KEY, vm_id TEXT NOT NULL REFERENCES vms(id),
-                name TEXT NOT NULL, enabled INTEGER NOT NULL,
+                name TEXT NOT NULL, storage_destination_id TEXT REFERENCES storage_destinations(id),
+                enabled INTEGER NOT NULL,
                 max_incrementals_per_chain INTEGER NOT NULL CHECK(max_incrementals_per_chain >= 0),
                 restore_points_to_retain INTEGER NOT NULL CHECK(restore_points_to_retain >= 0),
                 minimum_full_chains INTEGER NOT NULL CHECK(minimum_full_chains >= 1),
@@ -56,6 +61,19 @@ class SQLiteRepository:
                 next_run_at TEXT,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS storage_destinations (
+                id TEXT PRIMARY KEY, node_id TEXT NOT NULL REFERENCES nodes(id),
+                name TEXT NOT NULL,
+                control_root TEXT NOT NULL, backup_data_root TEXT NOT NULL,
+                backup_data_mode INTEGER NOT NULL,
+                backup_data_uid INTEGER, backup_data_gid INTEGER,
+                minimum_free_bytes INTEGER NOT NULL,
+                minimum_free_percent REAL NOT NULL,
+                is_default INTEGER NOT NULL, created_at TEXT NOT NULL,
+                UNIQUE(node_id, name)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS one_default_storage_destination
+                ON storage_destinations(node_id) WHERE is_default = 1;
             CREATE TABLE IF NOT EXISTS backup_chains (
                 id TEXT PRIMARY KEY, vm_id TEXT NOT NULL REFERENCES vms(id),
                 status TEXT NOT NULL CHECK(status IN ('ACTIVE', 'CLOSED')),
@@ -63,6 +81,8 @@ class SQLiteRepository:
             );
             CREATE UNIQUE INDEX IF NOT EXISTS one_active_chain_per_vm
                 ON backup_chains(vm_id) WHERE status = 'ACTIVE';
+            CREATE UNIQUE INDEX IF NOT EXISTS one_libvirt_uuid_per_node
+                ON vms(node_id, libvirt_domain_uuid) WHERE libvirt_domain_uuid IS NOT NULL;
             CREATE TABLE IF NOT EXISTS job_runs (
                 id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES backup_jobs(id),
                 state TEXT NOT NULL, planned_kind TEXT,
@@ -128,6 +148,7 @@ class SQLiteRepository:
             );
             CREATE TABLE IF NOT EXISTS events (
                 id TEXT PRIMARY KEY, job_run_id TEXT REFERENCES job_runs(id),
+                node_id TEXT REFERENCES nodes(id),
                 event_type TEXT NOT NULL, message TEXT NOT NULL,
                 from_state TEXT, to_state TEXT, created_at TEXT NOT NULL
             );
@@ -155,14 +176,168 @@ class SQLiteRepository:
     def add_node(self, value: Node) -> None:
         self._insert("nodes", value, ("id", "name", "created_at"))
 
+    def get_node(self, node_id: str) -> Node:
+        row = self.connection.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        if row is None:
+            raise KeyError(node_id)
+        return Node(id=row["id"], name=row["name"],
+                    created_at=datetime.fromisoformat(row["created_at"]))
+
+    def get_or_create_node(self, name: str) -> Node:
+        if not name.strip():
+            raise DomainInvariantError("node name cannot be empty")
+        row = self.connection.execute("SELECT id FROM nodes WHERE name = ?", (name,)).fetchone()
+        if row:
+            return self.get_node(row["id"])
+        node = Node(name=name)
+        try:
+            self.add_node(node)
+        except sqlite3.IntegrityError as exc:
+            raise DomainInvariantError("inconsistent local node identity") from exc
+        return node
+
+    def list_nodes(self) -> list[Node]:
+        return [self.get_node(row["id"]) for row in
+                self.connection.execute("SELECT id FROM nodes ORDER BY name")]
+
     def add_vm(self, value: VM) -> None:
         self._insert("vms", value, ("id", "node_id", "name", "external_id",
                                    "libvirt_domain_uuid", "created_at"))
 
+    def list_vms(self, node_id: str | None = None) -> list[VM]:
+        sql, params = "SELECT id FROM vms", ()
+        if node_id is not None:
+            sql, params = sql + " WHERE node_id = ?", (node_id,)
+        sql += " ORDER BY name, id"
+        return [self.get_vm(row["id"]) for row in self.connection.execute(sql, params)]
+
+    def find_vm_by_external_id(self, node_id: str, external_id: str) -> VM | None:
+        row = self.connection.execute(
+            "SELECT id FROM vms WHERE node_id = ? AND external_id = ?",
+            (node_id, external_id),
+        ).fetchone()
+        return self.get_vm(row["id"]) if row else None
+
+    def register_vm(
+        self, node_id: str, external_id: str, name: str, domain_uuid: str,
+    ) -> VM:
+        existing = self.find_vm_by_external_id(node_id, external_id)
+        if existing:
+            if existing.libvirt_domain_uuid != domain_uuid:
+                raise DomainInvariantError("DOMAIN_UUID_CHANGED")
+            return existing
+        row = self.connection.execute(
+            "SELECT id FROM vms WHERE node_id = ? AND libvirt_domain_uuid = ?",
+            (node_id, domain_uuid),
+        ).fetchone()
+        if row:
+            return self.get_vm(row["id"])
+        vm = VM(node_id=node_id, external_id=external_id, name=name,
+                libvirt_domain_uuid=domain_uuid)
+        self.add_vm(vm)
+        return vm
+
+    def add_storage_destination(self, value: StorageDestination) -> None:
+        self._insert("storage_destinations", value, (
+            "id", "node_id", "name", "control_root", "backup_data_root", "backup_data_mode",
+            "backup_data_uid", "backup_data_gid", "minimum_free_bytes",
+            "minimum_free_percent", "is_default", "created_at",
+        ))
+
+    def get_storage_destination(self, node_id: str, destination_id: str) -> StorageDestination:
+        row = self.connection.execute(
+            "SELECT * FROM storage_destinations WHERE node_id = ? AND id = ?",
+            (node_id, destination_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError(destination_id)
+        return StorageDestination(
+            id=row["id"], node_id=row["node_id"], name=row["name"],
+            control_root=row["control_root"],
+            backup_data_root=row["backup_data_root"],
+            backup_data_mode=row["backup_data_mode"], backup_data_uid=row["backup_data_uid"],
+            backup_data_gid=row["backup_data_gid"], minimum_free_bytes=row["minimum_free_bytes"],
+            minimum_free_percent=row["minimum_free_percent"], is_default=bool(row["is_default"]),
+            created_at=datetime.fromisoformat(row["created_at"]),
+        )
+
+    def list_storage_destinations(self, node_id: str) -> list[StorageDestination]:
+        return [self.get_storage_destination(node_id, row["id"]) for row in self.connection.execute(
+            "SELECT id FROM storage_destinations WHERE node_id = ? ORDER BY name", (node_id,)
+        )]
+
+    def get_storage_destination_by_name(self, node_id: str, name: str) -> StorageDestination | None:
+        row = self.connection.execute(
+            "SELECT id FROM storage_destinations WHERE node_id = ? AND name = ?", (node_id, name)
+        ).fetchone()
+        return self.get_storage_destination(node_id, row["id"]) if row else None
+
+    def get_default_storage_destination(self, node_id: str) -> StorageDestination:
+        row = self.connection.execute(
+            "SELECT id FROM storage_destinations WHERE node_id = ? AND is_default = 1", (node_id,)
+        ).fetchone()
+        if row is None:
+            raise DomainInvariantError("no default storage destination is configured")
+        return self.get_storage_destination(node_id, row["id"])
+
+    def sync_storage_destinations(
+        self, node_id: str, destinations: list[StorageDestination], default_name: str,
+    ) -> list[StorageDestination]:
+        if not destinations or default_name not in {item.name for item in destinations}:
+            raise DomainInvariantError("invalid configured storage catalog")
+        try:
+            with self.connection:
+                for intended in destinations:
+                    if intended.node_id != node_id:
+                        raise DomainInvariantError("storage destination belongs to another node")
+                    existing = self.get_storage_destination_by_name(node_id, intended.name)
+                    if existing is None:
+                        self.connection.execute(
+                            """INSERT INTO storage_destinations VALUES
+                               (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
+                            (intended.id, node_id, intended.name, intended.control_root,
+                             intended.backup_data_root, intended.backup_data_mode,
+                             intended.backup_data_uid, intended.backup_data_gid,
+                             intended.minimum_free_bytes, intended.minimum_free_percent,
+                             intended.created_at.isoformat()),
+                        )
+                        continue
+                    actual = (existing.control_root, existing.backup_data_root,
+                              existing.backup_data_mode, existing.backup_data_uid,
+                              existing.backup_data_gid, existing.minimum_free_bytes,
+                              existing.minimum_free_percent)
+                    wanted = (intended.control_root, intended.backup_data_root,
+                              intended.backup_data_mode, intended.backup_data_uid,
+                              intended.backup_data_gid, intended.minimum_free_bytes,
+                              intended.minimum_free_percent)
+                    if actual != wanted:
+                        raise DomainInvariantError(
+                            f"configured storage destination {intended.name} conflicts with persisted metadata"
+                        )
+                self.connection.execute(
+                    "UPDATE storage_destinations SET is_default = 0 WHERE node_id = ?", (node_id,)
+                )
+                cursor = self.connection.execute(
+                    """UPDATE storage_destinations SET is_default = 1
+                       WHERE node_id = ? AND name = ?""", (node_id, default_name),
+                )
+                if cursor.rowcount != 1:
+                    raise DomainInvariantError("configured default storage destination is missing")
+        except sqlite3.IntegrityError as exc:
+            raise DomainInvariantError(f"storage catalog rejected: {exc}") from exc
+        return self.list_storage_destinations(node_id)
+
     def add_job(self, value: BackupJob) -> None:
+        if value.storage_destination_id is not None:
+            vm = self.get_vm(value.vm_id)
+            try:
+                self.get_storage_destination(vm.node_id, value.storage_destination_id)
+            except KeyError as exc:
+                raise DomainInvariantError("STORAGE_DESTINATION_NOT_LOCAL") from exc
         self.connection.execute(
-            "INSERT INTO backup_jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (value.id, value.vm_id, value.name, int(value.enabled),
+            "INSERT INTO backup_jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (value.id, value.vm_id, value.name, value.storage_destination_id,
+             int(value.enabled),
              value.backup_policy.max_incrementals_per_chain,
              value.retention_policy.restore_points_to_retain,
              value.retention_policy.minimum_full_chains,
@@ -836,6 +1011,49 @@ class SQLiteRepository:
         sql += " ORDER BY created_at, id"
         return [self.get_run(row["id"]) for row in self.connection.execute(sql)]
 
+    def create_manual_run(self, job_id: str, local_node_id: str, now: datetime) -> JobRun:
+        """Atomically reject busy/quarantined VMs and create one SCHEDULED run."""
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            job = self.get_job(job_id)
+            vm = self.get_vm(job.vm_id)
+            if vm.node_id != local_node_id:
+                raise DomainInvariantError("VM_NOT_LOCAL")
+            if not job.enabled:
+                raise DomainInvariantError("JOB_DISABLED")
+            quarantined = self.connection.execute(
+                """SELECT 1 FROM job_runs jr JOIN backup_jobs bj ON bj.id = jr.job_id
+                   WHERE bj.vm_id = ? AND jr.recovery_required = 1
+                   AND jr.state NOT IN ('SUCCESS', 'FAILED') LIMIT 1""", (vm.id,),
+            ).fetchone()
+            if quarantined:
+                raise DomainInvariantError("VM_QUARANTINED")
+            busy = self.connection.execute(
+                """SELECT 1 FROM job_runs jr JOIN backup_jobs bj ON bj.id = jr.job_id
+                   WHERE bj.vm_id = ? AND jr.state NOT IN ('SUCCESS', 'FAILED') LIMIT 1""",
+                (vm.id,),
+            ).fetchone()
+            if busy:
+                raise DomainInvariantError("VM_BUSY")
+            run = JobRun(job_id=job.id, created_at=now, updated_at=now)
+            self.connection.execute(
+                """INSERT INTO job_runs
+                   (id, job_id, state, planned_kind, planned_chain_id, planned_sequence,
+                    parent_restore_point_id, error, cleanup_error, cleanup_attempts,
+                    scheduled_for, is_catch_up, missed_schedule_slots,
+                    recovery_required, recovery_reason, created_at, updated_at)
+                   VALUES (?, ?, 'SCHEDULED', NULL, NULL, NULL, NULL, NULL, NULL, 0,
+                           NULL, 0, 0, 0, NULL, ?, ?)""",
+                (run.id, job.id, now.isoformat(), now.isoformat()),
+            )
+            self._insert_event(Event(job_run_id=run.id, event_type="MANUAL_BACKUP_REQUESTED",
+                                     message="manual backup run created", created_at=now))
+            self.connection.commit()
+            return self.get_run(run.id)
+        except Exception:
+            self.connection.rollback()
+            raise
+
     def list_runs_for_node(self, node_id: str, *, nonterminal_only: bool = False) -> list[JobRun]:
         sql = """SELECT jr.id FROM job_runs jr
                  JOIN backup_jobs bj ON bj.id = jr.job_id
@@ -883,7 +1101,7 @@ class SQLiteRepository:
             )
             self._insert_event(Event(job_run_id=None, event_type="DAEMON_STARTED",
                                      message=f"daemon {daemon.instance_id} started on {node_id}",
-                                     created_at=now))
+                                     created_at=now, node_id=node_id))
         return daemon
 
     def heartbeat_daemon(self, instance_id: str, now: datetime) -> DaemonInstance:
@@ -940,7 +1158,7 @@ class SQLiteRepository:
                 job_run_id=None,
                 event_type="CONTROLLER_TAKEN_OVER" if taken_over else "CONTROLLER_ACQUIRED",
                 message=f"controller {daemon_instance_id} acquired node {node_id}",
-                created_at=now,
+                created_at=now, node_id=node_id,
             ))
             self.connection.commit()
             return NodeControllerLease(node_id, daemon_instance_id, now, now, expires)
@@ -989,7 +1207,7 @@ class SQLiteRepository:
                 self._insert_event(Event(
                     job_run_id=None, event_type="CONTROLLER_RELEASED",
                     message=f"controller {daemon_instance_id} released node {node_id}",
-                    created_at=now,
+                    created_at=now, node_id=node_id,
                 ))
         return bool(cursor.rowcount)
 
@@ -1205,8 +1423,8 @@ class SQLiteRepository:
 
     def _insert_event(self, event: Event) -> None:
         self.connection.execute(
-            "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (event.id, event.job_run_id, event.event_type, event.message,
+            "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (event.id, event.job_run_id, event.node_id, event.event_type, event.message,
              event.from_state, event.to_state, event.created_at.isoformat()),
         )
 
@@ -1233,8 +1451,19 @@ class SQLiteRepository:
         row = self.connection.execute("SELECT * FROM backup_jobs WHERE id = ?", (job_id,)).fetchone()
         if row is None:
             raise KeyError(job_id)
+        if row["storage_destination_id"] is not None:
+            ownership = self.connection.execute(
+                """SELECT vm.node_id AS vm_node_id, sd.node_id AS storage_node_id
+                   FROM vms vm LEFT JOIN storage_destinations sd ON sd.id = ?
+                   WHERE vm.id = ?""", (row["storage_destination_id"], row["vm_id"]),
+            ).fetchone()
+            if (ownership is None or ownership["storage_node_id"] is None
+                    or ownership["vm_node_id"] != ownership["storage_node_id"]):
+                raise DomainInvariantError("STORAGE_DESTINATION_NOT_LOCAL")
         return BackupJob(
-            id=row["id"], vm_id=row["vm_id"], name=row["name"], enabled=bool(row["enabled"]),
+            id=row["id"], vm_id=row["vm_id"], name=row["name"],
+            storage_destination_id=row["storage_destination_id"],
+            enabled=bool(row["enabled"]),
             backup_policy=BackupPolicy(row["max_incrementals_per_chain"]),
             retention_policy=RetentionPolicy(row["restore_points_to_retain"],
                                              row["minimum_full_chains"]),
@@ -1300,6 +1529,15 @@ class SQLiteRepository:
         sql += " ORDER BY rp.created_at, rp.sequence"
         return [self._restore_point(row) for row in self.connection.execute(sql, params)]
 
+    def list_restore_points_for_node(self, node_id: str) -> list[RestorePoint]:
+        rows = self.connection.execute(
+            """SELECT rp.* FROM restore_points rp
+               JOIN backup_chains bc ON bc.id = rp.chain_id
+               JOIN vms vm ON vm.id = bc.vm_id WHERE vm.node_id = ?
+               ORDER BY rp.created_at, rp.sequence""", (node_id,),
+        )
+        return [self._restore_point(row) for row in rows]
+
     def list_chains(self, vm_id: str) -> list[BackupChain]:
         rows = self.connection.execute(
             "SELECT * FROM backup_chains WHERE vm_id = ? ORDER BY created_at", (vm_id,)
@@ -1313,14 +1551,32 @@ class SQLiteRepository:
         return [Event(id=r["id"], job_run_id=r["job_run_id"], event_type=r["event_type"],
                       message=r["message"], from_state=RunState(r["from_state"]) if r["from_state"] else None,
                       to_state=RunState(r["to_state"]) if r["to_state"] else None,
-                      created_at=datetime.fromisoformat(r["created_at"])) for r in rows]
+                      created_at=datetime.fromisoformat(r["created_at"]),
+                      node_id=r["node_id"]) for r in rows]
 
     def list_all_events(self) -> list[Event]:
         rows = self.connection.execute("SELECT * FROM events ORDER BY created_at, id")
         return [Event(id=r["id"], job_run_id=r["job_run_id"], event_type=r["event_type"],
                       message=r["message"], from_state=RunState(r["from_state"]) if r["from_state"] else None,
                       to_state=RunState(r["to_state"]) if r["to_state"] else None,
-                      created_at=datetime.fromisoformat(r["created_at"])) for r in rows]
+                      created_at=datetime.fromisoformat(r["created_at"]),
+                      node_id=r["node_id"]) for r in rows]
+
+    def list_events_for_node(self, node_id: str) -> list[Event]:
+        rows = self.connection.execute(
+            """SELECT DISTINCT e.* FROM events e
+               LEFT JOIN job_runs jr ON jr.id = e.job_run_id
+               LEFT JOIN backup_jobs bj ON bj.id = jr.job_id
+               LEFT JOIN vms vm ON vm.id = bj.vm_id
+               WHERE vm.node_id = ? OR (e.job_run_id IS NULL AND e.node_id = ?)
+               ORDER BY e.created_at, e.id""", (node_id, node_id),
+        )
+        return [Event(id=r["id"], job_run_id=r["job_run_id"], event_type=r["event_type"],
+                      message=r["message"],
+                      from_state=RunState(r["from_state"]) if r["from_state"] else None,
+                      to_state=RunState(r["to_state"]) if r["to_state"] else None,
+                      created_at=datetime.fromisoformat(r["created_at"]),
+                      node_id=r["node_id"]) for r in rows]
 
     def record_event(self, event: Event) -> None:
         with self.connection:

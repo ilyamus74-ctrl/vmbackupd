@@ -42,3 +42,11 @@ vmbackupd never invents a Fedora QEMU identity or falls back to mode 0777.
 RPM integration must establish durable ownership and Fedora SELinux labels or
 policy. SELinux behavior must be tested under Enforcing before production RPM
 release; a development host with SELinux disabled cannot validate it.
+
+Phase 3C provides configuration and foreground entry points but deliberately
+does not install these paths. RPM ownership, socket parent creation, service
+units, and system accounts remain Phase 3D work.
+
+The first integration run uses a fresh development database. Phase 3D packaging
+must add `schema_version` and ordered migrations before upgrades are supported;
+conditional table creation does not migrate an older schema.

@@ -150,6 +150,21 @@ class VirshLibvirtDriver:
     def domain_uuid(self, external_id: str) -> str:
         return str(self._virsh("domuuid", external_id))
 
+    def list_domain_names(self) -> tuple[str, ...]:
+        output = str(self._virsh("list", "--all", "--name"))
+        return tuple(line.strip() for line in output.splitlines() if line.strip())
+
+    def discover_domains(self) -> tuple[dict[str, str], ...]:
+        discovered = []
+        for name in self.list_domain_names():
+            discovered.append({
+                "external_id": name,
+                "name": name,
+                "uuid": self.domain_uuid(name),
+                "state": self.domain_state(name),
+            })
+        return tuple(discovered)
+
     def domain_xml(self, external_id: str) -> str:
         return str(self._virsh("dumpxml", external_id))
 

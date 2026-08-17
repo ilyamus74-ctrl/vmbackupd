@@ -1,0 +1,34 @@
+[daemon]
+node_name = "local"
+database_path = "/var/lib/vmbackupd/state.db"
+socket_path = "/run/vmbackupd/vmbackupd.sock"
+socket_mode = "0660"
+tick_interval_seconds = 1
+controller_lease_seconds = 30
+execution_lease_seconds = 300
+
+[libvirt]
+uri = "qemu:///system"
+allow_mutation = false
+
+[storage]
+default_destination = "local-root"
+
+[[storage.destinations]]
+name = "local-root"
+control_root = "/var/lib/vmbackupd/control/local-root"
+backup_data_root = "/var/lib/libvirt/images/vmbackupd"
+backup_data_mode = "0750"
+# Set these to accounts present on the target host.
+# backup_data_user = "qemu"
+# backup_data_group = "qemu"
+minimum_free_bytes = 0
+minimum_free_percent = 5
+
+[[storage.destinations]]
+name = "local-home"
+control_root = "/var/lib/vmbackupd/control/local-home"
+backup_data_root = "/home/user/backups/vmbackupd"
+backup_data_mode = "0750"
+minimum_free_bytes = 0
+minimum_free_percent = 5

@@ -70,6 +70,16 @@ finalization.
 `MockBackupEngine` drives these same operations deterministically and can inject
 backup or cleanup failures. It performs no actual backup I/O.
 
+Retention has a fail-safe publication gate: **no new valid restore point means
+no automatic backup deletion**. Future automatic expiration may be initiated
+only after `finalize_success` publishes a new `AVAILABLE` restore point, and it
+must remain within that restore point's VM, job, and storage-destination
+lineage. Failed or recovery-required runs, job lifecycle changes, policy
+changes, and insufficient space cannot trigger deletion. In particular,
+vmbackupd never deletes existing backups before attempting a replacement; an
+insufficient-space preflight refuses the new backup instead. Retention remains
+planning-only in the current implementation. See [`retention.md`](retention.md).
+
 ## Local runtime layer
 
 Phase 2 adds orchestration above, rather than inside, the repository:
@@ -175,3 +185,56 @@ The product has one daemon backend serving both the future first-class console
 client and Cockpit GUI through one local API. RPM/DNF is the required deployment
 model. See [`product-roadmap.md`](product-roadmap.md) and
 [`installation-layout.md`](installation-layout.md).
+
+## Phase 3C control boundary
+
+One composition root constructs repository, clock, read-only and mutation
+drivers, destination-routed staging/executors, runtime, application services,
+and UNIX API. The foreground process owns controller lifecycle and cooperative
+ticks. Signal shutdown stops admission and ticks, releases controller ownership,
+closes SQLite, and removes its socket without claiming external completion.
+
+`vmbackupctl` is only a versioned JSON-lines UNIX API client. Explicit
+serializers define the public schema. Backup requests atomically create a
+SCHEDULED run after mutation, locality, busy, and quarantine checks, then return
+without driving execution. Persisted StorageDestinations select control/data
+roots and capacity status per job. See [`local-api.md`](local-api.md),
+[`cli.md`](cli.md), and [`configuration.md`](configuration.md).
+
+## Phase 3C hardening
+
+The asyncio API and cooperative runtime never share a SQLite connection. The
+API repository belongs to the asyncio thread. A dedicated single runtime worker
+creates, uses, and closes its own repository connection, starts/stops the
+runtime, and serially performs ticks. SQLite WAL mode and a five-second busy
+timeout coordinate committed API/runtime transactions. Shutdown stops API
+admission, waits for the current bounded worker step, stops runtime in its
+owning thread, closes the API repository, and removes the socket.
+
+Operational API queries are local-node scoped: jobs, runs, recovery, restore
+points, counts, object shows, and run events cannot expose a foreign node.
+Configuration supports multiple persisted destinations and one explicit
+default; jobs retain destination IDs across restart.
+
+The first real integration test intentionally uses a fresh development
+database. `CREATE TABLE IF NOT EXISTS` creates schema but does not migrate it.
+Phase 3D must introduce `schema_version` and ordered transactional migrations
+before RPM upgrades or reuse of older databases are supported.
+
+StorageDestination is Node-owned local operational configuration. Names and the
+single default are scoped by `node_id`; job creation and runtime routing enforce
+that VM and destination share a Node. Local configuration synchronization never
+mutates another Node's destinations.
+
+Runtime worker health is explicit: `STARTING`, `RUNNING`, `STOPPING`, `STOPPED`,
+or `FAILED`. A fatal tick captures a safe error, conservatively stops runtime,
+and closes its repository in the worker thread. The process remains alive for
+diagnostics, but new backup runs are refused. Automatic worker restart is
+deliberately deferred because abandoned libvirt work needs reconciliation;
+future systemd policy may restart the process.
+
+Events carry nullable structured `node_id`. Run events derive ownership through
+run/job/VM relations; daemon and controller events persist their Node directly.
+Human-readable messages are never searched to make authorization or ownership
+decisions. Truly node-less global events are excluded from local operational
+event lists unless a future explicit global API defines their exposure.

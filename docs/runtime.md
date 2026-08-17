@@ -127,6 +127,17 @@ backend left a snapshot, partial transfer, or verified object. Explicit
 repository operations can later clear the recovery marker after backend-specific
 reconciliation, but Phase 2 does not pretend to perform that reconciliation.
 
+## Phase 3C worker health
+
+The runtime owns a dedicated thread and SQLite connection, separate from the
+asyncio API repository. Health progresses through `STARTING`, `RUNNING`,
+`STOPPING`, `STOPPED`, or `FAILED`. Unexpected tick failure records a safe
+`last_error`, stops runtime conservatively, and closes SQLite in the worker.
+The API remains available in diagnostic-only mode and rejects `backup.run` with
+`RUNTIME_UNAVAILABLE`. It does not automatically restart the worker or infer
+success for external work. Future systemd integration may choose process-level
+restart policy.
+
 At startup, expired leases and leases owned by a fenced previous controller are
 removed and record `LEASE_EXPIRED`. An unsafe associated run is marked for
 recovery and is not restarted.

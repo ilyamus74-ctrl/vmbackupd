@@ -142,11 +142,28 @@ class VM:
 class BackupJob:
     vm_id: str
     name: str
+    storage_destination_id: str | None = None
     backup_policy: BackupPolicy = field(default_factory=BackupPolicy)
     retention_policy: RetentionPolicy = field(default_factory=RetentionPolicy)
     schedule_policy: SchedulePolicy = field(default_factory=SchedulePolicy)
     next_run_at: datetime | None = None
     enabled: bool = True
+    id: str = field(default_factory=new_id)
+    created_at: datetime = field(default_factory=utcnow)
+
+
+@dataclass(frozen=True, slots=True)
+class StorageDestination:
+    name: str
+    control_root: str
+    backup_data_root: str
+    node_id: str
+    backup_data_mode: int = 0o750
+    backup_data_uid: int | None = None
+    backup_data_gid: int | None = None
+    minimum_free_bytes: int = 0
+    minimum_free_percent: float = 5.0
+    is_default: bool = False
     id: str = field(default_factory=new_id)
     created_at: datetime = field(default_factory=utcnow)
 
@@ -265,6 +282,7 @@ class Event:
     to_state: RunState | None = None
     id: str = field(default_factory=new_id)
     created_at: datetime = field(default_factory=utcnow)
+    node_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
