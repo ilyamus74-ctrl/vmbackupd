@@ -1,9 +1,11 @@
 # Cockpit frontend
 
-Phase 3E.2 adds the first source-only `cockpit-vmbackupd` frontend slice under
-`cockpit/vmbackupd/`. It is not installed by the vmbackupd RPM. Fedora 41
-development validation exposed this source through a user-local Cockpit package
-symlink; a separate installable Cockpit RPM remains future work.
+Phase 3E.2 adds the first read-only frontend source under `cockpit/vmbackupd/`.
+Fedora 41 development validation exposed this source through a user-local
+Cockpit package symlink. Phase 3E.3 packages the unchanged files as the separate
+`cockpit-vmbackupd` binary RPM from the same vmbackupd source RPM. The main
+`vmbackupd` binary does not install the frontend and remains suitable for
+headless operation.
 
 ## Control path and authorization
 
@@ -97,8 +99,43 @@ roots, free space, and reserve policy. Repeated Refresh operations successfully
 reloaded `daemon.status`, `vm.discover`, and `storage.list` without timeout,
 framing, API, permission, or stale-table errors after the fresh login.
 
-This validates the browser-to-bridge-to-raw-UNIX-stream-to-JSON-lines path, not
-Cockpit packaging or mutation. No mutation controls exist and no real backup
-was requested. A separate `cockpit-vmbackupd` RPM, packaged-account read-write
-`backup-begin` authorization, and SELinux Enforcing validation remain pending;
-production readiness is not claimed.
+Phase 3E.3 then validated the packaged path. DNF installed exactly the new
+`cockpit-vmbackupd` package without starting vmbackupd, stopping the development
+daemon, or starting Cockpit. The five `/usr/share/cockpit/vmbackupd` files were
+root-owned mode 0644, owned by that RPM, and byte-for-byte equal to repository
+source. The user-local development symlink was removed before
+`cockpit-bridge --packages` discovered **VM Backup** from the system directory.
+
+With the mutation-disabled production daemon and 0660
+`vmbackupd:vmbackupd-admin` socket, a fresh authorized Cockpit session loaded
+the installed frontend. Dashboard, running `win10` VM discovery, default
+`local-root` storage, and repeated three-method Refresh all succeeded. This
+proves the packaged browser-to-bridge-to-raw-UNIX-stream-to-JSON-lines path.
+No mutation control was present and no backup was requested.
+
+Independent `rpm -e cockpit-vmbackupd` removed the static system tree and its
+Cockpit discovery entry while leaving `vmbackupd` installed and running. The
+state database retained the same device/inode, mode 0640, and
+`vmbackupd:vmbackupd` ownership. Before/after stats for both the preserved
+forensic root-owned mode 0600 qcow2 and successful mode 0660 user/QEMU-group
+qcow2 were identical. The user-local package remained absent. This validates
+frontend-only uninstall semantics.
+
+After acceptance, Cockpit and the production daemon were stopped, the existing
+development daemon and `ilyamus:qemu` mode 2770 shared backup root were
+restored, and the expected mutation-enabled development profile was healthy
+with schema version 1 and no non-terminal or recovery-required runs. This
+restoration fact does not change the production package default. Cockpit mutation controls,
+packaged-account read-write `backup-begin` authorization, finer-grained API
+roles, and SELinux Enforcing validation remain pending; production readiness is
+not claimed.
+
+## RPM boundary
+
+One `vmbackupd` spec and source RPM produce two noarch binary packages. The
+daemon/control-plane package owns Python, commands, configuration, systemd,
+sysusers, and tmpfiles. `cockpit-vmbackupd` owns only the five static files under
+`/usr/share/cockpit/vmbackupd/` and requires both `cockpit-bridge >= 215` and the
+exact same-release `vmbackupd`. Dependency direction is one-way:
+`cockpit-vmbackupd -> vmbackupd`; the daemon never requires Cockpit. The
+frontend subpackage has no service scriptlets or mutable state.

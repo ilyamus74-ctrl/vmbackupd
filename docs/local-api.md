@@ -1,7 +1,8 @@
 # Local API
 
 Phase 3C establishes the stable control boundary shared by `vmbackupctl` and the
-future Cockpit package. Clients never access SQLite or libvirt directly.
+packaged read-only `cockpit-vmbackupd` frontend. Both clients use the daemon API
+and never access SQLite or libvirt directly.
 
 The daemon listens on a configurable UNIX `SOCK_STREAM` socket. Each connection
 sends one bounded JSON request line and receives one JSON response line. Version

@@ -31,7 +31,18 @@ Requires(postun): systemd
 %description
 vmbackupd is a persistent local daemon and UNIX-socket control plane for
 conservative KVM/libvirt backup orchestration. The package includes the
-vmbackupctl console client. It does not include Cockpit integration.
+vmbackupctl console client. The optional Cockpit frontend is shipped as the
+separate cockpit-vmbackupd binary package from this source build.
+
+%package -n cockpit-vmbackupd
+Summary:        Cockpit frontend for vmbackupd
+Requires:       cockpit-bridge >= 215
+Requires:       vmbackupd = %{version}-%{release}
+
+%description -n cockpit-vmbackupd
+cockpit-vmbackupd provides the read-only Cockpit frontend for the vmbackupd
+local control API. The vmbackupd daemon package remains independently
+installable for headless operation.
 
 %prep
 %autosetup -p1
@@ -49,6 +60,9 @@ install -Dpm 0644 %{SOURCE1} %{buildroot}%{_unitdir}/vmbackupd.service
 install -Dpm 0644 %{SOURCE2} %{buildroot}%{_sysusersdir}/vmbackupd.conf
 install -Dpm 0644 %{SOURCE3} %{buildroot}%{_tmpfilesdir}/vmbackupd.conf
 install -Dpm 0644 %{SOURCE4} %{buildroot}%{_sysconfdir}/vmbackupd/vmbackupd.toml
+install -d -m 0755 %{buildroot}%{_datadir}/cockpit/vmbackupd
+install -pm 0644 cockpit/vmbackupd/{manifest.json,index.html,api.js,vmbackupd.js,vmbackupd.css} \
+    %{buildroot}%{_datadir}/cockpit/vmbackupd/
 
 %pre
 %sysusers_create_compat %{SOURCE2}
@@ -71,6 +85,9 @@ install -Dpm 0644 %{SOURCE4} %{buildroot}%{_sysconfdir}/vmbackupd/vmbackupd.toml
 %{_unitdir}/vmbackupd.service
 %{_sysusersdir}/vmbackupd.conf
 %{_tmpfilesdir}/vmbackupd.conf
+
+%files -n cockpit-vmbackupd
+%{_datadir}/cockpit/vmbackupd/
 
 %changelog
 * Mon Aug 17 2026 vmbackupd packagers <packagers@example.invalid> - 0.1.0-1

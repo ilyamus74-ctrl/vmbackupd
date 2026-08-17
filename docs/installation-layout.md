@@ -18,20 +18,32 @@ Phase 3D.2 provides the Fedora-style RPM layout and service profile:
 /usr/lib/systemd/system/vmbackupd.service
 /usr/lib/sysusers.d/vmbackupd.conf
 /usr/lib/tmpfiles.d/vmbackupd.conf
+
+# cockpit-vmbackupd subpackage only
+/usr/share/cockpit/vmbackupd/
+    manifest.json
+    index.html
+    api.js
+    vmbackupd.js
+    vmbackupd.css
 ```
 
-Cockpit remains a future separate `cockpit-vmbackupd` package. Logging uses the
-systemd journal; no package-owned log directory is currently needed.
+The main `vmbackupd` package does not own the Cockpit tree and does not require
+the optional frontend. Logging uses the systemd journal; no package-owned log
+directory is currently needed.
 
-Phase 3E.2 provides repository source at `cockpit/vmbackupd/` only. It is not
-yet installed into `/usr/share/cockpit/vmbackupd/` and is not part of the
-current vmbackupd RPM. That future package will contain the manifest, HTML,
-JavaScript, and CSS while continuing to use the existing
-`/run/vmbackupd/vmbackupd.sock` control boundary.
+Phase 3E.3 installs the Phase 3E.2 source unchanged into this tree through the
+separate `cockpit-vmbackupd` binary. It continues to use the existing
+`/run/vmbackupd/vmbackupd.sock` control boundary and owns no daemon or mutable
+runtime files. Fedora 41 lifecycle validation installed this exact five-file
+tree as root-owned mode 0644 files, and `rpm -qf` attributed them to
+`cockpit-vmbackupd`.
 
-Browser validation used a temporary user-local symlink at
-`~/.local/share/cockpit/vmbackupd`; this development exposure is not the final
-installed layout and does not replace the future separate Cockpit RPM.
+Before packaged validation, the temporary user-local symlink at
+`~/.local/share/cockpit/vmbackupd` was removed. Cockpit then discovered and
+loaded `/usr/share/cockpit/vmbackupd` through the system package. Independent
+erase removed that tree and discovery entry while leaving the installed daemon,
+configuration, state database, control data, and backup objects intact.
 
 ## Backup data placement
 

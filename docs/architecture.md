@@ -5,11 +5,12 @@ FULL-only libvirt push executor, UNIX API and CLI, schema migrations, and a
 Fedora-style production service/package profile. It also includes the first
 read-only Cockpit frontend source slice for `daemon.status`, `vm.discover`, and
 `storage.list`, validated in a Cockpit 345 browser through the local API.
-Installable `cockpit-vmbackupd` RPM packaging, Cockpit mutation controls, remote
-networking, incremental execution, restore execution, retention deletion,
-additional hypervisor mutations, SELinux Enforcing validation, and
-packaged-account read-write `backup-begin` authorization remain pending. This
-is not a production-readiness claim.
+The shared RPM spec now produces a separate `cockpit-vmbackupd` binary
+subpackage from the same source RPM. Packaged-browser installation validation,
+Cockpit mutation controls, remote networking, incremental execution, restore
+execution, retention deletion, additional hypervisor mutations, SELinux
+Enforcing validation, and packaged-account read-write `backup-begin`
+authorization remain pending. This is not a production-readiness claim.
 
 ## Jobs and persisted policies
 
@@ -315,7 +316,12 @@ database/libvirt/filesystem path, or mutation controls. Dashboard, discovered
 VMs, and Local storage are the initial views. Fedora 41 Cockpit 345 browser
 validation passed through a user-local development package symlink, including
 the stale-session permission failure, fresh-session group inheritance, live
-read-only data, and repeated refresh. This source slice is still not installed
-by the current RPM; separate `cockpit-vmbackupd` packaging, mutation-boundary
-authorization, and SELinux Enforcing validation remain pending. See
-[`cockpit.md`](cockpit.md).
+read-only data, and repeated refresh. Phase 3E.3 assigns the unchanged static
+tree to a separately installable `cockpit-vmbackupd` binary from the same source
+RPM; the main daemon RPM remains headless-capable and does not own that tree.
+Real Fedora 41 installation, system-package discovery, Cockpit 345 browser use,
+repeated refresh, and independent erase all passed after removing the user-local
+development symlink. Erase removed only the static frontend; vmbackupd, its
+state, and backup artifacts remained unchanged. Mutation controls,
+mutation-boundary authorization, finer-grained API roles, and SELinux Enforcing
+validation remain pending. See [`cockpit.md`](cockpit.md).

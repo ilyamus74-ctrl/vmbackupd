@@ -99,10 +99,19 @@ Cockpit stream channel to the existing UNIX API and exposes only daemon status,
 VM discovery, and Local storage listing. Fedora 41 Cockpit 345 browser
 validation passed through a user-local development symlink: fresh-session DAC
 authorization, Dashboard/VM/Local-storage rendering, and repeated three-method
-Refresh all worked. A separate `cockpit-vmbackupd` RPM remains the next Phase
-3E step; the existing vmbackupd RPM is unchanged. Mutation UI, packaged
-read-write authorization, SELinux Enforcing validation, and finer-grained roles
-remain deferred.
+Refresh all worked. That phase did not yet package the frontend and left the
+existing vmbackupd RPM unchanged. Mutation UI, packaged read-write
+authorization, SELinux Enforcing validation, and finer-grained roles remain
+deferred.
+
+Phase 3E.3 adds that frontend as a separate binary subpackage produced alongside
+`vmbackupd` from the existing single spec and source RPM. The one-way dependency
+`cockpit-vmbackupd -> vmbackupd` preserves headless daemon installation. Static
+payload/build inspection, real DNF installation, system-package discovery,
+Cockpit 345 browser acceptance, repeated read-only refresh, and independent
+frontend erase have passed. Erase preserved the daemon, metadata, and backup
+objects. Mutation UI, packaged read-write authorization, SELinux Enforcing
+validation, and finer-grained roles remain later work.
 
 Future retention deletion is constrained by a permanent fail-safe contract:
 **no new valid backup means no automatic deletion**. Automatic expiration is a
@@ -117,5 +126,6 @@ GitHub, COPR, and Fedora repositories are future publishing channels. Choosing
 one does not change the daemon/API/client architecture or permit
 distribution-specific backup logic.
 
-Phase 3C implements the shared local control boundary. The future Cockpit client
-must use the same logical methods and must not bypass the application service.
+Phase 3C implements the shared local control boundary. The packaged read-only
+Cockpit client uses the same logical methods and does not bypass the application
+service.

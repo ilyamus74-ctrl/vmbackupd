@@ -39,12 +39,43 @@ def test_spec_declares_runtime_dependencies_and_noreplace_config():
     assert "%config(noreplace) %{_sysconfdir}/vmbackupd/vmbackupd.toml" in spec
 
 
+def test_spec_defines_one_way_cockpit_binary_subpackage():
+    spec = text("vmbackupd.spec")
+    assert "%package -n cockpit-vmbackupd" in spec
+    assert "Summary:        Cockpit frontend for vmbackupd" in spec
+    assert "Requires:       cockpit-bridge >= 215" in spec
+    assert "Requires:       vmbackupd = %{version}-%{release}" in spec
+    main_header = spec.split("%package -n cockpit-vmbackupd", 1)[0]
+    assert "Requires:       cockpit-vmbackupd" not in main_header
+    assert len(list(PACKAGING.glob("*.spec"))) == 1
+
+
 def test_spec_payload_never_owns_state_or_backup_images():
     files = text("vmbackupd.spec").split("%files", 1)[1]
     assert "state.db" not in files
     assert ".qcow2" not in files
     assert "/var/lib/vmbackupd" not in files
     assert "/var/lib/libvirt/images" not in files
+
+
+def test_cockpit_subpackage_installs_and_owns_only_static_frontend_tree():
+    spec = text("vmbackupd.spec")
+    install_section = spec.split("%install", 1)[1].split("%pre", 1)[0]
+    for name in ("manifest.json", "index.html", "api.js", "vmbackupd.js", "vmbackupd.css"):
+        assert name in install_section
+    assert "install -pm 0644 cockpit/vmbackupd/" in install_section
+    assert "%{buildroot}%{_datadir}/cockpit/vmbackupd/" in install_section
+
+    main_files, cockpit_files = spec.split("%files -f %{pyproject_files}", 1)[1].split(
+        "%files -n cockpit-vmbackupd", 1,
+    )
+    assert "%{_datadir}/cockpit/vmbackupd/" not in main_files
+    assert "%{_datadir}/cockpit/vmbackupd/" in cockpit_files
+    for forbidden in (
+        "%{_bindir}", "%{_sysconfdir}", "%{_unitdir}", "%{_sysusersdir}",
+        "%{_tmpfilesdir}", "state.db", ".qcow2", "/var/lib", "/run/",
+    ):
+        assert forbidden not in cockpit_files
 
 
 def test_rpm_scriptlets_do_not_start_backups_or_delete_state():
@@ -55,6 +86,12 @@ def test_rpm_scriptlets_do_not_start_backups_or_delete_state():
     assert "%systemd_post vmbackupd.service" in spec
     assert "%systemd_preun vmbackupd.service" in spec
     assert "%systemd_postun vmbackupd.service" in spec
+    cockpit_package = spec.split("%package -n cockpit-vmbackupd", 1)[1]
+    cockpit_before_files = cockpit_package.split("%files -n cockpit-vmbackupd", 1)[0]
+    assert "%post -n cockpit-vmbackupd" not in cockpit_before_files
+    assert "%pre -n cockpit-vmbackupd" not in cockpit_before_files
+    assert "%postun -n cockpit-vmbackupd" not in cockpit_before_files
+    assert "%preun -n cockpit-vmbackupd" not in cockpit_before_files
 
 
 def test_service_uses_unprivileged_account_and_expected_lifecycle():
@@ -165,6 +202,9 @@ def test_build_helper_is_offline_noninstalling_and_excludes_development_content(
     assert '"$script_dir"/vmbackupd.' not in helper
     assert '--directory "$repo_root"' not in helper
     assert "--others" not in helper
+    assert "-name 'cockpit-vmbackupd-*.rpm'" in helper
+    assert "-name 'vmbackupd-*.rpm'" in helper
+    assert "*.src.rpm" in helper
     assert "tests" in helper and ".venv" in helper and ".git" in helper
     for forbidden in ("dnf install", "rpm -i", "rpm -U", "curl ", "wget ", "sudo "):
         assert forbidden not in helper
@@ -245,6 +285,6 @@ def test_build_helper_uses_staged_index_snapshot_not_unstaged_worktree(tmp_path)
 
 def test_packaging_document_keeps_future_components_explicitly_deferred():
     documentation = (ROOT / "docs" / "packaging.md").read_text()
-    assert "Cockpit" in documentation and "not packaged" in documentation
+    assert "cockpit-vmbackupd" in documentation and "separate" in documentation
     assert "SELinux Enforcing" in documentation and "blocker" in documentation
     assert "state.db" in documentation and "preserved" in documentation

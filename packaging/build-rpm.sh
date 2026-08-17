@@ -45,4 +45,6 @@ rpmbuild -ba "$work_root/rpmbuild/SPECS/vmbackupd.spec" \
 
 find "$work_root/rpmbuild/RPMS" "$work_root/rpmbuild/SRPMS" \
     -type f \( -name '*.rpm' -o -name '*.src.rpm' \) -exec cp -p {} "$output_dir/" \;
-find "$output_dir" -maxdepth 1 -type f -name 'vmbackupd-*.rpm' -print
+find "$output_dir" -maxdepth 1 -type f \
+    \( -name 'vmbackupd-*.rpm' -o -name 'cockpit-vmbackupd-*.rpm' \) \
+    -print | LC_ALL=C sort

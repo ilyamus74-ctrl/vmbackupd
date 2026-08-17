@@ -1,15 +1,55 @@
 # Fedora RPM packaging
 
-Phase 3D.2 provides a Fedora-style `vmbackupd` RPM specification and production
-service profile. Cockpit is not packaged, no SELinux policy subpackage exists,
-and source-tree `vmbackupd-dev.service` is neither read nor included.
+The shared Fedora-style spec produces the `vmbackupd` daemon package and the
+separate `cockpit-vmbackupd` frontend package from one source RPM. No SELinux
+policy subpackage exists, and source-tree `vmbackupd-dev.service` is neither
+read nor included.
 
 ## Package contents and layout
 
-The binary package contains the Python package, `/usr/bin/vmbackupd`,
+The main binary package contains the Python package, `/usr/bin/vmbackupd`,
 `/usr/bin/vmbackupctl`, the systemd unit, sysusers/tmpfiles definitions,
 documentation, and `/etc/vmbackupd/vmbackupd.toml` as `%config(noreplace)`.
 Mutable databases and backup images are never RPM payload files.
+
+The optional noarch `cockpit-vmbackupd` package contains only the five static
+frontend files below `/usr/share/cockpit/vmbackupd/`. It requires
+`cockpit-bridge >= 215` and exact-release `vmbackupd`. The dependency is
+one-way, so `vmbackupd` remains independently installable for headless hosts.
+The Cockpit package has no service scriptlets, configuration, runtime state, or
+backup data.
+
+## Phase 3E.3 Cockpit package lifecycle validation
+
+The staged Fedora 41 build produced exactly the two noarch binaries
+`vmbackupd-0.1.0-1.fc41` and `cockpit-vmbackupd-0.1.0-1.fc41` from the single
+`vmbackupd-0.1.0-1.fc41` source RPM. DNF installed only the Cockpit subpackage.
+It did not start vmbackupd, stop the development daemon, start Cockpit, or alter
+the production mutation-disabled configuration. The five installed files were
+root-owned mode 0644, attributed by RPM to `cockpit-vmbackupd`, and compared
+byte-for-byte equal to source.
+
+The user-local development symlink was removed before package discovery.
+`cockpit-bridge --packages` then resolved **VM Backup** from
+`/usr/share/cockpit/vmbackupd`, and a fresh authorized Cockpit 345 session
+successfully displayed the production Dashboard, running `win10`, default
+`local-root` destination, and repeated read-only Refresh results. The production
+daemon remained mutation-disabled and no backup ran.
+
+Independent frontend erase removed only `/usr/share/cockpit/vmbackupd` and its
+discovery entry. The exact-release `vmbackupd` dependency did not make erase
+remove the daemon package. The production service stayed healthy; `state.db`
+remained device 64512, inode 3816539, mode 0640, owner
+`vmbackupd:vmbackupd`. Backup artifact stat comparisons were empty: the
+forensic artifact remained device 64512, inode 3816474, size 49904353280, mode
+0600, owner `root:root`; the successful artifact remained device 64512, inode
+3816476, size 49904353280, mode 0660, owner `ilyamus:qemu`. Configuration,
+control data, and all backup objects were preserved.
+
+This validates package install/browser/uninstall behavior, not mutation or
+production readiness. SELinux Enforcing, non-interactive packaged-account
+read-write `backup-begin` authorization, Cockpit mutation controls, and
+finer-grained API roles remain pending.
 
 ```text
 /etc/vmbackupd/vmbackupd.toml
