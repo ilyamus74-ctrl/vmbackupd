@@ -1,1 +1,2 @@
+g vmbackupd-admin -
 u vmbackupd - "vmbackupd backup daemon" /var/lib/vmbackupd /usr/sbin/nologin

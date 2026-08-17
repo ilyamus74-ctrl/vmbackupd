@@ -65,11 +65,17 @@ def test_service_uses_unprivileged_account_and_expected_lifecycle():
     assert service["User"] == "vmbackupd"
     assert service["Group"] == "vmbackupd"
     assert service["SupplementaryGroups"] == "qemu"
+    assert service["StateDirectory"] == "vmbackupd"
+    assert service["StateDirectoryMode"] == "0750"
     assert service["ExecStart"] == (
         "/usr/bin/vmbackupd --config /etc/vmbackupd/vmbackupd.toml"
     )
     assert service["Restart"] == "on-failure"
     unit = text("vmbackupd.service").lower()
+    assert "systemd-tmpfiles-setup.service" in unit
+    assert "runtimedirectory=" not in unit
+    assert "runtimedirectorymode=" not in unit
+    assert "supplementarygroups=vmbackupd-admin" not in unit
     assert "user=root" not in unit
     assert "sudo" not in unit
     assert "chown -r" not in unit
@@ -120,15 +126,31 @@ def test_packaging_files_have_no_development_identity_or_numeric_qemu_id():
 
 
 def test_sysusers_and_tmpfiles_are_restrictive_and_scoped():
-    assert text("vmbackupd.sysusers").strip() == (
+    sysusers = text("vmbackupd.sysusers").splitlines()
+    assert "g vmbackupd-admin -" in sysusers
+    assert (
         'u vmbackupd - "vmbackupd backup daemon" /var/lib/vmbackupd /usr/sbin/nologin'
+        in sysusers
     )
+    assert len(sysusers) == 2
+    assert all(not line.startswith("m ") for line in sysusers)
     tmpfiles = text("vmbackupd.tmpfiles").splitlines()
+    assert "d /run/vmbackupd 2750 vmbackupd vmbackupd-admin -" in tmpfiles
     assert "d /var/lib/vmbackupd 0750 vmbackupd vmbackupd -" in tmpfiles
     assert "d /var/lib/vmbackupd/control 0750 vmbackupd vmbackupd -" in tmpfiles
     assert "d /var/lib/libvirt/images/vmbackupd 0750 vmbackupd qemu -" in tmpfiles
     assert all("0777" not in line and "0666" not in line for line in tmpfiles)
     assert all(not line.startswith("r ") and not line.startswith("R ") for line in tmpfiles)
+
+
+def test_production_control_socket_contract_remains_private_and_stable():
+    config = text("vmbackupd.toml")
+    assert 'socket_path = "/run/vmbackupd/vmbackupd.sock"' in config
+    assert 'socket_mode = "0660"' in config
+    assert "0666" not in config
+
+    from vmbackupd.cli import DEFAULT_SOCKET
+    assert DEFAULT_SOCKET == "/run/vmbackupd/vmbackupd.sock"
 
 
 def test_build_helper_is_offline_noninstalling_and_excludes_development_content():

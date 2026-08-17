@@ -32,6 +32,30 @@ shutdown removes only the socket owned by that server instance.
 Only definitive stale results such as connection refusal permit unlink;
 permission, resource, and other ambiguous probe failures leave it untouched.
 
+## Local administrator access
+
+The production socket is `/run/vmbackupd/vmbackupd.sock`, owned by
+`vmbackupd:vmbackupd-admin` with mode 0660. Its tmpfiles-managed parent is
+`vmbackupd:vmbackupd-admin` mode 2750, so normal UNIX SGID inheritance assigns
+the control group when the unprivileged daemon binds the socket. Root and
+explicit members of `vmbackupd-admin` may connect; ordinary users receive a
+permission error. The package creates the group but never enrolls human users.
+
+Phase 3E.1 live Fedora 41 validation proved the packaged DAC behavior: the SGID
+directory produced a 0660 `vmbackupd:vmbackupd-admin` socket, an unenrolled user
+received permission denied with client exit 3, and the explicitly enrolled
+administrator could call daemon status, VM discovery, and storage listing from
+a fresh session. Group credentials are captured when the login/Cockpit bridge
+session starts, so an existing session may need re-login after enrollment.
+Direct access to SQLite, daemon control state, and existing backup qcow2 data
+remained denied to the API administrator.
+
+`vmbackupd-admin` is a full local control-plane administrator role in the first
+implementation. It is distinct from the `vmbackupd` service-account group and
+does not grant direct SQLite, libvirt, qemu-img, control-state, or backup-file
+access. Future finer-grained authorization may be added behind the same API
+without changing the client architecture.
+
 `daemon.status` exposes `runtime_state`, a safe `runtime_last_error`, and the
 validated `database_schema_version`. The latter is additive diagnostic data and
 does not change API protocol version 1. If the worker is `FAILED`, diagnostic

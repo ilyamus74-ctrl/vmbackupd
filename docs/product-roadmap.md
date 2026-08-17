@@ -72,6 +72,28 @@ is `Local`. Phase 3F adds `SSH / rsync`. This prevents the UI from being shaped
 around local filesystem paths even though remote destination persistence and
 transport are intentionally not implemented yet.
 
+Phase 3E uses the existing local API through Cockpit's raw UNIX-stream channel:
+
+```text
+Cockpit browser -> Cockpit bridge (logged-in user)
+                -> /run/vmbackupd/vmbackupd.sock -> vmbackupd API
+```
+
+The initial logged-in user must belong to the full control-plane administrator
+role `vmbackupd-admin`. Cockpit must not invoke `vmbackupctl`, access SQLite,
+run virsh/qemu-img, or require a privileged helper for this normal path. No
+read-only role is introduced yet; future finer-grained authorization remains
+behind the same daemon API.
+
+Phase 3E.1 has live-validated this local DAC foundation with the Fedora 41 RPM:
+the packaged SGID directory and socket inherited `vmbackupd-admin`, access was
+denied before explicit enrollment and allowed from a fresh session afterward,
+and the administrator gained no direct database/control/backup-file access.
+The Cockpit frontend itself is not implemented or validated yet. SELinux
+Enforcing and non-interactive packaged-account authorization for the separate
+read-write `backup-begin` boundary also remain unresolved; no packaged-service
+backup was executed during this validation.
+
 Future retention deletion is constrained by a permanent fail-safe contract:
 **no new valid backup means no automatic deletion**. Automatic expiration is a
 post-success action, permitted only after an `AVAILABLE` restore point has been

@@ -281,6 +281,56 @@ def test_protocol_validation_malformed_size_unknown_and_structured_errors(app, t
     asyncio.run(scenario())
 
 
+def test_api_socket_mode_requires_no_privileged_chown(app, tmp_path):
+    async def scenario():
+        runtime_dir = tmp_path / "runtime"
+        runtime_dir.mkdir(mode=0o750)
+        server = ApiServer(app, runtime_dir / "vmbackupd.sock", 0o660)
+        await server.start()
+        try:
+            socket_stat = server.socket_path.lstat()
+            assert socket_stat.st_mode & 0o777 == 0o660
+        finally:
+            await server.stop()
+
+    asyncio.run(scenario())
+    assert ".chown(" not in (Path(__file__).parents[1] / "src/vmbackupd/local_api.py").read_text()
+
+
+def test_api_socket_inherits_alternate_supplementary_group_from_sgid_directory(
+    app, tmp_path,
+):
+    effective_gid = os.getegid()
+    alternate_gid = next((gid for gid in os.getgroups() if gid != effective_gid), None)
+    if alternate_gid is None:
+        pytest.skip("no supplementary GID distinct from the effective GID")
+
+    async def scenario():
+        runtime_dir = tmp_path / "runtime-sgid"
+        runtime_dir.mkdir(mode=0o750)
+        try:
+            os.chown(runtime_dir, -1, alternate_gid)
+            runtime_dir.chmod(0o2750)
+        except OSError as exc:
+            pytest.skip(f"cannot assign owned test directory to supplementary GID: {exc}")
+
+        directory_stat = runtime_dir.stat()
+        if directory_stat.st_gid != alternate_gid or not directory_stat.st_mode & 0o2000:
+            pytest.skip("filesystem did not retain alternate group with SGID mode")
+
+        assert alternate_gid != effective_gid
+        server = ApiServer(app, runtime_dir / "vmbackupd.sock", 0o660)
+        await server.start()
+        try:
+            socket_stat = server.socket_path.lstat()
+            assert socket_stat.st_gid == alternate_gid
+            assert socket_stat.st_mode & 0o777 == 0o660
+        finally:
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
 def test_api_lists_status_and_objects(app, tmp_path):
     vm, job = register_and_job(app)
     async def scenario():

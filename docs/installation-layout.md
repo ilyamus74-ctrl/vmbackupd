@@ -12,6 +12,9 @@ Phase 3D.2 provides the Fedora-style RPM layout and service profile:
     state.db
     control/
 
+/run/vmbackupd/                 vmbackupd:vmbackupd-admin 2750
+    vmbackupd.sock              vmbackupd:vmbackupd-admin 0660
+
 /usr/lib/systemd/system/vmbackupd.service
 /usr/lib/sysusers.d/vmbackupd.conf
 /usr/lib/tmpfiles.d/vmbackupd.conf
@@ -47,10 +50,22 @@ If a data user is configured, it must resolve to the account actually running
 vmbackupd; configuration cannot transfer the run directory to QEMU. The
 configured data group is applied without changing daemon ownership.
 
-Sysusers creates the dedicated non-login account without fixed numeric IDs.
-Tmpfiles and systemd state/runtime directories establish narrowly scoped 0750
-paths. Fedora SELinux labels or policy remain unimplemented; Enforcing
-validation is required before production release.
+Sysusers creates the dedicated non-login account without fixed numeric IDs. It
+also creates the dedicated `vmbackupd-admin` system group without a fixed GID
+or automatic human membership. Tmpfiles, rather than `RuntimeDirectory=`,
+creates the SGID API directory so sockets inherit the control-plane group. This
+does not change ownership of state, control, or backup data. Tmpfiles and
+systemd state directories establish narrowly scoped paths. Fedora SELinux
+labels or policy remain unimplemented; Enforcing validation is required before
+production release.
+
+Live Fedora 41 packaged-service validation confirmed the exact 2750 runtime
+directory and inherited 0660 socket ownership shown above. Installation created
+the role group without enrolling a human or the service account. An ordinary
+user was denied before explicit operator enrollment; a fresh session succeeded
+through the API afterward while direct database, control-directory, and backup
+artifact access remained denied. Newly added group membership may require a
+new login or Cockpit bridge session to take effect.
 
 An isolated Fedora 41 alternate-root lifecycle test validated installation,
 reinstallation, and erase. The account was created with home

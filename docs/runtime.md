@@ -146,7 +146,10 @@ schema mutation. WAL and busy-timeout coordination remain unchanged, and no
 connection crosses thread ownership boundaries.
 
 The packaged foreground daemon runs as the dedicated `vmbackupd` account.
-Systemd creates its 0750 runtime directory, sends SIGTERM on stop, and allows 30
+Systemd-tmpfiles creates `/run/vmbackupd` as
+`vmbackupd:vmbackupd-admin` mode 2750 for the local API, while systemd
+`StateDirectory=vmbackupd` manages `/var/lib/vmbackupd` as
+`vmbackupd:vmbackupd` mode 0750. Systemd sends SIGTERM on stop and allows 30
 seconds for the current bounded cooperative step and clean controller/socket
 shutdown. Installing the RPM does not start a backup or explicitly start the
 unit.

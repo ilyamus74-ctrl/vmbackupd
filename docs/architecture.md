@@ -218,6 +218,22 @@ without driving execution. Persisted StorageDestinations select control/data
 roots and capacity status per job. See [`local-api.md`](local-api.md),
 [`cli.md`](cli.md), and [`configuration.md`](configuration.md).
 
+Local control-plane authorization is enforced by UNIX filesystem credentials.
+The SGID `/run/vmbackupd` directory and 0660 API socket use group
+`vmbackupd-admin`, a dedicated full-administrator role distinct from the
+`vmbackupd` service-account group. Package installation never enrolls human
+users. Membership grants API access only—not direct database, libvirt,
+qemu-img, control-state, or backup-data access—and permits future finer-grained
+authorization without bypassing the application service.
+
+Phase 3E.1 live RPM testing validated that boundary under the packaged hardened
+service: the socket inherited `vmbackupd-admin`, an ordinary user was denied,
+an explicitly enrolled administrator gained API access in a fresh session, and
+database, control-state, and backup-artifact access remained unavailable. The
+mutation-disabled API still rejected `backup.run`; this was not a real backup
+or Cockpit frontend test. SELinux Enforcing and packaged-account authorization
+for the separate read-write `backup-begin` boundary remain unresolved.
+
 ## Phase 3C hardening
 
 The asyncio API and cooperative runtime never share a SQLite connection. The
