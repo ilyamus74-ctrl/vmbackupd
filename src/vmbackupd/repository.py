@@ -7,10 +7,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from .models import (
-    BackupChain, BackupChainStatus, BackupJob, BackupKind, BackupPolicy, CatchUpMode,
-    DaemonInstance, Event, ExecutionLease, JobRun, Node, NodeControllerLease,
-    OverlapPolicy, RestorePoint, RestorePointStatus, RetentionPolicy, RunState,
-    SchedulePolicy, VM, new_id, utcnow,
+    ArtifactKind, ArtifactState, BackupArtifact, BackupChain, BackupChainStatus,
+    BackupJob, BackupKind, BackupPolicy, CatchUpMode, DaemonInstance, Event,
+    ExecutionLease, JobRun, LibvirtBackupOperation, LibvirtExternalState, Node,
+    NodeControllerLease, OverlapPolicy, PersistedLibvirtPlan, RestorePoint,
+    RestorePointStatus, RetentionPolicy, RunDisk, RunState, SchedulePolicy, VM,
+    new_id, utcnow,
 )
 from .state_machine import InvalidStateTransition, validate_transition
 
@@ -37,7 +39,8 @@ class SQLiteRepository:
             );
             CREATE TABLE IF NOT EXISTS vms (
                 id TEXT PRIMARY KEY, node_id TEXT NOT NULL REFERENCES nodes(id),
-                name TEXT NOT NULL, external_id TEXT NOT NULL, created_at TEXT NOT NULL,
+                name TEXT NOT NULL, external_id TEXT NOT NULL, libvirt_domain_uuid TEXT,
+                created_at TEXT NOT NULL,
                 UNIQUE(node_id, external_id)
             );
             CREATE TABLE IF NOT EXISTS backup_jobs (
@@ -80,10 +83,47 @@ class SQLiteRepository:
                 id TEXT PRIMARY KEY, chain_id TEXT NOT NULL REFERENCES backup_chains(id),
                 job_run_id TEXT NOT NULL UNIQUE REFERENCES job_runs(id), kind TEXT NOT NULL,
                 sequence INTEGER NOT NULL CHECK(sequence >= 0),
-                backup_object_id TEXT NOT NULL UNIQUE,
+                backup_object_id TEXT,
                 parent_restore_point_id TEXT REFERENCES restore_points(id),
+                libvirt_checkpoint_name TEXT,
                 status TEXT NOT NULL CHECK(status = 'AVAILABLE'), created_at TEXT NOT NULL,
                 UNIQUE(chain_id, sequence)
+            );
+            CREATE TABLE IF NOT EXISTS backup_artifacts (
+                id TEXT PRIMARY KEY, job_run_id TEXT NOT NULL REFERENCES job_runs(id),
+                restore_point_id TEXT REFERENCES restore_points(id),
+                kind TEXT NOT NULL CHECK(kind IN ('DISK', 'DOMAIN_XML', 'MANIFEST')),
+                disk_target TEXT, object_id TEXT NOT NULL UNIQUE, format TEXT,
+                size_bytes INTEGER CHECK(size_bytes IS NULL OR size_bytes >= 0),
+                checksum_algorithm TEXT, checksum TEXT,
+                state TEXT NOT NULL CHECK(state IN
+                    ('PLANNED', 'WRITING', 'COMPLETE', 'VERIFIED', 'PUBLISHED')),
+                created_at TEXT NOT NULL, verified_at TEXT,
+                CHECK((kind = 'DISK' AND disk_target IS NOT NULL) OR
+                      (kind != 'DISK' AND disk_target IS NULL)),
+                UNIQUE(job_run_id, kind, disk_target)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS one_nondisk_artifact_kind_per_run
+                ON backup_artifacts(job_run_id, kind) WHERE kind != 'DISK';
+            CREATE UNIQUE INDEX IF NOT EXISTS one_disk_artifact_target_per_run
+                ON backup_artifacts(job_run_id, disk_target) WHERE kind = 'DISK';
+            CREATE TABLE IF NOT EXISTS run_disks (
+                run_id TEXT NOT NULL REFERENCES job_runs(id), target_dev TEXT NOT NULL,
+                source_type TEXT NOT NULL, source_path TEXT, source_format TEXT,
+                backup_enabled INTEGER NOT NULL,
+                planned_artifact_id TEXT REFERENCES backup_artifacts(id),
+                PRIMARY KEY(run_id, target_dev)
+            );
+            CREATE TABLE IF NOT EXISTS libvirt_backup_operations (
+                run_id TEXT PRIMARY KEY REFERENCES job_runs(id), domain_uuid TEXT NOT NULL,
+                domain_name TEXT NOT NULL, connection_uri TEXT NOT NULL,
+                backup_mode TEXT NOT NULL CHECK(backup_mode IN ('FULL', 'INCREMENTAL')),
+                checkpoint_name TEXT, incremental_base_checkpoint TEXT,
+                backup_xml TEXT NOT NULL, checkpoint_xml TEXT,
+                external_state TEXT NOT NULL CHECK(external_state IN
+                    ('PLANNED', 'START_REQUESTED', 'RUNNING', 'COMPLETED',
+                     'ABORT_REQUESTED', 'UNKNOWN')),
+                started_at TEXT, last_polled_at TEXT, completed_at TEXT
             );
             CREATE TABLE IF NOT EXISTS events (
                 id TEXT PRIMARY KEY, job_run_id TEXT REFERENCES job_runs(id),
@@ -115,7 +155,8 @@ class SQLiteRepository:
         self._insert("nodes", value, ("id", "name", "created_at"))
 
     def add_vm(self, value: VM) -> None:
-        self._insert("vms", value, ("id", "node_id", "name", "external_id", "created_at"))
+        self._insert("vms", value, ("id", "node_id", "name", "external_id",
+                                   "libvirt_domain_uuid", "created_at"))
 
     def add_job(self, value: BackupJob) -> None:
         self.connection.execute(
@@ -180,6 +221,8 @@ class SQLiteRepository:
         validate_transition(run.state, target)
         if target is RunState.BACKING_UP and run.planned_kind is None:
             raise DomainInvariantError("a persisted backup plan is required before BACKING_UP")
+        if target is RunState.BACKING_UP and self.get_libvirt_operation(run_id) is not None:
+            self._validate_libvirt_backing_transition(run_id)
         with self.connection:
             self._update_run_state(run, target, error)
             self._insert_transition_event(run.id, run.state, target)
@@ -228,13 +271,257 @@ class SQLiteRepository:
         if run.planned_kind is None or run.planned_chain_id != chain_id:
             raise DomainInvariantError("chain assignment must come from the persisted backup plan")
 
-    def finalize_success(self, run_id: str, backup_object_id: str) -> JobRun:
-        """Atomically publish the restore point, chain lifecycle, event, and SUCCESS."""
+    def add_artifact(self, artifact: BackupArtifact) -> None:
+        if artifact.state is ArtifactState.PUBLISHED or artifact.restore_point_id is not None:
+            raise DomainInvariantError("artifacts may be published only by finalize_success")
+        if self.get_libvirt_operation(artifact.job_run_id) is not None:
+            raise DomainInvariantError("persisted libvirt plan artifact identities are immutable")
+        self.connection.execute(
+            """INSERT INTO backup_artifacts
+               (id, job_run_id, restore_point_id, kind, disk_target, object_id, format,
+                size_bytes, checksum_algorithm, checksum, state, created_at, verified_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (artifact.id, artifact.job_run_id, artifact.restore_point_id, artifact.kind,
+             artifact.disk_target, artifact.object_id, artifact.format, artifact.size_bytes,
+             artifact.checksum_algorithm, artifact.checksum, artifact.state,
+             artifact.created_at.isoformat(),
+             artifact.verified_at.isoformat() if artifact.verified_at else None),
+        )
+        self.connection.commit()
+
+    def mark_artifact_verified(
+        self, artifact_id: str, *, size_bytes: int | None = None,
+        checksum_algorithm: str | None = None, checksum: str | None = None,
+        verified_at: datetime | None = None,
+    ) -> BackupArtifact:
+        artifact = self.get_artifact(artifact_id)
+        if artifact.state not in (
+            ArtifactState.PLANNED, ArtifactState.WRITING,
+            ArtifactState.COMPLETE, ArtifactState.VERIFIED,
+        ):
+            raise DomainInvariantError("published artifact cannot be re-verified")
+        when = verified_at or utcnow()
+        with self.connection:
+            self.connection.execute(
+                """UPDATE backup_artifacts SET state = 'VERIFIED', size_bytes = ?,
+                   checksum_algorithm = ?, checksum = ?, verified_at = ? WHERE id = ?""",
+                (size_bytes if size_bytes is not None else artifact.size_bytes,
+                 checksum_algorithm if checksum_algorithm is not None else artifact.checksum_algorithm,
+                 checksum if checksum is not None else artifact.checksum,
+                 when.isoformat(), artifact_id),
+            )
+        return self.get_artifact(artifact_id)
+
+    def get_artifact(self, artifact_id: str) -> BackupArtifact:
+        row = self.connection.execute(
+            "SELECT * FROM backup_artifacts WHERE id = ?", (artifact_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(artifact_id)
+        return self._artifact(row)
+
+    def list_artifacts_for_run(self, run_id: str) -> list[BackupArtifact]:
+        rows = self.connection.execute(
+            """SELECT * FROM backup_artifacts WHERE job_run_id = ?
+               ORDER BY CASE kind WHEN 'DISK' THEN 0 WHEN 'DOMAIN_XML' THEN 1 ELSE 2 END,
+                        disk_target, id""", (run_id,),
+        )
+        return [self._artifact(row) for row in rows]
+
+    def list_artifacts_for_restore_point(self, restore_point_id: str) -> list[BackupArtifact]:
+        rows = self.connection.execute(
+            """SELECT * FROM backup_artifacts WHERE restore_point_id = ?
+               ORDER BY CASE kind WHEN 'DISK' THEN 0 WHEN 'DOMAIN_XML' THEN 1 ELSE 2 END,
+                        disk_target, id""", (restore_point_id,),
+        )
+        return [self._artifact(row) for row in rows]
+
+    def add_run_disk(self, disk: RunDisk) -> None:
+        if self.get_libvirt_operation(disk.run_id) is not None:
+            raise DomainInvariantError("persisted libvirt plan disk inventory is immutable")
+        self.connection.execute(
+            "INSERT INTO run_disks VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (disk.run_id, disk.target_dev, disk.source_type, disk.source_path,
+             disk.source_format, int(disk.backup_enabled), disk.planned_artifact_id),
+        )
+        self.connection.commit()
+
+    def list_run_disks(self, run_id: str) -> list[RunDisk]:
+        rows = self.connection.execute(
+            "SELECT * FROM run_disks WHERE run_id = ? ORDER BY target_dev", (run_id,)
+        )
+        return [RunDisk(run_id=row["run_id"], target_dev=row["target_dev"],
+                        source_type=row["source_type"], source_path=row["source_path"],
+                        source_format=row["source_format"],
+                        backup_enabled=bool(row["backup_enabled"]),
+                        planned_artifact_id=row["planned_artifact_id"]) for row in rows]
+
+    def add_libvirt_operation(self, operation: LibvirtBackupOperation) -> None:
+        self.connection.execute(
+            "INSERT INTO libvirt_backup_operations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (operation.run_id, operation.domain_uuid, operation.domain_name,
+             operation.connection_uri, operation.backup_mode, operation.checkpoint_name,
+             operation.incremental_base_checkpoint, operation.backup_xml,
+             operation.checkpoint_xml, operation.external_state,
+             operation.started_at.isoformat() if operation.started_at else None,
+             operation.last_polled_at.isoformat() if operation.last_polled_at else None,
+             operation.completed_at.isoformat() if operation.completed_at else None),
+        )
+        self.connection.commit()
+
+    def persist_libvirt_plan(
+        self, run_id: str, disks: list[RunDisk], artifacts: list[BackupArtifact],
+        operation: LibvirtBackupOperation,
+    ) -> None:
+        run = self.get_run(run_id)
+        if run.state is not RunState.PREPARING or run.planned_kind is None:
+            raise DomainInvariantError("libvirt planning requires a planned PREPARING run")
+        if operation.run_id != run_id or operation.backup_mode is not run.planned_kind:
+            raise DomainInvariantError("libvirt operation does not match the run plan")
+        if operation.external_state is not LibvirtExternalState.PLANNED:
+            raise DomainInvariantError("new libvirt operation must have PLANNED external state")
+        job = self.get_job(run.job_id)
+        vm = self.get_vm(job.vm_id)
+        if vm.libvirt_domain_uuid is None or operation.domain_uuid != vm.libvirt_domain_uuid:
+            raise DomainInvariantError("libvirt operation UUID does not match bound VM identity")
+        artifact_ids = {artifact.id for artifact in artifacts}
+        if any(artifact.job_run_id != run_id for artifact in artifacts):
+            raise DomainInvariantError("artifact belongs to another run")
+        if any(disk.run_id != run_id for disk in disks):
+            raise DomainInvariantError("disk inventory belongs to another run")
+        if any(disk.backup_enabled and disk.planned_artifact_id not in artifact_ids for disk in disks):
+            raise DomainInvariantError("enabled disk has no planned artifact")
+        with self.connection:
+            if self.connection.execute(
+                "SELECT 1 FROM libvirt_backup_operations WHERE run_id = ?", (run_id,)
+            ).fetchone():
+                raise DomainInvariantError("run already has a libvirt operation")
+            for artifact in artifacts:
+                self.connection.execute(
+                    """INSERT INTO backup_artifacts
+                       (id, job_run_id, restore_point_id, kind, disk_target, object_id,
+                        format, size_bytes, checksum_algorithm, checksum, state,
+                        created_at, verified_at)
+                       VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (artifact.id, run_id, artifact.kind, artifact.disk_target,
+                     artifact.object_id, artifact.format, artifact.size_bytes,
+                     artifact.checksum_algorithm, artifact.checksum, artifact.state,
+                     artifact.created_at.isoformat(),
+                     artifact.verified_at.isoformat() if artifact.verified_at else None),
+                )
+            for disk in disks:
+                self.connection.execute(
+                    "INSERT INTO run_disks VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (run_id, disk.target_dev, disk.source_type, disk.source_path,
+                     disk.source_format, int(disk.backup_enabled), disk.planned_artifact_id),
+                )
+            self.connection.execute(
+                "INSERT INTO libvirt_backup_operations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (run_id, operation.domain_uuid, operation.domain_name,
+                 operation.connection_uri, operation.backup_mode,
+                 operation.checkpoint_name, operation.incremental_base_checkpoint,
+                 operation.backup_xml, operation.checkpoint_xml,
+                 operation.external_state,
+                 operation.started_at.isoformat() if operation.started_at else None,
+                 operation.last_polled_at.isoformat() if operation.last_polled_at else None,
+                 operation.completed_at.isoformat() if operation.completed_at else None),
+            )
+
+    def get_libvirt_operation(self, run_id: str) -> LibvirtBackupOperation | None:
+        row = self.connection.execute(
+            "SELECT * FROM libvirt_backup_operations WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return LibvirtBackupOperation(
+            run_id=row["run_id"], domain_uuid=row["domain_uuid"],
+            domain_name=row["domain_name"], connection_uri=row["connection_uri"],
+            backup_mode=BackupKind(row["backup_mode"]), checkpoint_name=row["checkpoint_name"],
+            incremental_base_checkpoint=row["incremental_base_checkpoint"],
+            backup_xml=row["backup_xml"], checkpoint_xml=row["checkpoint_xml"],
+            external_state=LibvirtExternalState(row["external_state"]),
+            started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
+            last_polled_at=datetime.fromisoformat(row["last_polled_at"]) if row["last_polled_at"] else None,
+            completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
+        )
+
+    def get_persisted_libvirt_plan(self, run_id: str) -> PersistedLibvirtPlan | None:
+        operation = self.get_libvirt_operation(run_id)
+        if operation is None:
+            return None
+        return PersistedLibvirtPlan(
+            operation=operation,
+            disks=tuple(self.list_run_disks(run_id)),
+            artifacts=tuple(self.list_artifacts_for_run(run_id)),
+        )
+
+    def _validate_libvirt_backing_transition(self, run_id: str) -> None:
+        run = self.get_run(run_id)
+        operation = self.get_libvirt_operation(run_id)
+        assert operation is not None
+        disks = self.list_run_disks(run_id)
+        artifacts = self.list_artifacts_for_run(run_id)
+        job = self.get_job(run.job_id)
+        vm = self.get_vm(job.vm_id)
+        if not disks or not artifacts:
+            raise DomainInvariantError("libvirt operation requires persisted disks and artifacts")
+        artifact_ids = {artifact.id for artifact in artifacts}
+        if any(disk.backup_enabled and disk.planned_artifact_id not in artifact_ids for disk in disks):
+            raise DomainInvariantError("libvirt disk inventory has an invalid artifact mapping")
+        if operation.external_state is not LibvirtExternalState.PLANNED:
+            raise DomainInvariantError("libvirt operation must be PLANNED before BACKING_UP")
+        if operation.backup_mode is not run.planned_kind:
+            raise DomainInvariantError("libvirt operation mode does not match run plan")
+        if vm.libvirt_domain_uuid is None or operation.domain_uuid != vm.libvirt_domain_uuid:
+            raise DomainInvariantError("libvirt operation UUID does not match bound VM identity")
+
+    def get_restore_point(self, restore_point_id: str) -> RestorePoint:
+        row = self.connection.execute(
+            "SELECT * FROM restore_points WHERE id = ?", (restore_point_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(restore_point_id)
+        return self._restore_point(row)
+
+    def finalize_success(self, run_id: str, backup_object_id: str | None = None) -> JobRun:
+        """Atomically publish verified artifacts, restore point, chain, event, and SUCCESS."""
         now = utcnow()
         try:
             with self.connection:
                 row = self._run_context(run_id)
                 self._validate_finalization_context(row)
+                artifacts = self.connection.execute(
+                    "SELECT * FROM backup_artifacts WHERE job_run_id = ? ORDER BY kind, disk_target",
+                    (run_id,),
+                ).fetchall()
+                if not artifacts and backup_object_id is not None:
+                    synthetic = (
+                        BackupArtifact(job_run_id=run_id, kind=ArtifactKind.DISK,
+                                       disk_target="vda", object_id=backup_object_id,
+                                       format="qcow2", state=ArtifactState.VERIFIED,
+                                       verified_at=now),
+                        BackupArtifact(job_run_id=run_id, kind=ArtifactKind.DOMAIN_XML,
+                                       object_id=f"mock-domain://{run_id}", format="xml",
+                                       state=ArtifactState.VERIFIED, verified_at=now),
+                    )
+                    for artifact in synthetic:
+                        self.connection.execute(
+                            """INSERT INTO backup_artifacts VALUES
+                               (?, ?, NULL, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?)""",
+                            (artifact.id, run_id, artifact.kind, artifact.disk_target,
+                             artifact.object_id, artifact.format, artifact.state,
+                             artifact.created_at.isoformat(), now.isoformat()),
+                        )
+                    artifacts = self.connection.execute(
+                        "SELECT * FROM backup_artifacts WHERE job_run_id = ?", (run_id,)
+                    ).fetchall()
+                if not artifacts:
+                    raise DomainInvariantError("successful finalization requires artifacts")
+                if any(ArtifactState(a["state"]) is not ArtifactState.VERIFIED for a in artifacts):
+                    raise DomainInvariantError("all artifacts must be VERIFIED before SUCCESS")
+                kinds = {ArtifactKind(a["kind"]) for a in artifacts}
+                if ArtifactKind.DISK not in kinds or ArtifactKind.DOMAIN_XML not in kinds:
+                    raise DomainInvariantError("verified DISK and DOMAIN_XML artifacts are required")
                 if BackupKind(row["planned_kind"]) is BackupKind.FULL:
                     active = self.connection.execute(
                         "SELECT id FROM backup_chains WHERE vm_id = ? AND status = 'ACTIVE'",
@@ -249,17 +536,26 @@ class SQLiteRepository:
                         "INSERT INTO backup_chains VALUES (?, ?, 'ACTIVE', ?, NULL)",
                         (row["planned_chain_id"], row["vm_id"], now.isoformat()),
                     )
+                operation = self.get_libvirt_operation(run_id)
+                first_disk = next(a for a in artifacts if ArtifactKind(a["kind"]) is ArtifactKind.DISK)
                 point = RestorePoint(
                     chain_id=row["planned_chain_id"], job_run_id=run_id,
                     kind=BackupKind(row["planned_kind"]), sequence=row["planned_sequence"],
                     parent_restore_point_id=row["parent_restore_point_id"],
-                    backup_object_id=backup_object_id, created_at=now,
+                    backup_object_id=first_disk["object_id"],
+                    libvirt_checkpoint_name=operation.checkpoint_name if operation else None,
+                    created_at=now,
                 )
                 self.connection.execute(
-                    "INSERT INTO restore_points VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO restore_points VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (point.id, point.chain_id, point.job_run_id, point.kind, point.sequence,
-                     point.backup_object_id, point.parent_restore_point_id, point.status,
+                     point.backup_object_id, point.parent_restore_point_id,
+                     point.libvirt_checkpoint_name, point.status,
                      point.created_at.isoformat()),
+                )
+                self.connection.execute(
+                    """UPDATE backup_artifacts SET restore_point_id = ?, state = 'PUBLISHED'
+                       WHERE job_run_id = ?""", (point.id, run_id),
                 )
                 run = self.get_run(run_id)
                 self._update_run_state(run, RunState.SUCCESS, None)
@@ -824,6 +1120,45 @@ class SQLiteRepository:
             created_at=datetime.fromisoformat(row["created_at"]),
         )
 
+    def get_vm(self, vm_id: str) -> VM:
+        row = self.connection.execute("SELECT * FROM vms WHERE id = ?", (vm_id,)).fetchone()
+        if row is None:
+            raise KeyError(vm_id)
+        return VM(id=row["id"], node_id=row["node_id"], name=row["name"],
+                  external_id=row["external_id"],
+                  libvirt_domain_uuid=row["libvirt_domain_uuid"],
+                  created_at=datetime.fromisoformat(row["created_at"]))
+
+    def bind_libvirt_domain_uuid(self, vm_id: str, observed_uuid: str) -> VM:
+        if not observed_uuid.strip():
+            raise ValueError("observed libvirt UUID cannot be empty")
+        with self.connection:
+            cursor = self.connection.execute(
+                """UPDATE vms SET libvirt_domain_uuid = ?
+                   WHERE id = ? AND libvirt_domain_uuid IS NULL""",
+                (observed_uuid, vm_id),
+            )
+            if cursor.rowcount == 0:
+                row = self.connection.execute(
+                    "SELECT libvirt_domain_uuid FROM vms WHERE id = ?", (vm_id,)
+                ).fetchone()
+                if row is None:
+                    raise KeyError(vm_id)
+                if row["libvirt_domain_uuid"] != observed_uuid:
+                    raise DomainInvariantError("DOMAIN_UUID_CHANGED")
+        return self.get_vm(vm_id)
+
+    def rebind_libvirt_domain_uuid(self, vm_id: str, new_uuid: str) -> VM:
+        if not new_uuid.strip():
+            raise ValueError("new libvirt UUID cannot be empty")
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE vms SET libvirt_domain_uuid = ? WHERE id = ?", (new_uuid, vm_id)
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(vm_id)
+        return self.get_vm(vm_id)
+
     def get_chain(self, chain_id: str) -> BackupChain:
         row = self.connection.execute("SELECT * FROM backup_chains WHERE id = ?", (chain_id,)).fetchone()
         if row is None:
@@ -878,8 +1213,22 @@ class SQLiteRepository:
             kind=BackupKind(row["kind"]), sequence=row["sequence"],
             backup_object_id=row["backup_object_id"],
             parent_restore_point_id=row["parent_restore_point_id"],
+            libvirt_checkpoint_name=row["libvirt_checkpoint_name"],
             status=RestorePointStatus(row["status"]),
             created_at=datetime.fromisoformat(row["created_at"]),
+        )
+
+    @staticmethod
+    def _artifact(row: sqlite3.Row) -> BackupArtifact:
+        return BackupArtifact(
+            id=row["id"], job_run_id=row["job_run_id"],
+            restore_point_id=row["restore_point_id"], kind=ArtifactKind(row["kind"]),
+            disk_target=row["disk_target"], object_id=row["object_id"],
+            format=row["format"], size_bytes=row["size_bytes"],
+            checksum_algorithm=row["checksum_algorithm"], checksum=row["checksum"],
+            state=ArtifactState(row["state"]),
+            created_at=datetime.fromisoformat(row["created_at"]),
+            verified_at=datetime.fromisoformat(row["verified_at"]) if row["verified_at"] else None,
         )
 
     @staticmethod

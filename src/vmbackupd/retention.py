@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .models import BackupChain, BackupChainStatus, BackupKind, RestorePoint, RetentionPolicy
+from .models import (
+    BackupArtifact, BackupChain, BackupChainStatus, BackupKind, RestorePoint, RetentionPolicy,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -12,6 +14,8 @@ class RetentionPlan:
     retained_restore_point_ids: frozenset[str]
     expired_chain_ids: tuple[str, ...]
     candidate_backup_object_ids: tuple[str, ...]
+    candidate_artifact_ids: tuple[str, ...]
+    candidate_object_ids: tuple[str, ...]
 
 
 class RetentionPlanner:
@@ -22,6 +26,7 @@ class RetentionPlanner:
         chains: list[BackupChain],
         restore_points: list[RestorePoint],
         policy: RetentionPolicy,
+        artifacts: list[BackupArtifact] | None = None,
     ) -> RetentionPlan:
         chain_by_id = {chain.id: chain for chain in chains}
         members_by_chain: dict[str, list[RestorePoint]] = {chain.id: [] for chain in chains}
@@ -71,11 +76,27 @@ class RetentionPlanner:
                 retained.update(p.id for p in members if p.sequence <= limit)
 
         expired: list[str] = []
-        objects: list[str] = []
+        legacy_objects: list[str] = []
+        expired_point_ids: set[str] = set()
         for chain in newest_chains:
             members = members_by_chain[chain.id]
             if (chain.status is BackupChainStatus.CLOSED
                     and not any(point.id in retained for point in members)):
                 expired.append(chain.id)
-                objects.extend(point.backup_object_id for point in members)
-        return RetentionPlan(frozenset(retained), tuple(expired), tuple(objects))
+                expired_point_ids.update(point.id for point in members)
+                legacy_objects.extend(
+                    point.backup_object_id for point in members if point.backup_object_id is not None
+                )
+        selected_artifacts = sorted(
+            (artifact for artifact in (artifacts or [])
+             if artifact.restore_point_id in expired_point_ids),
+            key=lambda artifact: (artifact.restore_point_id or "", artifact.id),
+        )
+        authoritative_objects = (
+            tuple(artifact.object_id for artifact in selected_artifacts)
+            if artifacts is not None else tuple(legacy_objects)
+        )
+        return RetentionPlan(
+            frozenset(retained), tuple(expired), tuple(legacy_objects),
+            tuple(artifact.id for artifact in selected_artifacts), authoritative_objects,
+        )

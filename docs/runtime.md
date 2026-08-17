@@ -83,6 +83,10 @@ Routine controller heartbeat updates only the controller row. Clean `stop`
 marks the daemon stopped and releases controller ownership, but deliberately
 leaves active VM execution state for conservative recovery by a later owner.
 
+If controller acquisition succeeds but startup recovery raises, startup releases
+the controller and marks the daemon stopped before propagating the error. A
+failed startup cannot leave accidental live controller ownership.
+
 ## VM recovery quarantine
 
 An unsafe `recovery_required` run quarantines its entire VM even after its stale
@@ -126,6 +130,9 @@ reconciliation, but Phase 2 does not pretend to perform that reconciliation.
 At startup, expired leases and leases owned by a fenced previous controller are
 removed and record `LEASE_EXPIRED`. An unsafe associated run is marked for
 recovery and is not restarted.
+
+`CLEANUP_RETRY` records the start or restart of a lease-owned cleanup attempt.
+Polling the same long-running cleanup does not append one event per tick.
 
 ## Unexpected executor exceptions
 

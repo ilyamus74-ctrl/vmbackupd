@@ -1,7 +1,8 @@
 from datetime import timedelta
 
 from vmbackupd.models import (
-    BackupChain, BackupChainStatus, BackupKind, RestorePoint, RetentionPolicy, utcnow,
+    ArtifactKind, ArtifactState, BackupArtifact, BackupChain, BackupChainStatus,
+    BackupKind, RestorePoint, RetentionPolicy, utcnow,
 )
 from vmbackupd.retention import RetentionPlanner
 
@@ -63,3 +64,24 @@ def test_candidates_never_include_retained_dependencies():
     retained_objects = {p.backup_object_id for p in a + b
                         if p.id in plan.retained_restore_point_ids}
     assert retained_objects.isdisjoint(plan.candidate_backup_object_ids)
+
+
+def test_expired_chain_selects_every_published_artifact_as_authoritative_objects():
+    old, old_points = make_chain("old-artifacts", 1, -20, BackupChainStatus.CLOSED)
+    active, active_points = make_chain("active-artifacts", 1, 0, BackupChainStatus.ACTIVE)
+    point = old_points[0]
+    artifacts = [
+        BackupArtifact(id=f"artifact-{kind}-{target}", job_run_id=point.job_run_id,
+                       restore_point_id=point.id, kind=kind, disk_target=target,
+                       object_id=f"object-{kind}-{target}", state=ArtifactState.PUBLISHED)
+        for kind, target in (
+            (ArtifactKind.DISK, "vda"), (ArtifactKind.DISK, "vdb"),
+            (ArtifactKind.DOMAIN_XML, None), (ArtifactKind.MANIFEST, None),
+        )
+    ]
+    plan = RetentionPlanner().plan(
+        [old, active], old_points + active_points, RetentionPolicy(0, 1), artifacts
+    )
+    assert plan.expired_chain_ids == (old.id,)
+    assert set(plan.candidate_artifact_ids) == {artifact.id for artifact in artifacts}
+    assert set(plan.candidate_object_ids) == {artifact.object_id for artifact in artifacts}

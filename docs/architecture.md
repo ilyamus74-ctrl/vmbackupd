@@ -114,3 +114,30 @@ ownership without claiming that external work completed.
 Interval schedules use `SKIP_IF_BUSY`. Due occurrences are coalesced into an
 observable skip and the cursor advances into the future, preventing slow jobs
 from accumulating an unbounded queue.
+
+## Libvirt planning boundary
+
+Phase 3A adds persistent planning without backend execution. `RunDisk` freezes
+the multi-disk inventory, `BackupArtifact` represents disk/XML/manifest objects,
+and `LibvirtBackupOperation` records exact future XML and external identity
+separately from `JobRun`. Restore-point publication atomically promotes all
+verified artifacts.
+
+The read-only virsh adapter is isolated behind an argv-only command runner.
+Structured preflight, deterministic checkpoint names, explicit push targets,
+and reconciliation classification are described in
+[`libvirt-backend.md`](libvirt-backend.md).
+
+Phase 3A.1 binds each VM to an immutable-by-default libvirt UUID, freezes each
+persisted libvirt plan against a second planning pass, and validates that plan
+again before `BACKING_UP`. Checkpoint-capable chains require qcow2 across the
+whole VM; full-only chains may include raw disks.
+
+Domain job inspection models libvirt job type separately from job operation: an
+active backup is a bounded or unbounded job whose operation is backup. Active
+and retained completed-job inspection are separate, and absence of an active
+job never proves success. Crash reconciliation compares semantic backup identity
+and can preserve completed-success, failure, cancellation, no-evidence, and
+unknown outcomes for future Phase 3B decisions. Retention derives future
+deletion candidates from every published artifact rather than the legacy first
+object.

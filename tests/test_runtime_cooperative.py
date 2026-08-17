@@ -193,10 +193,28 @@ def test_cleanup_spans_ticks_and_does_not_block_other_vm():
         tick(runtime, clock, seconds=1)
         assert repository.get_run(cleanup.id).state is RunState.CLEANUP
         assert repository.get_lease_for_run(cleanup.id) is not None
+    assert [e.event_type for e in repository.list_events(cleanup.id)].count("CLEANUP_RETRY") == 1
     while repository.get_run(other.id).state is not RunState.SUCCESS:
         tick(runtime, clock, seconds=1)
     assert repository.get_run(cleanup.id).state is RunState.FAILED
     assert repository.get_run(other.id).state is RunState.SUCCESS
+
+
+def test_failed_startup_recovery_releases_controller_and_stops_daemon():
+    repository, node, _, _, _, _, clock = domain()
+    runtime = DaemonRuntime(repository, node.id, clock, MockBackupEngine(repository))
+
+    def fail_recovery():
+        raise RuntimeError("recovery inspection failed")
+
+    runtime.recover_startup = fail_recovery
+    with pytest.raises(RuntimeError, match="recovery inspection failed"):
+        runtime.start()
+    assert repository.get_controller(node.id) is None
+    row = repository.connection.execute(
+        "SELECT stopped_at FROM daemon_instances ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    assert row["stopped_at"] is not None
 
 
 def test_clean_shutdown_releases_controller_but_leaves_active_vm_state():

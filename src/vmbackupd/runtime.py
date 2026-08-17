@@ -44,11 +44,13 @@ class DaemonRuntime:
             self.repository.acquire_controller(
                 self.node_id, daemon.instance_id, now, self.controller_lease_seconds
             )
+            self.instance_id = daemon.instance_id
+            self.recover_startup()
         except Exception:
+            self.repository.release_controller(self.node_id, daemon.instance_id, now)
             self.repository.stop_daemon(daemon.instance_id, now)
+            self.instance_id = None
             raise
-        self.instance_id = daemon.instance_id
-        self.recover_startup()
         return daemon.instance_id
 
     def stop(self) -> None:
@@ -149,16 +151,18 @@ class DaemonRuntime:
     def _advance_cleanup(self, run: JobRun) -> JobRun:
         instance = self._instance()
         lease = self.repository.get_lease_for_run(run.id)
+        attempt_started = lease is None
         if lease is None:
             lease = self.repository.acquire_lease(
                 run.id, instance, self.clock.now(), self.lease_seconds
             )
         if lease is None:
             return run
-        self.repository.record_event(Event(
-            job_run_id=run.id, event_type="CLEANUP_RETRY",
-            message="advancing cooperative cleanup", created_at=self.clock.now(),
-        ))
+        if attempt_started:
+            self.repository.record_event(Event(
+                job_run_id=run.id, event_type="CLEANUP_RETRY",
+                message="starting cooperative cleanup attempt", created_at=self.clock.now(),
+            ))
         previous_attempts = run.cleanup_attempts
         try:
             result = self.executor.advance_cleanup(run.id)
