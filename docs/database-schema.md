@@ -1,6 +1,6 @@
 # SQLite database schema and migrations
 
-`CURRENT_SCHEMA_VERSION = 1` is the vmbackupd product database format version.
+`CURRENT_SCHEMA_VERSION = 2` is the vmbackupd product database format version.
 It is independent of the Python package version and local API protocol version.
 Version 1 is the complete Phase 3C schema, including persisted prepared-output
 capacity and device/inode identity on `backup_artifacts`.
@@ -26,14 +26,30 @@ busy timeout, and WAL mode for file databases before invoking the schema
 manager. Repository operations become available only after one path completes:
 
 - An empty database is created directly from the authoritative current schema
-  definition and stamped version 1 in one transaction.
+  definition and stamped with the current version in one transaction.
 - A structurally current but unversioned Phase 3C/3D-preview database is
   validated, then receives only the metadata table and row. Operational tables
   and backup rows are not rebuilt or rewritten.
 - The known immediately preceding unversioned Phase 3C layout is migrated by
   adding nullable `planned_capacity`, `prepared_device`, and `prepared_inode`
-  columns, then stamped version 1.
-- A version-1 database is structurally validated without schema mutation.
+  columns, then migrated through the ordered versions.
+
+Version 2 adds `job_runs.storage_destination_id`, the immutable destination
+snapshot selected when a run is created. The transactional v1-to-v2 migration
+backfills historical runs from their job destination, which was not editable
+before Phase 3E.5. Missing relationships fail closed without advancing the
+version. Target-v2 structural, trigger, destination-node lineage, and foreign-key
+validation all run inside the same `BEGIN IMMEDIATE` transaction before the
+version row advances. Fresh and migrated schemas use the same appended column
+order and destination-trigger set. SQLite requires every run destination and
+rejects changing an existing snapshot while continuing to allow unrelated run
+state updates. Current-schema validation also checks every backup job, including
+jobs with no runs, against the destination's Node. It deliberately does not
+require a historical run snapshot to equal the job's current destination:
+changing a job from local destination A to local destination B affects only
+future runs. Migration performs no filesystem, libvirt, retention,
+restore-point, artifact, or run-state operation.
+- A version-1 database is transactionally migrated to version 2.
 
 Fingerprints verify every required operational table and its exact column set,
 critical foreign-key targets, and named partial/unique indexes. SQL text is not

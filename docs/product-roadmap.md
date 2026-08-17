@@ -119,9 +119,22 @@ methods are joined in the browser to show local-time success/failure summaries,
 active and recovery-required work, recent runs, each job's destination and last
 run, and its newest published `AVAILABLE` restore point. Displayed duration is
 total run lifecycle elapsed time. Storage remains explicitly `Type = Local`
-with compact free/reserve information. Manual browser validation of this
-expanded slice is still pending. Configuration/edit actions are reserved for
-Phases 3E.5/3E.6, while peer/node overview remains Phase 3F.
+with compact free/reserve information. Manual Cockpit 345 validation passed for
+the health cards, empty activity/job states, Local storage, discovered VM, and
+RUNNING/mutation-disabled presentation.
+
+Phase 3E.5 adds Backup Job creation/editing, enable/disable, and guarded Run now
+through the same allow-listed API. Discovered VMs can be registered explicitly
+as the first save step. FULL is fixed; storage CRUD and broader configuration
+remain Phase 3E.6. Runs snapshot their destination, so editing a job affects
+future runs only. Manual Cockpit 345 source/development-browser acceptance
+passed against schema v2: the existing successful FULL run and `AVAILABLE`
+restore point rendered, Edit populated and saved job metadata with a complete
+refresh, Enable/Disable worked, Add exposed the expected VM, destination,
+schedule, and retention controls, FULL remained fixed, and Run now remained
+disabled with libvirt mutation off. The edited job was restored afterward; no
+backup ran and no second job was intentionally persisted. Packaged Phase 3E.5
+browser validation remains pending, and peer/node overview remains Phase 3F.
 
 Future retention deletion is constrained by a permanent fail-safe contract:
 **no new valid backup means no automatic deletion**. Automatic expiration is a

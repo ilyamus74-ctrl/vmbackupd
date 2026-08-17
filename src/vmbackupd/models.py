@@ -171,6 +171,7 @@ class StorageDestination:
 @dataclass(slots=True)
 class JobRun:
     job_id: str
+    storage_destination_id: str | None = None
     state: RunState = RunState.SCHEDULED
     id: str = field(default_factory=new_id)
     planned_kind: BackupKind | None = None

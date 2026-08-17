@@ -178,3 +178,20 @@ rather than mock implementation details. `MockBackupEngine` is the only Phase 2
 executor. A
 future libvirt executor can implement the boundary after recovery semantics are
 defined against real external state.
+
+## Phase 3E.5 schedules and destination snapshots
+
+Manual jobs have `next_run_at = NULL`; Interval jobs have a persisted cursor.
+Moving to Interval, changing an active interval, or re-enabling a disabled
+scheduled job resets the cursor to `now + interval`, so disabled time is not
+replayed. Moving to Manual clears it. Disabling prevents new runs but never
+cancels existing work or deletes backup data.
+
+Manual and scheduled creation atomically copy the job's current destination to
+`JobRun.storage_destination_id`. Runtime routing reads that immutable snapshot,
+so editing a job destination affects future runs only.
+
+Job updates begin `BEGIN IMMEDIATE` before reading mutable job state. Schedule
+cursor derivation and the update therefore share one linearization point with
+the scheduler's separate SQLite connection; an API update cannot overwrite a
+cursor that the scheduler advanced after an earlier read.

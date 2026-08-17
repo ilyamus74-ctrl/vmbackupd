@@ -76,10 +76,10 @@ def test_cockpit_success_waits_for_normal_close_and_rejects_lifecycle_errors():
     assert "channel.close()" not in close_handler
 
 
-def test_cockpit_method_allow_list_is_exactly_operational_read_only_slice():
+def test_cockpit_method_allow_list_is_exactly_phase3e5_boundary():
     api = source("api.js")
     match = re.search(
-        r"const READ_ONLY_METHODS = Object\.freeze\(\[(.*?)\]\);",
+        r"const ALLOWED_METHODS = Object\.freeze\(\[(.*?)\]\);",
         api,
         re.DOTALL,
     )
@@ -94,9 +94,14 @@ def test_cockpit_method_allow_list_is_exactly_operational_read_only_slice():
         "run.list",
         "restore_point.list",
         "recovery.list",
+        "vm.register",
+        "job.create",
+        "job.update",
+        "backup.run",
     ]
-    for mutation in ("vm.register", "job.create", "backup.run"):
-        assert mutation not in api
+    for forbidden in ("storage.create", "storage.update", "storage.delete",
+                      "restore.run", "retention.run", "recovery.update"):
+        assert forbidden not in api
 
 
 def test_cockpit_frontend_has_no_privileged_or_direct_backend_path():
@@ -110,7 +115,7 @@ def test_cockpit_frontend_has_no_privileged_or_direct_backend_path():
         assert forbidden not in lowered
 
 
-def test_cockpit_ui_is_read_only_and_has_required_sections():
+def test_cockpit_ui_has_operational_sections_and_no_destructive_controls():
     html = source("index.html")
     javascript = source("vmbackupd.js")
     assert all(value in html for value in (
@@ -126,7 +131,7 @@ def test_cockpit_ui_is_read_only_and_has_required_sections():
     assert "Refresh" in html
     assert "clearViews();" in javascript
     assert javascript.index("clearViews();") < javascript.index('api.request("daemon.status")')
-    for control in ("Register", "Create job", "Run backup", "Restore", "Delete"):
+    for control in ("Add storage", ">Delete<", ">Restore<", "Resolve recovery"):
         assert control not in html
 
 
@@ -146,7 +151,7 @@ def test_cockpit_recent_runs_join_jobs_and_vms_with_explicit_statuses():
     html = source("index.html")
     javascript = source("vmbackupd.js")
     assert all(column in html for column in (
-        "VM", "Job", "Type", "Started", "Status", "Duration", "Error",
+        "VM", "Job", "Type", "Created", "Status", "Duration", "Error",
     ))
     assert "model.jobById.get(run.job_id)" in javascript
     assert "vmName(model.vmById, job.vm_id)" in javascript
@@ -186,3 +191,49 @@ def test_cockpit_has_timestamp_duration_and_atomic_refresh_helpers():
     assert 'api.request("restore_point.list")' in javascript
     assert 'api.request("recovery.list")' in javascript
     assert javascript.index("clearViews();") < javascript.index("Promise.all([")
+
+
+def test_cockpit_job_management_is_full_only_and_refreshes_authoritative_data():
+    html = source("index.html")
+    javascript = source("vmbackupd.js")
+    assert "Add backup job" in html
+    assert "Edit" in javascript
+    assert 'job.enabled ? "Disable" : "Enable"' in javascript
+    assert "Run now" in javascript
+    assert 'value="Full" readonly' in html
+    assert "Destination" in html
+    assert "Schedule mode" in html
+    assert "Restore points to retain" in html
+    assert "Minimum full chains" in html
+    assert "Manual" in html and "Interval" in html
+    assert 'max_incrementals_per_chain: 0' in javascript
+    assert 'await api.request("job.update"' in javascript
+    assert 'await api.request("backup.run"' in javascript
+    assert 'await refresh();' in javascript
+
+
+def test_cockpit_registration_flow_and_run_now_safety_are_explicit():
+    html = source("index.html")
+    javascript = source("vmbackupd.js")
+    assert "This VM will be registered when the job is saved." in html
+    assert "registeredByUuid" in javascript
+    assert "vm.libvirt_domain_uuid" in javascript
+    assert 'await api.request("vm.register"' in javascript
+    assert "VM registration succeeded, but job creation failed" in javascript
+    assert '"Libvirt mutation is disabled"' in javascript
+    assert '"The backup job is disabled"' in javascript
+    assert '"The VM requires recovery"' in javascript
+    assert '"The VM already has active work"' in javascript
+
+
+def test_cockpit_interval_editor_round_trips_without_truncation():
+    html = source("index.html")
+    javascript = source("vmbackupd.js")
+    assert '<option value="1">seconds</option>' in html
+    assert "function intervalParts(secondsValue)" in javascript
+    assert "seconds % 86400 === 0" in javascript
+    assert "seconds % 3600 === 0" in javascript
+    assert "seconds % 60 === 0" in javascript
+    assert "return { amount: seconds, unit: 1 };" in javascript
+    assert "Number(document.getElementById(\"job-interval\").value) *" in javascript
+    assert "Number(document.getElementById(\"job-interval-unit\").value)" in javascript

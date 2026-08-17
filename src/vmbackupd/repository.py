@@ -201,12 +201,13 @@ class SQLiteRepository:
         return self.list_storage_destinations(node_id)
 
     def add_job(self, value: BackupJob) -> None:
-        if value.storage_destination_id is not None:
-            vm = self.get_vm(value.vm_id)
-            try:
-                self.get_storage_destination(vm.node_id, value.storage_destination_id)
-            except KeyError as exc:
-                raise DomainInvariantError("STORAGE_DESTINATION_NOT_LOCAL") from exc
+        vm = self.get_vm(value.vm_id)
+        if value.storage_destination_id is None:
+            raise DomainInvariantError("STORAGE_DESTINATION_REQUIRED")
+        try:
+            self.get_storage_destination(vm.node_id, value.storage_destination_id)
+        except KeyError as exc:
+            raise DomainInvariantError("STORAGE_DESTINATION_NOT_LOCAL") from exc
         self.connection.execute(
             "INSERT INTO backup_jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (value.id, value.vm_id, value.name, value.storage_destination_id,
@@ -223,6 +224,73 @@ class SQLiteRepository:
         )
         self.connection.commit()
 
+    def update_job(
+        self, job_id: str, local_node_id: str, now: datetime, *, name=None,
+        enabled=None, storage_destination_id=None, storage_destination=None,
+        restore_points_to_retain=None, minimum_full_chains=None,
+        interval_seconds=None, misfire_grace_seconds=None, schedule_enabled=None,
+    ) -> BackupJob:
+        """Read, derive, and write a mutable job patch under one write lock."""
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            current = self.get_job(job_id)
+            vm = self.get_vm(current.vm_id)
+            if vm.node_id != local_node_id:
+                raise DomainInvariantError("JOB_NOT_LOCAL")
+            destination_id = current.storage_destination_id
+            if storage_destination_id is not None:
+                destination_id = self.get_storage_destination(
+                    local_node_id, storage_destination_id
+                ).id
+            elif storage_destination is not None:
+                destination = self.get_storage_destination_by_name(
+                    local_node_id, storage_destination
+                )
+                if destination is None:
+                    raise KeyError(storage_destination)
+                destination_id = destination.id
+            if destination_id is None:
+                raise DomainInvariantError("STORAGE_DESTINATION_REQUIRED")
+            self.get_storage_destination(local_node_id, destination_id)
+            interval = (current.schedule_policy.interval_seconds if interval_seconds is None
+                        else interval_seconds)
+            grace = (current.schedule_policy.misfire_grace_seconds
+                     if misfire_grace_seconds is None else misfire_grace_seconds)
+            schedule = SchedulePolicy(interval, grace)
+            retention = RetentionPolicy(
+                current.retention_policy.restore_points_to_retain
+                if restore_points_to_retain is None else restore_points_to_retain,
+                current.retention_policy.minimum_full_chains
+                if minimum_full_chains is None else minimum_full_chains,
+            )
+            new_enabled = current.enabled if enabled is None else enabled
+            was_scheduled = current.next_run_at is not None
+            will_schedule = was_scheduled if schedule_enabled is None else schedule_enabled
+            reset_cursor = will_schedule and (
+                not was_scheduled or interval != current.schedule_policy.interval_seconds
+                or (not current.enabled and new_enabled)
+            )
+            next_run_at = current.next_run_at if will_schedule else None
+            if reset_cursor:
+                next_run_at = now + timedelta(seconds=interval)
+            self.connection.execute(
+                """UPDATE backup_jobs SET name = ?, storage_destination_id = ?, enabled = ?,
+                   max_incrementals_per_chain = ?, restore_points_to_retain = ?,
+                   minimum_full_chains = ?, interval_seconds = ?, misfire_grace_seconds = ?,
+                   catch_up_mode = ?, overlap_policy = ?, next_run_at = ? WHERE id = ?""",
+                (current.name if name is None else name, destination_id, int(new_enabled),
+                 current.backup_policy.max_incrementals_per_chain,
+                 retention.restore_points_to_retain, retention.minimum_full_chains,
+                 schedule.interval_seconds, schedule.misfire_grace_seconds,
+                 schedule.catch_up_mode, schedule.overlap_policy,
+                 next_run_at.isoformat() if next_run_at else None, current.id),
+            )
+            self.connection.commit()
+            return self.get_job(current.id)
+        except Exception:
+            self.connection.rollback()
+            raise
+
     def add_chain(self, value: BackupChain) -> None:
         """Fixture/setup helper; production FULL chains are published by finalize_success."""
         self.connection.execute(
@@ -233,14 +301,19 @@ class SQLiteRepository:
         self.connection.commit()
 
     def add_run(self, value: JobRun) -> None:
+        destination_id = value.storage_destination_id or self.get_job(
+            value.job_id
+        ).storage_destination_id
+        if destination_id is None:
+            raise DomainInvariantError("STORAGE_DESTINATION_REQUIRED")
         self.connection.execute(
             """INSERT INTO job_runs
-               (id, job_id, state, planned_kind, planned_chain_id, planned_sequence,
+               (id, job_id, storage_destination_id, state, planned_kind, planned_chain_id, planned_sequence,
                 parent_restore_point_id, error, cleanup_error, cleanup_attempts,
                 scheduled_for, is_catch_up, missed_schedule_slots,
                 recovery_required, recovery_reason, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (value.id, value.job_id, value.state, value.planned_kind, value.planned_chain_id,
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (value.id, value.job_id, destination_id, value.state, value.planned_kind, value.planned_chain_id,
              value.planned_sequence, value.parent_restore_point_id, value.error,
              value.cleanup_error, value.cleanup_attempts,
              value.scheduled_for.isoformat() if value.scheduled_for else None,
@@ -824,16 +897,16 @@ class SQLiteRepository:
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             job = self.get_job(job_id)
+            vm = self.get_vm(job.vm_id)
             if daemon_instance_id is not None:
-                node_row = self.connection.execute(
-                    "SELECT node_id FROM vms WHERE id = ?", (job.vm_id,)
-                ).fetchone()
-                assert node_row is not None
-                self._assert_controller(daemon_instance_id, node_row["node_id"], now)
+                self._assert_controller(daemon_instance_id, vm.node_id, now)
             due = job.next_run_at
             if not job.enabled or due is None or due > now:
                 self.connection.commit()
                 return None
+            if job.storage_destination_id is None:
+                raise DomainInvariantError("STORAGE_DESTINATION_REQUIRED")
+            self.get_storage_destination(vm.node_id, job.storage_destination_id)
             interval = job.schedule_policy.interval_seconds
             represented = int((now - due).total_seconds() // interval) + 1
             next_run_at = due + timedelta(seconds=represented * interval)
@@ -859,6 +932,7 @@ class SQLiteRepository:
                 return None
             run = JobRun(
                 job_id=job.id,
+                storage_destination_id=job.storage_destination_id,
                 scheduled_for=due,
                 is_catch_up=is_catch_up,
                 missed_schedule_slots=represented if is_catch_up else 0,
@@ -867,12 +941,12 @@ class SQLiteRepository:
             )
             self.connection.execute(
                 """INSERT INTO job_runs
-                   (id, job_id, state, planned_kind, planned_chain_id, planned_sequence,
+                   (id, job_id, storage_destination_id, state, planned_kind, planned_chain_id, planned_sequence,
                     parent_restore_point_id, error, cleanup_error, cleanup_attempts,
                     scheduled_for, is_catch_up, missed_schedule_slots,
                     recovery_required, recovery_reason, created_at, updated_at)
-                   VALUES (?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, 0, ?, ?, ?, 0, NULL, ?, ?)""",
-                (run.id, run.job_id, run.state, due.isoformat(), int(is_catch_up),
+                   VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, 0, ?, ?, ?, 0, NULL, ?, ?)""",
+                (run.id, run.job_id, run.storage_destination_id, run.state, due.isoformat(), int(is_catch_up),
                  run.missed_schedule_slots, now.isoformat(), now.isoformat()),
             )
             self.connection.execute(
@@ -936,16 +1010,20 @@ class SQLiteRepository:
             ).fetchone()
             if busy:
                 raise DomainInvariantError("VM_BUSY")
-            run = JobRun(job_id=job.id, created_at=now, updated_at=now)
+            if job.storage_destination_id is None:
+                raise DomainInvariantError("STORAGE_DESTINATION_REQUIRED")
+            self.get_storage_destination(local_node_id, job.storage_destination_id)
+            run = JobRun(job_id=job.id, storage_destination_id=job.storage_destination_id,
+                         created_at=now, updated_at=now)
             self.connection.execute(
                 """INSERT INTO job_runs
-                   (id, job_id, state, planned_kind, planned_chain_id, planned_sequence,
+                   (id, job_id, storage_destination_id, state, planned_kind, planned_chain_id, planned_sequence,
                     parent_restore_point_id, error, cleanup_error, cleanup_attempts,
                     scheduled_for, is_catch_up, missed_schedule_slots,
                     recovery_required, recovery_reason, created_at, updated_at)
-                   VALUES (?, ?, 'SCHEDULED', NULL, NULL, NULL, NULL, NULL, NULL, 0,
+                   VALUES (?, ?, ?, 'SCHEDULED', NULL, NULL, NULL, NULL, NULL, NULL, 0,
                            NULL, 0, 0, 0, NULL, ?, ?)""",
-                (run.id, job.id, now.isoformat(), now.isoformat()),
+                (run.id, job.id, run.storage_destination_id, now.isoformat(), now.isoformat()),
             )
             self._insert_event(Event(job_run_id=run.id, event_type="MANUAL_BACKUP_REQUESTED",
                                      message="manual backup run created", created_at=now))
@@ -1334,7 +1412,8 @@ class SQLiteRepository:
         if row is None:
             raise KeyError(run_id)
         return JobRun(
-            id=row["id"], job_id=row["job_id"], state=RunState(row["state"]),
+            id=row["id"], job_id=row["job_id"],
+            storage_destination_id=row["storage_destination_id"], state=RunState(row["state"]),
             planned_kind=BackupKind(row["planned_kind"]) if row["planned_kind"] else None,
             planned_chain_id=row["planned_chain_id"], planned_sequence=row["planned_sequence"],
             parent_restore_point_id=row["parent_restore_point_id"], error=row["error"],

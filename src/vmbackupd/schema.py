@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import Callable, Mapping
 
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 class SchemaError(RuntimeError):
@@ -27,6 +27,25 @@ CREATE TABLE schema_version (
     version INTEGER NOT NULL CHECK(version >= 1)
 )
 """
+
+
+JOB_RUNS_TABLE_SQL = """CREATE TABLE job_runs (
+        id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES backup_jobs(id),
+        state TEXT NOT NULL, planned_kind TEXT, planned_chain_id TEXT,
+        planned_sequence INTEGER,
+        parent_restore_point_id TEXT REFERENCES restore_points(id),
+        error TEXT, cleanup_error TEXT, cleanup_attempts INTEGER NOT NULL DEFAULT 0,
+        scheduled_for TEXT, is_catch_up INTEGER NOT NULL DEFAULT 0,
+        missed_schedule_slots INTEGER NOT NULL DEFAULT 0,
+        recovery_required INTEGER NOT NULL DEFAULT 0, recovery_reason TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        storage_destination_id TEXT REFERENCES storage_destinations(id),
+        CHECK((planned_kind IS NULL AND planned_chain_id IS NULL AND
+               planned_sequence IS NULL AND parent_restore_point_id IS NULL) OR
+              (planned_kind IS NOT NULL AND planned_chain_id IS NOT NULL AND
+               planned_sequence IS NOT NULL)),
+        UNIQUE(job_id, scheduled_for)
+    )"""
 
 
 CURRENT_SCHEMA_STATEMENTS = (
@@ -63,22 +82,7 @@ CURRENT_SCHEMA_STATEMENTS = (
         status TEXT NOT NULL CHECK(status IN ('ACTIVE', 'CLOSED')),
         created_at TEXT NOT NULL, closed_at TEXT
     )""",
-    """CREATE TABLE job_runs (
-        id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES backup_jobs(id),
-        state TEXT NOT NULL, planned_kind TEXT, planned_chain_id TEXT,
-        planned_sequence INTEGER,
-        parent_restore_point_id TEXT REFERENCES restore_points(id),
-        error TEXT, cleanup_error TEXT, cleanup_attempts INTEGER NOT NULL DEFAULT 0,
-        scheduled_for TEXT, is_catch_up INTEGER NOT NULL DEFAULT 0,
-        missed_schedule_slots INTEGER NOT NULL DEFAULT 0,
-        recovery_required INTEGER NOT NULL DEFAULT 0, recovery_reason TEXT,
-        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-        CHECK((planned_kind IS NULL AND planned_chain_id IS NULL AND
-               planned_sequence IS NULL AND parent_restore_point_id IS NULL) OR
-              (planned_kind IS NOT NULL AND planned_chain_id IS NOT NULL AND
-               planned_sequence IS NOT NULL)),
-        UNIQUE(job_id, scheduled_for)
-    )""",
+    JOB_RUNS_TABLE_SQL,
     """CREATE TABLE restore_points (
         id TEXT PRIMARY KEY, chain_id TEXT NOT NULL REFERENCES backup_chains(id),
         job_run_id TEXT NOT NULL UNIQUE REFERENCES job_runs(id), kind TEXT NOT NULL,
@@ -154,6 +158,17 @@ CURRENT_SCHEMA_STATEMENTS = (
         ON backup_artifacts(job_run_id, kind) WHERE kind != 'DISK'""",
     """CREATE UNIQUE INDEX one_disk_artifact_target_per_run
         ON backup_artifacts(job_run_id, disk_target) WHERE kind = 'DISK'""",
+    """CREATE TRIGGER job_runs_destination_required_insert
+        BEFORE INSERT ON job_runs WHEN NEW.storage_destination_id IS NULL
+        BEGIN SELECT RAISE(ABORT, 'job run storage destination is required'); END""",
+    """CREATE TRIGGER job_runs_destination_required_update
+        BEFORE UPDATE OF storage_destination_id ON job_runs
+        WHEN NEW.storage_destination_id IS NULL
+        BEGIN SELECT RAISE(ABORT, 'job run storage destination is required'); END""",
+    """CREATE TRIGGER job_runs_destination_immutable
+        BEFORE UPDATE OF storage_destination_id ON job_runs
+        WHEN NEW.storage_destination_id IS NOT OLD.storage_destination_id
+        BEGIN SELECT RAISE(ABORT, 'job run storage destination is immutable'); END""",
 )
 
 
@@ -168,7 +183,7 @@ CURRENT_COLUMNS = {
                     "max_incrementals_per_chain", "restore_points_to_retain",
                     "minimum_full_chains", "interval_seconds", "misfire_grace_seconds",
                     "catch_up_mode", "overlap_policy", "next_run_at", "created_at"},
-    "job_runs": {"id", "job_id", "state", "planned_kind", "planned_chain_id",
+    "job_runs": {"id", "job_id", "storage_destination_id", "state", "planned_kind", "planned_chain_id",
                  "planned_sequence", "parent_restore_point_id", "error", "cleanup_error",
                  "cleanup_attempts", "scheduled_for", "is_catch_up", "missed_schedule_slots",
                  "recovery_required", "recovery_reason", "created_at", "updated_at"},
@@ -197,7 +212,10 @@ CURRENT_COLUMNS = {
                                "heartbeat_at", "expires_at"},
 }
 
-LEGACY_COLUMNS = {name: set(columns) for name, columns in CURRENT_COLUMNS.items()}
+VERSION_1_COLUMNS = {name: set(columns) for name, columns in CURRENT_COLUMNS.items()}
+VERSION_1_COLUMNS["job_runs"].remove("storage_destination_id")
+
+LEGACY_COLUMNS = {name: set(columns) for name, columns in VERSION_1_COLUMNS.items()}
 LEGACY_COLUMNS["backup_artifacts"] -= {
     "planned_capacity", "prepared_device", "prepared_inode"
 }
@@ -207,7 +225,8 @@ REQUIRED_FOREIGN_KEYS = {
     "storage_destinations": {("node_id", "nodes", "id")},
     "backup_jobs": {("vm_id", "vms", "id"),
                     ("storage_destination_id", "storage_destinations", "id")},
-    "job_runs": {("job_id", "backup_jobs", "id")},
+    "job_runs": {("job_id", "backup_jobs", "id"),
+                 ("storage_destination_id", "storage_destinations", "id")},
     "backup_chains": {("vm_id", "vms", "id")},
     "restore_points": {("chain_id", "backup_chains", "id"),
                        ("job_run_id", "job_runs", "id")},
@@ -233,6 +252,14 @@ REQUIRED_INDEXES = {
     "one_disk_artifact_target_per_run":
         ("backup_artifacts", ("job_run_id", "disk_target"), True, True),
 }
+
+REQUIRED_TRIGGERS = {
+    "job_runs_destination_required_insert",
+    "job_runs_destination_required_update",
+    "job_runs_destination_immutable",
+}
+
+DESTINATION_TRIGGER_STATEMENTS = CURRENT_SCHEMA_STATEMENTS[-3:]
 
 
 def _table_names(connection: sqlite3.Connection) -> set[str]:
@@ -297,6 +324,7 @@ def _validate_fingerprint(
                 f"schema column fingerprint mismatch for {table}"
             )
     for table, required in REQUIRED_FOREIGN_KEYS.items():
+        required = {item for item in required if item[0] in expected_columns[table]}
         actual = {(row[3], row[2], row[4]) for row in
                   connection.execute(f'PRAGMA foreign_key_list("{table}")')}
         if not required <= actual:
@@ -314,6 +342,34 @@ def _validate_fingerprint(
 
 def validate_current_schema(connection: sqlite3.Connection) -> None:
     _validate_fingerprint(connection, CURRENT_COLUMNS)
+    triggers = {row[0] for row in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+    )}
+    if not REQUIRED_TRIGGERS <= triggers:
+        raise UnsupportedSchemaError("schema destination-snapshot triggers are missing")
+    if connection.execute(
+        "SELECT 1 FROM job_runs WHERE storage_destination_id IS NULL LIMIT 1"
+    ).fetchone():
+        raise UnsupportedSchemaError("job run has no storage destination snapshot")
+    invalid_job_lineage = connection.execute(
+        """SELECT bj.id FROM backup_jobs bj
+           LEFT JOIN vms vm ON vm.id = bj.vm_id
+           LEFT JOIN storage_destinations sd ON sd.id = bj.storage_destination_id
+           WHERE bj.storage_destination_id IS NULL OR vm.id IS NULL OR sd.id IS NULL
+              OR vm.node_id != sd.node_id LIMIT 1"""
+    ).fetchone()
+    if invalid_job_lineage:
+        raise UnsupportedSchemaError("backup job storage destination is not on the VM node")
+    invalid_lineage = connection.execute(
+        """SELECT jr.id FROM job_runs jr
+           LEFT JOIN backup_jobs bj ON bj.id = jr.job_id
+           LEFT JOIN vms vm ON vm.id = bj.vm_id
+           LEFT JOIN storage_destinations sd ON sd.id = jr.storage_destination_id
+           WHERE bj.id IS NULL OR vm.id IS NULL OR sd.id IS NULL
+              OR vm.node_id != sd.node_id LIMIT 1"""
+    ).fetchone()
+    if invalid_lineage:
+        raise UnsupportedSchemaError("job run storage destination is not on the VM node")
     violations = list(connection.execute("PRAGMA foreign_key_check"))
     if violations:
         raise UnsupportedSchemaError("database contains foreign-key violations")
@@ -338,7 +394,46 @@ def migrate_0_to_1(connection: sqlite3.Connection) -> None:
     connection.execute("ALTER TABLE backup_artifacts ADD COLUMN prepared_inode INTEGER")
 
 
-MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {0: migrate_0_to_1}
+def migrate_1_to_2(connection: sqlite3.Connection) -> None:
+    invalid_jobs = connection.execute(
+        """SELECT COUNT(*) FROM backup_jobs bj
+           LEFT JOIN vms vm ON vm.id = bj.vm_id
+           LEFT JOIN storage_destinations sd ON sd.id = bj.storage_destination_id
+           WHERE bj.storage_destination_id IS NULL OR vm.id IS NULL OR sd.id IS NULL
+              OR vm.node_id != sd.node_id"""
+    ).fetchone()[0]
+    if invalid_jobs:
+        raise SchemaMigrationError(
+            "cannot snapshot destinations for jobs with missing or foreign-node destinations"
+        )
+    missing = connection.execute(
+        """SELECT COUNT(*) FROM job_runs jr
+           LEFT JOIN backup_jobs bj ON bj.id = jr.job_id
+           LEFT JOIN vms vm ON vm.id = bj.vm_id
+           LEFT JOIN storage_destinations sd ON sd.id = bj.storage_destination_id
+           WHERE bj.id IS NULL OR vm.id IS NULL OR bj.storage_destination_id IS NULL
+              OR sd.id IS NULL OR vm.node_id != sd.node_id"""
+    ).fetchone()[0]
+    if missing:
+        raise SchemaMigrationError(
+            "cannot snapshot destinations for runs with missing jobs or destinations"
+        )
+    connection.execute(
+        "ALTER TABLE job_runs ADD COLUMN storage_destination_id TEXT "
+        "REFERENCES storage_destinations(id)"
+    )
+    connection.execute(
+        """UPDATE job_runs SET storage_destination_id =
+           (SELECT storage_destination_id FROM backup_jobs WHERE id = job_runs.job_id)"""
+    )
+    for statement in DESTINATION_TRIGGER_STATEMENTS:
+        connection.execute(statement)
+
+
+MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    0: migrate_0_to_1,
+    1: migrate_1_to_2,
+}
 
 
 def _foreign_keys_clean(connection: sqlite3.Connection) -> None:
@@ -382,40 +477,56 @@ def ensure_current_schema(
     version = get_schema_version(connection)
     if version is None:
         try:
-            _validate_fingerprint(connection, CURRENT_COLUMNS)
+            validate_current_schema(connection)
         except UnsupportedSchemaError:
             try:
-                _validate_fingerprint(connection, LEGACY_COLUMNS)
-            except UnsupportedSchemaError as exc:
-                raise UnsupportedSchemaError(
-                    "unsupported unversioned vmbackupd schema"
-                ) from exc
+                _validate_fingerprint(connection, VERSION_1_COLUMNS)
+            except UnsupportedSchemaError:
+                try:
+                    _validate_fingerprint(connection, LEGACY_COLUMNS)
+                except UnsupportedSchemaError as exc:
+                    raise UnsupportedSchemaError(
+                        "unsupported unversioned vmbackupd schema"
+                    ) from exc
 
-            def migrate_legacy() -> None:
-                locked_version = get_schema_version(connection)
-                if locked_version is not None:
-                    if locked_version != CURRENT_SCHEMA_VERSION:
-                        raise UnsupportedSchemaError(
-                            f"schema changed concurrently to version {locked_version}"
-                        )
-                    return
-                _validate_fingerprint(connection, LEGACY_COLUMNS)
-                step = migration_steps.get(0)
-                if step is None:
-                    raise SchemaMigrationError("missing ordered migration 0 -> 1")
-                step(connection)
-                _validate_fingerprint(connection, CURRENT_COLUMNS)
-                connection.execute(SCHEMA_VERSION_SQL)
-                connection.execute(
-                    "INSERT INTO schema_version(id, version) VALUES (1, 1)"
-                )
+                def migrate_legacy() -> None:
+                    locked_version = get_schema_version(connection)
+                    if locked_version is not None:
+                        return
+                    _validate_fingerprint(connection, LEGACY_COLUMNS)
+                    step = migration_steps.get(0)
+                    if step is None:
+                        raise SchemaMigrationError("missing ordered migration 0 -> 1")
+                    step(connection)
+                    _validate_fingerprint(connection, VERSION_1_COLUMNS)
+                    connection.execute(SCHEMA_VERSION_SQL)
+                    connection.execute(
+                        "INSERT INTO schema_version(id, version) VALUES (1, 1)"
+                    )
 
-            try:
-                _run_transaction(connection, migrate_legacy)
-            except SchemaError:
-                raise
-            except Exception as exc:
-                raise SchemaMigrationError(f"migration 0 -> 1 failed: {exc}") from exc
+                try:
+                    _run_transaction(connection, migrate_legacy)
+                except SchemaError:
+                    raise
+                except Exception as exc:
+                    raise SchemaMigrationError(f"migration 0 -> 1 failed: {exc}") from exc
+            else:
+                def adopt_version_one() -> None:
+                    if get_schema_version(connection) is not None:
+                        return
+                    _validate_fingerprint(connection, VERSION_1_COLUMNS)
+                    connection.execute(SCHEMA_VERSION_SQL)
+                    connection.execute(
+                        "INSERT INTO schema_version(id, version) VALUES (1, 1)"
+                    )
+
+                try:
+                    _run_transaction(connection, adopt_version_one)
+                except Exception as exc:
+                    raise SchemaMigrationError(
+                        f"version-1 unversioned schema adoption failed: {exc}"
+                    ) from exc
+            return ensure_current_schema(connection, migrations=migration_steps)
         else:
             def adopt_current() -> None:
                 locked_version = get_schema_version(connection)
@@ -425,7 +536,7 @@ def ensure_current_schema(
                             f"schema changed concurrently to version {locked_version}"
                         )
                     return
-                _validate_fingerprint(connection, CURRENT_COLUMNS)
+                validate_current_schema(connection)
                 connection.execute(SCHEMA_VERSION_SQL)
                 connection.execute(
                     "INSERT INTO schema_version(id, version) VALUES (1, ?)",
@@ -447,7 +558,8 @@ def ensure_current_schema(
             f"{CURRENT_SCHEMA_VERSION}"
         )
     if version < CURRENT_SCHEMA_VERSION:
-        # No positive historical versions exist yet. Keep the ordered framework explicit.
+        if version == 1:
+            _validate_fingerprint(connection, VERSION_1_COLUMNS)
         current = version
         while current < CURRENT_SCHEMA_VERSION:
             step = migration_steps.get(current)
@@ -458,6 +570,10 @@ def ensure_current_schema(
 
             def migrate_version() -> None:
                 step(connection)
+                if current + 1 == CURRENT_SCHEMA_VERSION:
+                    validate_current_schema(connection)
+                elif current + 1 == 1:
+                    _validate_fingerprint(connection, VERSION_1_COLUMNS)
                 connection.execute(
                     "UPDATE schema_version SET version = ? WHERE id = 1",
                     (current + 1,),

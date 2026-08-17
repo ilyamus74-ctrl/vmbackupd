@@ -51,6 +51,10 @@ def make_unversioned(path, *, legacy=False):
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = OFF")
     connection.execute("DROP TABLE schema_version")
+    connection.execute("DROP TRIGGER job_runs_destination_required_insert")
+    connection.execute("DROP TRIGGER job_runs_destination_required_update")
+    connection.execute("DROP TRIGGER job_runs_destination_immutable")
+    connection.execute("ALTER TABLE job_runs DROP COLUMN storage_destination_id")
     if legacy:
         connection.execute("ALTER TABLE backup_artifacts DROP COLUMN planned_capacity")
         connection.execute("ALTER TABLE backup_artifacts DROP COLUMN prepared_device")
@@ -71,7 +75,13 @@ def test_fresh_database_initializes_directly_to_current_version(tmp_path):
     assert repository.get_database_schema_version() == CURRENT_SCHEMA_VERSION
     assert [tuple(row) for row in repository.connection.execute(
         "SELECT id, version FROM schema_version"
-    )] == [(1, 1)]
+    )] == [(1, CURRENT_SCHEMA_VERSION)]
+    assert "storage_destination_id" in table_columns(repository.connection, "job_runs")
+    triggers = {row[0] for row in repository.connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='trigger'"
+    )}
+    assert "job_runs_destination_required_insert" in triggers
+    assert "job_runs_destination_immutable" in triggers
     assert set(CURRENT_COLUMNS) | {"schema_version"} == {
         row[0] for row in repository.connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
@@ -101,7 +111,7 @@ def test_current_reopen_is_idempotent_and_crud_remains_available(tmp_path):
     )) == schema_before
     assert [tuple(row) for row in second.connection.execute(
         "SELECT * FROM schema_version"
-    )] == [(1, 1)]
+    )] == [(1, CURRENT_SCHEMA_VERSION)]
     second.close()
 
 
@@ -115,7 +125,7 @@ def test_current_unversioned_database_is_adopted_without_rewriting_data(tmp_path
     ))
     raw.close()
     repository = SQLiteRepository(path)
-    assert repository.get_database_schema_version() == 1
+    assert repository.get_database_schema_version() == CURRENT_SCHEMA_VERSION
     assert repository.get_node(node.id).id == node.id
     assert repository.get_storage_destination(node.id, destination.id).id == destination.id
     assert repository.get_vm(vm.id).libvirt_domain_uuid == "domain-uuid"
@@ -127,12 +137,7 @@ def test_current_unversioned_database_is_adopted_without_rewriting_data(tmp_path
         "mock://disk", f"mock-domain://{run.id}"
     ]
     assert list(repository.connection.execute("PRAGMA foreign_key_check")) == []
-    operational_after = list(repository.connection.execute(
-        "SELECT name, rootpage, sql FROM sqlite_master "
-        "WHERE type IN ('table', 'index') AND tbl_name != 'schema_version' "
-        "ORDER BY type, name"
-    ))
-    assert [tuple(row) for row in operational_after] == operational_before
+    assert repository.get_run(run.id).storage_destination_id == destination.id
     repository.close()
 
 
@@ -143,7 +148,8 @@ def test_legacy_phase3c_migrates_nullable_prepared_identity_without_data_changes
     assert {"planned_capacity", "prepared_device", "prepared_inode"} <= table_columns(
         repository.connection, "backup_artifacts"
     )
-    assert repository.get_database_schema_version() == 1
+    assert repository.get_database_schema_version() == CURRENT_SCHEMA_VERSION
+    assert repository.get_run(run.id).storage_destination_id is not None
     assert repository.get_run(run.id).state.value == "SUCCESS"
     assert repository.get_restore_point(point.id).status.value == "AVAILABLE"
     artifacts = repository.list_artifacts_for_run(run.id)
@@ -179,7 +185,7 @@ def test_failed_migration_rolls_back_ddl_and_can_be_retried(tmp_path):
     ).fetchone()[0] == original_state
     connection.close()
     repository = SQLiteRepository(path)
-    assert repository.get_database_schema_version() == 1
+    assert repository.get_database_schema_version() == CURRENT_SCHEMA_VERSION
     repository.close()
 
 
@@ -218,7 +224,9 @@ def test_unknown_unversioned_database_is_refused_without_reset(tmp_path, builder
 def test_newer_schema_version_is_refused(tmp_path):
     path = tmp_path / "newer.db"
     repository = SQLiteRepository(path)
-    repository.connection.execute("UPDATE schema_version SET version = 2")
+    repository.connection.execute(
+        "UPDATE schema_version SET version = ?", (CURRENT_SCHEMA_VERSION + 1,)
+    )
     repository.connection.commit(); repository.close()
     with pytest.raises(UnsupportedSchemaError, match="newer"):
         SQLiteRepository(path)

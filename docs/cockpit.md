@@ -1,6 +1,8 @@
 # Cockpit frontend
 
-Phase 3E.2 adds the first read-only frontend source under `cockpit/vmbackupd/`.
+Phase 3E.2 added the first read-only frontend source under `cockpit/vmbackupd/`;
+Phase 3E.5 retains read-only operational views while adding narrowly allow-listed
+job management.
 Fedora 41 development validation exposed this source through a user-local
 Cockpit package symlink. Phase 3E.3 packages the unchanged files as the separate
 `cockpit-vmbackupd` binary RPM from the same vmbackupd source RPM. The main
@@ -49,7 +51,7 @@ carrying a Cockpit problem code. Timers are cleared on every completion.
 Transport errors, protocol errors, and structurally valid daemon API errors
 remain distinct.
 
-Phase 3E.4 expands the read-only allow-list to exactly:
+Phase 3E.5 keeps the read methods explicit and adds exactly four mutations:
 
 - `daemon.status`
 - `vm.discover`
@@ -59,8 +61,13 @@ Phase 3E.4 expands the read-only allow-list to exactly:
 - `run.list`
 - `restore_point.list`
 - `recovery.list`
+- `vm.register`
+- `job.create`
+- `job.update`
+- `backup.run`
 
-There is no generic arbitrary-method entry point and no mutation control.
+There is no generic arbitrary-method entry point. Storage CRUD, restore,
+retention, recovery mutation, and peer operations remain unavailable.
 
 ## Operational dashboard
 
@@ -102,7 +109,31 @@ are inserted with DOM text APIs, never raw HTML.
 The detailed daemon identity, controller, schema, and libvirt fields remain in
 a compact System details section below the operational views. Configuration and
 edit actions remain Phase 3E.5/3E.6 work, and peer/node overview remains Phase
-3F. The Phase 3E.4 dashboard has not yet received manual browser validation.
+3F. Manual Cockpit 345 validation of Phase 3E.4 passed: health cards, empty
+Recent runs and Backup jobs states, Local storage, discovered `win10`, and
+RUNNING/mutation-disabled status rendered while production remained
+mutation-disabled.
+
+Phase 3E.5 adds an Add/Edit job dialog and per-job Enable/Disable and guarded
+Run now actions. FULL is fixed. A discovered VM can be registered by stable UUID
+before its first job is created, with a partial registration failure reported
+explicitly. Run now is disabled when mutation is off, the job is disabled, or
+current data shows busy/recovery work; the backend always rechecks. Successful
+mutations reload the complete operational dataset.
+
+Manual Phase 3E.5 source/development-browser acceptance passed with Cockpit 345
+against the development schema-v2 database. The daemon rendered as `RUNNING`,
+an existing real successful FULL run appeared in recent activity, and its
+published `AVAILABLE` restore point appeared as the job's last successful
+backup. The Edit dialog correctly populated the immutable VM and FULL mode,
+destination, Manual schedule, and retention values. Saving a metadata edit
+reloaded the complete operational dataset; the tested job name and retention
+were then restored to their original values. Enable and Disable both worked.
+The Add backup job dialog exposed VM, destination, schedule, and retention
+controls while keeping FULL non-editable. Run now remained disabled because
+libvirt mutation was disabled. No backup ran and no second backup job was
+intentionally persisted during acceptance. This validates the development
+source path only; packaged Phase 3E.5 browser validation is not yet claimed.
 
 ## Current status
 
@@ -153,7 +184,7 @@ After acceptance, Cockpit and the production daemon were stopped, the existing
 development daemon and `ilyamus:qemu` mode 2770 shared backup root were
 restored, and the expected mutation-enabled development profile was healthy
 with schema version 1 and no non-terminal or recovery-required runs. This
-restoration fact does not change the production package default. Cockpit mutation controls,
+restoration fact does not change the production package default. Broader Cockpit mutation controls,
 packaged-account read-write `backup-begin` authorization, finer-grained API
 roles, and SELinux Enforcing validation remain pending; production readiness is
 not claimed.

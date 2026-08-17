@@ -32,7 +32,7 @@ class Components:
 
 
 class StorageRoutingExecutor:
-    """Resolve each run through its BackupJob's persisted storage destination."""
+    """Resolve each run through its immutable destination snapshot."""
 
     def __init__(self, repository, factory) -> None:
         self.repository, self.factory, self.executors = repository, factory, {}
@@ -41,9 +41,11 @@ class StorageRoutingExecutor:
         run = self.repository.get_run(run_id)
         job = self.repository.get_job(run.job_id)
         vm = self.repository.get_vm(job.vm_id)
-        destination = (self.repository.get_storage_destination(vm.node_id, job.storage_destination_id)
-                       if job.storage_destination_id
-                       else self.repository.get_default_storage_destination(vm.node_id))
+        if not run.storage_destination_id:
+            raise DomainInvariantError("RUN_STORAGE_DESTINATION_MISSING")
+        destination = self.repository.get_storage_destination(
+            vm.node_id, run.storage_destination_id
+        )
         if destination.node_id != vm.node_id:
             raise DomainInvariantError("STORAGE_DESTINATION_NOT_LOCAL")
         if destination.id not in self.executors:

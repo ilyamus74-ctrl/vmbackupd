@@ -30,6 +30,7 @@ def job(value: BackupJob) -> dict:
 
 def run(value: JobRun) -> dict:
     return {"id": value.id, "job_id": value.job_id, "state": value.state.value,
+            "storage_destination_id": value.storage_destination_id,
             "planned_kind": value.planned_kind.value if value.planned_kind else None,
             "error": value.error, "cleanup_error": value.cleanup_error,
             "recovery_required": value.recovery_required,

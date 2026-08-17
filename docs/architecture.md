@@ -3,11 +3,12 @@
 vmbackupd now includes the domain/persistence core, cooperative local runtime,
 FULL-only libvirt push executor, UNIX API and CLI, schema migrations, and a
 Fedora-style production service/package profile. It also includes the first
-read-only Cockpit frontend, whose validated initial transport slice has now
-been expanded into an operational dashboard using existing list APIs.
+Cockpit frontend: its validated operational dashboard reads remain read-only,
+and Phase 3E.5 adds only an explicit job-management mutation boundary.
 The shared RPM spec now produces a separate `cockpit-vmbackupd` binary
-subpackage from the same source RPM. Packaged-browser installation validation,
-Cockpit mutation controls, remote networking, incremental execution, restore
+subpackage from the same source RPM. Job metadata management and guarded Run
+now are now implemented through explicit API methods. Storage CRUD, remote
+networking, incremental execution, restore
 execution, retention deletion, additional hypervisor mutations, SELinux
 Enforcing validation, and packaged-account read-write `backup-begin`
 authorization remain pending. This is not a production-readiness claim.
@@ -341,5 +342,26 @@ an `AVAILABLE` restore point published for one of that job's runs; a newer
 failed run cannot masquerade as success. Storage retains an explicit Local type
 and presents free/reserve information without replacing execution's VM-specific
 capacity preflight. Configuration/edit actions remain Phase 3E.5/3E.6 work,
-peer/node overview remains Phase 3F, and this expanded dashboard still awaits
-manual browser validation.
+peer/node overview remains Phase 3F. Manual Cockpit 345 validation subsequently
+passed for the health cards, intentional empty recent-run/job states, Local
+storage, discovered `win10`, and RUNNING/mutation-disabled indicators; the
+production API remained mutation-disabled.
+
+## Phase 3E.5 job management
+
+Job management uses explicit `vm.register`, `job.create`, and `job.update`
+calls; `backup.run` is the only execution request and retains all server-side
+mutation/runtime gates. The browser cannot invoke arbitrary methods and FULL is
+fixed. Each manual or scheduled run snapshots `storage_destination_id`, and the
+executor routes through that run field. Editing a job destination therefore
+affects future runs only and cannot redirect active or historical work.
+
+Manual Cockpit 345 Phase 3E.5 acceptance passed through the development source
+frontend against the schema-v2 daemon. It rendered the existing real successful
+FULL run and its published `AVAILABLE` restore point, populated and saved the
+Edit dialog correctly, refreshed the complete dataset, exercised Enable and
+Disable, and opened Add with VM, destination, schedule, and retention controls.
+FULL remained fixed and Run now remained disabled while libvirt mutation was
+disabled. The edited job was restored to its original name and retention; no
+backup executed and no second job was intentionally persisted. This is not yet
+packaged Phase 3E.5 browser validation or a production-readiness claim.

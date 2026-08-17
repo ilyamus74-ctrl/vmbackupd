@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import shutil
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import serialization
@@ -34,7 +34,8 @@ class VmbackupApplication:
             "vm.discover": self.vm_discover, "vm.list": self.vm_list,
             "vm.show": self.vm_show, "vm.register": self.vm_register,
             "job.list": self.job_list, "job.show": self.job_show,
-            "job.create": self.job_create, "backup.run": self.backup_run,
+            "job.create": self.job_create, "job.update": self.job_update,
+            "backup.run": self.backup_run,
             "run.list": self.run_list, "run.show": self.run_show,
             "restore_point.list": self.restore_point_list,
             "restore_point.show": self.restore_point_show,
@@ -54,6 +55,8 @@ class VmbackupApplication:
             code = str(exc) if str(exc).isupper() else "DOMAIN_ERROR"
             raise ApplicationError(code, str(exc)) from None
         except TypeError as exc:
+            raise ApplicationError("INVALID_PARAMS", str(exc)) from None
+        except ValueError as exc:
             raise ApplicationError("INVALID_PARAMS", str(exc)) from None
 
     def _free(self, destination: StorageDestination) -> int | None:
@@ -118,7 +121,12 @@ class VmbackupApplication:
     def job_create(self, vm_id, name, max_incrementals_per_chain=0,
                    restore_points_to_retain=7, minimum_full_chains=1,
                    interval_seconds=3600, misfire_grace_seconds=0,
-                   storage_destination_id=None, storage_destination=None):
+                   storage_destination_id=None, storage_destination=None,
+                   schedule_enabled=False, enabled=True):
+        if not isinstance(schedule_enabled, bool) or not isinstance(enabled, bool):
+            raise ApplicationError("INVALID_PARAMS", "schedule_enabled and enabled must be boolean")
+        if not isinstance(name, str) or not name.strip():
+            raise ApplicationError("INVALID_PARAMS", "job name must not be empty")
         vm = self.repository.get_vm(vm_id)
         if vm.node_id != self.node.id:
             raise ApplicationError("VM_NOT_LOCAL", "VM belongs to another node")
@@ -138,10 +146,39 @@ class VmbackupApplication:
             retention_policy=RetentionPolicy(int(restore_points_to_retain),
                                              int(minimum_full_chains)),
             schedule_policy=SchedulePolicy(int(interval_seconds), int(misfire_grace_seconds)),
-            next_run_at=None,
+            next_run_at=(self.clock.now() + timedelta(seconds=int(interval_seconds))
+                         if schedule_enabled else None),
+            enabled=enabled,
         )
         self.repository.add_job(value)
         return serialization.job(value)
+
+    def job_update(self, id, name=None, enabled=None,
+                   storage_destination_id=None, storage_destination=None,
+                   restore_points_to_retain=None, minimum_full_chains=None,
+                   interval_seconds=None, misfire_grace_seconds=None,
+                   schedule_enabled=None):
+        if enabled is not None and not isinstance(enabled, bool):
+            raise ApplicationError("INVALID_PARAMS", "enabled must be boolean")
+        if schedule_enabled is not None and not isinstance(schedule_enabled, bool):
+            raise ApplicationError("INVALID_PARAMS", "schedule_enabled must be boolean")
+        if name is not None and (not isinstance(name, str) or not name.strip()):
+            raise ApplicationError("INVALID_PARAMS", "job name must not be empty")
+        if storage_destination_id and storage_destination:
+            raise ApplicationError("INVALID_PARAMS", "select destination by ID or name, not both")
+        return serialization.job(self.repository.update_job(
+            id, self.node.id, self.clock.now(), name=name, enabled=enabled,
+            storage_destination_id=storage_destination_id,
+            storage_destination=storage_destination,
+            restore_points_to_retain=(None if restore_points_to_retain is None
+                                      else int(restore_points_to_retain)),
+            minimum_full_chains=(None if minimum_full_chains is None
+                                 else int(minimum_full_chains)),
+            interval_seconds=(None if interval_seconds is None else int(interval_seconds)),
+            misfire_grace_seconds=(None if misfire_grace_seconds is None
+                                   else int(misfire_grace_seconds)),
+            schedule_enabled=schedule_enabled,
+        ))
 
     def backup_run(self, job_id):
         runtime_state = getattr(self.runtime, "runtime_state", "RUNNING")

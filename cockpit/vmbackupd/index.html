@@ -14,7 +14,7 @@
     <header class="page-header">
       <div>
         <h1>VM Backup</h1>
-        <p>Read-only backup service overview</p>
+        <p>Backup service overview</p>
       </div>
       <button id="refresh" type="button">Refresh</button>
     </header>
@@ -41,17 +41,20 @@
       <h2 id="recent-title">Recent backup runs</h2>
       <div class="table-scroll">
         <table class="operational-table">
-          <thead><tr><th>VM</th><th>Job</th><th>Type</th><th>Started</th><th>Status</th><th>Duration</th><th>Error</th></tr></thead>
+          <thead><tr><th>VM</th><th>Job</th><th>Type</th><th>Created</th><th>Status</th><th>Duration</th><th>Error</th></tr></thead>
           <tbody id="recent-runs"></tbody>
         </table>
       </div>
     </section>
 
     <section aria-labelledby="jobs-title">
-      <h2 id="jobs-title">Backup jobs</h2>
+      <div class="section-heading">
+        <h2 id="jobs-title">Backup jobs</h2>
+        <button id="add-job" type="button" class="primary-action">Add backup job</button>
+      </div>
       <div class="table-scroll">
         <table class="operational-table">
-          <thead><tr><th>VM</th><th>Job</th><th>Enabled</th><th>Destination</th><th>Last run</th><th>Last status</th><th>Last successful backup</th><th>Next run</th></tr></thead>
+          <thead><tr><th>VM</th><th>Job</th><th>Enabled</th><th>Destination</th><th>Last run</th><th>Last status</th><th>Last successful backup</th><th>Next run</th><th>Actions</th></tr></thead>
           <tbody id="jobs"></tbody>
         </table>
       </div>
@@ -85,5 +88,25 @@
       </details>
     </section>
   </main>
+  <dialog id="job-dialog" aria-labelledby="job-dialog-title">
+    <form id="job-form">
+      <h2 id="job-dialog-title">Add backup job</h2>
+      <p id="registration-note" class="form-note" hidden>This VM will be registered when the job is saved.</p>
+      <label>Virtual machine<select id="job-vm" required></select></label>
+      <label>Job name<input id="job-name" required maxlength="200"></label>
+      <label>Destination<select id="job-storage" required></select></label>
+      <label>Backup mode<input value="Full" readonly aria-readonly="true"></label>
+      <label class="check-label"><input id="job-enabled" type="checkbox" checked> Enabled</label>
+      <label>Schedule mode<select id="job-schedule"><option value="manual">Manual</option><option value="interval">Interval</option></select></label>
+      <div id="interval-fields" class="inline-fields" hidden>
+        <label>Every<input id="job-interval" type="number" min="1" value="60" required></label>
+        <label>Unit<select id="job-interval-unit"><option value="1">seconds</option><option value="60">minutes</option><option value="3600">hours</option><option value="86400">days</option></select></label>
+      </div>
+      <label>Restore points to retain<input id="job-retain" type="number" min="0" value="7" required></label>
+      <label>Minimum full chains<input id="job-minimum-chains" type="number" min="1" value="1" required></label>
+      <p id="job-form-error" class="form-error" role="alert"></p>
+      <div class="dialog-actions"><button id="job-cancel" type="button">Cancel</button><button class="primary-action" type="submit">Save job</button></div>
+    </form>
+  </dialog>
 </body>
 </html>

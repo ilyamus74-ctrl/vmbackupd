@@ -4,7 +4,7 @@ import pytest
 
 from vmbackupd.clock import FakeClock
 from vmbackupd.engine import MockBackupEngine
-from vmbackupd.models import BackupJob, JobRun, Node, RunState, VM
+from vmbackupd.models import BackupJob, JobRun, Node, RunState, StorageDestination, VM
 from vmbackupd.repository import SQLiteRepository
 from vmbackupd.runtime import DaemonRuntime
 
@@ -16,7 +16,16 @@ def add_job(repository, node, name, vm=None):
     if vm is None:
         vm = VM(node_id=node.id, name=name, external_id=name)
         repository.add_vm(vm)
-    job = BackupJob(vm_id=vm.id, name=f"job-{name}")
+    destinations = repository.list_storage_destinations(node.id)
+    if not destinations:
+        destination = StorageDestination(
+            "local", "/control", "/data", node.id, is_default=True,
+        )
+        repository.add_storage_destination(destination)
+    else:
+        destination = destinations[0]
+    job = BackupJob(vm_id=vm.id, name=f"job-{name}",
+                    storage_destination_id=destination.id)
     repository.add_job(job)
     return vm, job
 

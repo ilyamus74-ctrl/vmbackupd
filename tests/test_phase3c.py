@@ -343,7 +343,7 @@ def test_api_lists_status_and_objects(app, tmp_path):
                 ).encode() + b"\n")
                 assert response["ok"] is True
                 if method == "daemon.status":
-                    assert response["result"]["database_schema_version"] == 1
+                    assert response["result"]["database_schema_version"] == 2
             assert (await exchange(server.socket_path, json.dumps(
                 {"version": 1, "id": "show", "method": "vm.show", "params": {"id": vm["id"]}}
             ).encode() + b"\n"))["result"]["id"] == vm["id"]
@@ -460,8 +460,14 @@ def test_local_api_excludes_foreign_node_operational_state(app):
     eu_run = JobRun(local_job["id"], recovery_required=True, recovery_reason="local")
     app.repository.add_run(eu_run)
     ua = Node("UA"); app.repository.add_node(ua)
+    ua_destination = StorageDestination(
+        node_id=ua.id, name="ua-root", control_root="/ua-control",
+        backup_data_root="/ua-data", is_default=True,
+    )
+    app.repository.add_storage_destination(ua_destination)
     ua_vm = VM(ua.id, "ua-vm", "ua-vm"); app.repository.add_vm(ua_vm)
-    ua_job = BackupJob(ua_vm.id, "ua-job", backup_policy=BackupPolicy(0),
+    ua_job = BackupJob(ua_vm.id, "ua-job", storage_destination_id=ua_destination.id,
+                       backup_policy=BackupPolicy(0),
                        retention_policy=RetentionPolicy(5, 1))
     app.repository.add_job(ua_job)
     ua_run = JobRun(ua_job.id, recovery_required=True, recovery_reason="foreign")
@@ -543,6 +549,11 @@ def test_storage_destinations_and_defaults_are_independent_per_node(tmp_path):
     ); repository.connection.commit()
     with pytest.raises(DomainInvariantError, match="STORAGE_DESTINATION_NOT_LOCAL"):
         StorageRoutingExecutor(repository, lambda destination: object())._for_run(run.id)
+    repository.connection.execute(
+        "UPDATE backup_jobs SET storage_destination_id = ? WHERE id = ?",
+        (valid.storage_destination_id, valid.id),
+    )
+    repository.connection.commit()
 
     repository.sync_storage_destinations(
         eu.id, node_destinations(eu, tmp_path, "eu"), "local-home"
@@ -553,8 +564,7 @@ def test_storage_destinations_and_defaults_are_independent_per_node(tmp_path):
     repository.close()
     reopened = SQLiteRepository(tmp_path / "multi.db")
     assert {item.name: item.id for item in reopened.list_storage_destinations(eu.id)} == eu_ids
-    with pytest.raises(DomainInvariantError, match="STORAGE_DESTINATION_NOT_LOCAL"):
-        reopened.get_job(valid.id)
+    assert reopened.get_job(valid.id).storage_destination_id == valid.storage_destination_id
     reopened.close()
 
 

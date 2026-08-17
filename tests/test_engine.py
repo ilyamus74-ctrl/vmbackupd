@@ -5,7 +5,7 @@ import pytest
 from vmbackupd.engine import MockBackupEngine
 from vmbackupd.models import (
     BackupChain, BackupChainStatus, BackupJob, BackupKind, BackupPolicy, JobRun,
-    Node, RetentionPolicy, RestorePointStatus, RunState, VM,
+    Node, RetentionPolicy, RestorePointStatus, RunState, StorageDestination, VM,
 )
 from vmbackupd.repository import DomainInvariantError
 from vmbackupd.repository import SQLiteRepository
@@ -31,9 +31,12 @@ def advance_to_finalizing(repository, job):
 def add_domain(repository, name, max_incrementals):
     node = Node(name=f"node-{name}")
     repository.add_node(node)
+    destination = StorageDestination("local", "/control", "/data", node.id, is_default=True)
+    repository.add_storage_destination(destination)
     vm = VM(node_id=node.id, name=name, external_id=name)
     repository.add_vm(vm)
-    job = BackupJob(vm_id=vm.id, name="job", backup_policy=BackupPolicy(max_incrementals),
+    job = BackupJob(vm_id=vm.id, name="job", storage_destination_id=destination.id,
+                    backup_policy=BackupPolicy(max_incrementals),
                     retention_policy=RetentionPolicy(5, 1))
     repository.add_job(job)
     return vm, job

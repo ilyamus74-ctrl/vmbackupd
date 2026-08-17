@@ -1,0 +1,398 @@
+from __future__ import annotations
+
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+import pytest
+
+from vmbackupd.application import ApplicationError, VmbackupApplication
+from vmbackupd.bootstrap import StorageRoutingExecutor
+from vmbackupd.clock import FakeClock
+from vmbackupd.cli import _parser, _request
+from vmbackupd.models import BackupJob, Node, StorageDestination, VM
+from vmbackupd.repository import DomainInvariantError, SQLiteRepository
+from vmbackupd.schema import (
+    CURRENT_SCHEMA_VERSION, MIGRATIONS, SchemaMigrationError, UnsupportedSchemaError,
+    ensure_current_schema,
+)
+
+
+NOW = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+
+
+def catalog(repository):
+    node = Node("EU")
+    repository.add_node(node)
+    first = StorageDestination("first", "/control/a", "/data/a", node.id, is_default=True)
+    second = StorageDestination("second", "/control/b", "/data/b", node.id)
+    repository.add_storage_destination(first)
+    repository.add_storage_destination(second)
+    vm = VM(node.id, "guest", "guest", "uuid")
+    repository.add_vm(vm)
+    return node, first, second, vm
+
+
+def application(repository, node, clock):
+    config = SimpleNamespace(
+        libvirt=SimpleNamespace(allow_mutation=False, uri="qemu:///system"),
+        daemon=SimpleNamespace(database_path=":memory:"),
+    )
+    runtime = SimpleNamespace(runtime_state="RUNNING", instance_id="daemon")
+    return VmbackupApplication(repository, runtime, None, config, node, clock, "test")
+
+
+def version_one_database(path):
+    repository = SQLiteRepository(path)
+    node, first, _, vm = catalog(repository)
+    job = BackupJob(vm.id, "job", storage_destination_id=first.id)
+    repository.add_job(job)
+    run = repository.create_manual_run(job.id, node.id, NOW)
+    repository.close()
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA foreign_keys = OFF")
+    connection.execute("DROP TRIGGER job_runs_destination_required_insert")
+    connection.execute("DROP TRIGGER job_runs_destination_required_update")
+    connection.execute("DROP TRIGGER job_runs_destination_immutable")
+    connection.execute("ALTER TABLE job_runs DROP COLUMN storage_destination_id")
+    connection.execute("UPDATE schema_version SET version = 1 WHERE id = 1")
+    connection.commit()
+    connection.close()
+    return node, first, vm, job, run
+
+
+def test_schema_v2_fresh_and_v1_migration_backfills_run_destination(tmp_path):
+    fresh = SQLiteRepository(tmp_path / "fresh.db")
+    assert fresh.schema_version == CURRENT_SCHEMA_VERSION == 2
+    assert "storage_destination_id" in {
+        row[1] for row in fresh.connection.execute("PRAGMA table_info(job_runs)")
+    }
+    fresh_columns = [row[1] for row in fresh.connection.execute("PRAGMA table_info(job_runs)")]
+    fresh_fks = {(row[3], row[2], row[4]) for row in
+                 fresh.connection.execute("PRAGMA foreign_key_list(job_runs)")}
+    fresh_triggers = {row[0] for row in fresh.connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='trigger'"
+    )}
+    assert "job_runs_destination_immutable" in fresh_triggers
+    fresh.close()
+
+    path = tmp_path / "v1.db"
+    _, destination, _, _, run = version_one_database(path)
+    migrated = SQLiteRepository(path)
+    assert migrated.schema_version == 2
+    assert migrated.get_run(run.id).storage_destination_id == destination.id
+    assert list(migrated.connection.execute("PRAGMA foreign_key_check")) == []
+    assert [row[1] for row in migrated.connection.execute(
+        "PRAGMA table_info(job_runs)"
+    )] == fresh_columns
+    assert {(row[3], row[2], row[4]) for row in
+            migrated.connection.execute("PRAGMA foreign_key_list(job_runs)")} == fresh_fks
+    assert {row[0] for row in migrated.connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='trigger'"
+    )} == fresh_triggers
+
+
+def test_v1_migration_rolls_back_and_rejects_missing_destination(tmp_path):
+    path = tmp_path / "rollback.db"
+    version_one_database(path)
+    connection = sqlite3.connect(path)
+
+    def fail_after_column(value):
+        value.execute("ALTER TABLE job_runs ADD COLUMN storage_destination_id TEXT")
+        raise RuntimeError("injected")
+
+    with pytest.raises(SchemaMigrationError, match="1 -> 2"):
+        ensure_current_schema(connection, migrations={1: fail_after_column})
+    assert "storage_destination_id" not in {
+        row[1] for row in connection.execute("PRAGMA table_info(job_runs)")
+    }
+    assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 1
+    connection.close()
+    assert SQLiteRepository(path).schema_version == 2
+
+    malformed = tmp_path / "malformed.db"
+    version_one_database(malformed)
+    connection = sqlite3.connect(malformed)
+    connection.execute("UPDATE backup_jobs SET storage_destination_id = NULL")
+    connection.commit()
+    with pytest.raises(SchemaMigrationError, match="missing or foreign-node destinations"):
+        ensure_current_schema(connection, migrations=MIGRATIONS)
+
+
+def test_failed_target_validation_and_unversioned_adoption_never_stamp(tmp_path):
+    path = tmp_path / "invalid-target.db"
+    version_one_database(path)
+    connection = sqlite3.connect(path)
+
+    def missing_trigger(value):
+        MIGRATIONS[1](value)
+        value.execute("DROP TRIGGER job_runs_destination_required_update")
+
+    with pytest.raises(SchemaMigrationError, match="1 -> 2"):
+        ensure_current_schema(connection, migrations={1: missing_trigger})
+    assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 1
+    assert "storage_destination_id" not in {
+        row[1] for row in connection.execute("PRAGMA table_info(job_runs)")
+    }
+    connection.close()
+
+    unversioned = tmp_path / "unversioned-invalid.db"
+    repository = SQLiteRepository(unversioned)
+    repository.connection.execute("DROP TABLE schema_version")
+    repository.connection.execute("DROP TRIGGER job_runs_destination_required_update")
+    repository.connection.commit()
+    repository.close()
+    with pytest.raises(UnsupportedSchemaError, match="unsupported unversioned"):
+        SQLiteRepository(unversioned)
+    raw = sqlite3.connect(unversioned)
+    assert raw.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'"
+    ).fetchone() is None
+
+
+def test_migration_and_current_validation_reject_cross_node_destinations(tmp_path):
+    path = tmp_path / "cross-node-v1.db"
+    version_one_database(path)
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "INSERT INTO nodes VALUES ('foreign-node', 'foreign', ?)", (NOW.isoformat(),)
+    )
+    connection.execute(
+        """INSERT INTO storage_destinations VALUES
+           ('foreign-destination', 'foreign-node', 'foreign', '/c', '/d', 488,
+            NULL, NULL, 0, 5, 1, ?)""", (NOW.isoformat(),)
+    )
+    connection.execute("UPDATE backup_jobs SET storage_destination_id='foreign-destination'")
+    connection.execute("DELETE FROM job_runs")
+    connection.commit()
+    with pytest.raises(SchemaMigrationError, match="foreign-node destinations"):
+        ensure_current_schema(connection)
+    assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 1
+
+    current = tmp_path / "cross-node-v2.db"
+    repository = SQLiteRepository(current)
+    node, destination, _, vm = catalog(repository)
+    job = BackupJob(vm.id, "job", storage_destination_id=destination.id)
+    repository.add_job(job)
+    foreign = Node("foreign")
+    repository.add_node(foreign)
+    other = StorageDestination("other", "/x", "/y", foreign.id, is_default=True)
+    repository.add_storage_destination(other)
+    repository.connection.execute(
+        "UPDATE backup_jobs SET storage_destination_id=? WHERE id=?", (other.id, job.id)
+    )
+    repository.connection.commit()
+    repository.close()
+    with pytest.raises(UnsupportedSchemaError, match="not on the VM node"):
+        SQLiteRepository(current)
+
+
+def test_job_run_destination_snapshot_is_sqlite_immutable():
+    repository = SQLiteRepository()
+    node, first, second, vm = catalog(repository)
+    job = BackupJob(vm.id, "job", storage_destination_id=first.id)
+    repository.add_job(job)
+    run = repository.create_manual_run(job.id, node.id, NOW)
+
+    repository.connection.execute(
+        "UPDATE job_runs SET storage_destination_id=? WHERE id=?", (first.id, run.id)
+    )
+    repository.connection.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        repository.connection.execute(
+            "UPDATE job_runs SET storage_destination_id=? WHERE id=?", (second.id, run.id)
+        )
+    repository.connection.rollback()
+
+    foreign = Node("foreign")
+    repository.add_node(foreign)
+    foreign_destination = StorageDestination(
+        "foreign", "/foreign/control", "/foreign/data", foreign.id, is_default=True,
+    )
+    repository.add_storage_destination(foreign_destination)
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        repository.connection.execute(
+            "UPDATE job_runs SET storage_destination_id=? WHERE id=?",
+            (foreign_destination.id, run.id),
+        )
+    repository.connection.rollback()
+
+    repository.connection.execute(
+        "UPDATE job_runs SET error=? WHERE id=?", ("unrelated update", run.id)
+    )
+    repository.connection.commit()
+    assert repository.get_run(run.id).error == "unrelated update"
+    assert repository.get_run(run.id).storage_destination_id == first.id
+
+
+def test_current_schema_allows_historical_local_destination_snapshot(tmp_path):
+    path = tmp_path / "historical-destination.db"
+    repository = SQLiteRepository(path)
+    node, first, second, vm = catalog(repository)
+    job = BackupJob(vm.id, "job", storage_destination_id=first.id)
+    repository.add_job(job)
+    run = repository.create_manual_run(job.id, node.id, NOW)
+    repository.connection.execute(
+        "UPDATE backup_jobs SET storage_destination_id=? WHERE id=?", (second.id, job.id)
+    )
+    repository.connection.commit()
+    repository.close()
+
+    reopened = SQLiteRepository(path)
+    assert reopened.get_job(job.id).storage_destination_id == second.id
+    assert reopened.get_run(run.id).storage_destination_id == first.id
+
+
+def test_add_job_requires_explicit_local_destination():
+    repository = SQLiteRepository()
+    node = Node("local")
+    repository.add_node(node)
+    vm = VM(node.id, "vm", "vm")
+    repository.add_vm(vm)
+    with pytest.raises(DomainInvariantError, match="STORAGE_DESTINATION_REQUIRED"):
+        repository.add_job(BackupJob(vm.id, "missing"))
+    assert repository.list_storage_destinations(node.id) == []
+    foreign = Node("foreign")
+    repository.add_node(foreign)
+    destination = StorageDestination("foreign", "/c", "/d", foreign.id, is_default=True)
+    repository.add_storage_destination(destination)
+    with pytest.raises(DomainInvariantError, match="STORAGE_DESTINATION_NOT_LOCAL"):
+        repository.add_job(BackupJob(vm.id, "foreign", storage_destination_id=destination.id))
+
+
+def test_manual_and_scheduled_runs_snapshot_destination():
+    repository = SQLiteRepository()
+    node, first, _, vm = catalog(repository)
+    manual_job = BackupJob(vm.id, "manual", storage_destination_id=first.id)
+    repository.add_job(manual_job)
+    manual = repository.create_manual_run(manual_job.id, node.id, NOW)
+    assert manual.storage_destination_id == first.id
+    repository.connection.execute("UPDATE job_runs SET state='SUCCESS' WHERE id=?", (manual.id,))
+    scheduled_job = BackupJob(
+        vm.id, "scheduled", storage_destination_id=first.id, next_run_at=NOW,
+    )
+    repository.add_job(scheduled_job)
+    scheduled = repository.schedule_due_job(scheduled_job.id, NOW)
+    assert scheduled.storage_destination_id == first.id
+
+
+def test_job_destination_update_affects_future_runs_only_and_executor_routes_snapshot():
+    repository = SQLiteRepository()
+    node, first, second, vm = catalog(repository)
+    job = BackupJob(vm.id, "job", storage_destination_id=first.id)
+    repository.add_job(job)
+    old = repository.create_manual_run(job.id, node.id, NOW)
+    app = application(repository, node, FakeClock(NOW))
+    app.dispatch("job.update", {"id": job.id, "storage_destination_id": second.id})
+    routed = []
+
+    class Executor:
+        pass
+
+    router = StorageRoutingExecutor(repository, lambda destination: routed.append(destination.id) or Executor())
+    assert router._for_run(old.id) is not None
+    assert routed == [first.id]
+    repository.connection.execute("UPDATE job_runs SET state='SUCCESS' WHERE id=?", (old.id,))
+    repository.connection.commit()
+    new = repository.create_manual_run(job.id, node.id, NOW + timedelta(minutes=1))
+    assert repository.get_run(old.id).storage_destination_id == first.id
+    assert new.storage_destination_id == second.id
+    assert router._for_run(new.id) is not None
+    assert routed == [first.id, second.id]
+
+
+def test_job_update_policies_and_schedule_cursor_semantics():
+    repository = SQLiteRepository()
+    node, first, second, vm = catalog(repository)
+    clock = FakeClock(NOW)
+    app = application(repository, node, clock)
+    created = app.dispatch("job.create", {
+        "vm_id": vm.id, "name": "manual", "storage_destination_id": first.id,
+    })
+    assert created["next_run_at"] is None
+    scheduled = app.dispatch("job.update", {
+        "id": created["id"], "name": "renamed", "storage_destination": second.name,
+        "restore_points_to_retain": 10, "minimum_full_chains": 2,
+        "interval_seconds": 600, "schedule_enabled": True,
+    })
+    assert scheduled["name"] == "renamed"
+    assert scheduled["storage_destination_id"] == second.id
+    assert scheduled["next_run_at"] == (NOW + timedelta(minutes=10)).isoformat()
+    assert scheduled["restore_points_to_retain"] == 10
+    disabled = app.dispatch("job.update", {"id": created["id"], "enabled": False})
+    assert not disabled["enabled"]
+    with pytest.raises(DomainInvariantError, match="JOB_DISABLED"):
+        repository.create_manual_run(created["id"], node.id, NOW)
+    clock.advance(seconds=300)
+    app.dispatch("job.update", {"id": created["id"], "enabled": True})
+    assert repository.get_job(created["id"]).next_run_at == NOW + timedelta(minutes=15)
+    manual = app.dispatch("job.update", {"id": created["id"], "schedule_enabled": False})
+    assert manual["next_run_at"] is None
+
+
+def test_job_update_uses_cursor_read_inside_write_transaction(tmp_path):
+    path = tmp_path / "concurrent.db"
+    api_repository = SQLiteRepository(path)
+    node, first, _, vm = catalog(api_repository)
+    job = BackupJob(vm.id, "scheduled", storage_destination_id=first.id, next_run_at=NOW)
+    api_repository.add_job(job)
+    app = application(api_repository, node, FakeClock(NOW))
+    assert api_repository.get_job(job.id).next_run_at == NOW  # stale pre-scheduler view
+
+    runtime_repository = SQLiteRepository(path)
+    runtime_repository.schedule_due_job(job.id, NOW)
+    advanced = NOW + timedelta(hours=1)
+    assert runtime_repository.get_job(job.id).next_run_at == advanced
+    updated = app.dispatch("job.update", {"id": job.id, "name": "renamed"})
+    assert updated["next_run_at"] == advanced.isoformat()
+    assert api_repository.get_job(job.id).next_run_at == advanced
+
+
+def test_job_update_rejects_foreign_destination_and_conflicting_selectors():
+    repository = SQLiteRepository()
+    node, first, _, vm = catalog(repository)
+    app = application(repository, node, FakeClock(NOW))
+    job = app.dispatch("job.create", {
+        "vm_id": vm.id, "name": "job", "storage_destination_id": first.id,
+    })
+    foreign = Node("UA")
+    repository.add_node(foreign)
+    destination = StorageDestination("foreign", "/c", "/d", foreign.id, is_default=True)
+    repository.add_storage_destination(destination)
+    with pytest.raises(ApplicationError):
+        app.dispatch("job.update", {"id": job["id"], "storage_destination_id": destination.id})
+    with pytest.raises(ApplicationError) as caught:
+        app.dispatch("job.update", {
+            "id": job["id"], "storage_destination_id": first.id,
+            "storage_destination": first.name,
+        })
+    assert caught.value.code == "INVALID_PARAMS"
+
+
+def test_cli_job_create_and_update_map_schedule_enable_and_destination_options():
+    parser = _parser()
+    method, params = _request(parser.parse_args([
+        "job", "create", "--vm", "vm", "--name", "job", "--storage-name", "local",
+        "--schedule", "--disabled",
+    ]))
+    assert method == "job.create"
+    assert params["storage_destination"] == "local"
+    assert params["schedule_enabled"] is True
+    assert params["enabled"] is False
+
+    method, params = _request(parser.parse_args([
+        "job", "update", "job-id", "--storage", "storage-id", "--enable",
+        "--manual", "--retain", "9",
+    ]))
+    assert method == "job.update"
+    assert params == {
+        "id": "job-id", "name": None, "storage_destination_id": "storage-id",
+        "storage_destination": None, "restore_points_to_retain": 9,
+        "minimum_full_chains": None, "interval_seconds": None,
+        "misfire_grace_seconds": None, "enabled": True, "schedule_enabled": False,
+    }
+    with pytest.raises(SystemExit):
+        parser.parse_args([
+            "job", "update", "job-id", "--storage", "id", "--storage-name", "name",
+        ])

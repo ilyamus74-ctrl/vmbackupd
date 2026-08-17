@@ -1,7 +1,19 @@
 # Local API
 
+Phase 3E.5 adds `job.update` for mutable name, enabled state, local destination
+(by ID or name), retention, interval/misfire, and schedule-enabled fields. VM,
+job ID, creation time, and incremental policy remain immutable here. Destination
+selectors are mutually exclusive, and changing destination affects future runs
+only because every run snapshots it at creation.
+
+`job.create` remains manual unless `schedule_enabled` is explicit. Metadata
+changes do not require libvirt mutation permission; `backup.run` still does and
+retains runtime, enabled-job, busy-VM, quarantine, and locality checks.
+
 Phase 3C establishes the stable control boundary shared by `vmbackupctl` and the
-packaged read-only `cockpit-vmbackupd` frontend. Both clients use the daemon API
+packaged `cockpit-vmbackupd` frontend. Its operational dashboard reads remain
+read-only, while Phase 3E.5 exposes only the narrow mutations listed above.
+Both clients use the daemon API
 and never access SQLite or libvirt directly.
 
 The daemon listens on a configurable UNIX `SOCK_STREAM` socket. Each connection
@@ -13,7 +25,7 @@ oversized requests, unsupported versions, invalid parameters, unknown methods,
 domain rejection, and internal failure are distinct. Tracebacks are never sent.
 
 Methods are: `daemon.status`, `node.list`, `storage.list/show`,
-`vm.discover/list/show/register`, `job.list/show/create`, `backup.run`,
+`vm.discover/list/show/register`, `job.list/show/create/update`, `backup.run`,
 `run.list/show`, `restore_point.list/show`, `recovery.list/show`, and
 `event.list`. `backup.run` only creates a SCHEDULED run and returns immediately.
 The runtime owns execution. Run progress exposes state and nullable byte fields;

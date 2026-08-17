@@ -1,7 +1,10 @@
 from datetime import datetime, timedelta, timezone
 
 from vmbackupd.clock import FakeClock
-from vmbackupd.models import BackupJob, BackupPolicy, Node, RetentionPolicy, SchedulePolicy, VM
+from vmbackupd.models import (
+    BackupJob, BackupPolicy, Node, RetentionPolicy, SchedulePolicy,
+    StorageDestination, VM,
+)
 from vmbackupd.repository import SQLiteRepository
 from vmbackupd.scheduler import IntervalScheduler
 
@@ -12,10 +15,16 @@ START = datetime(2026, 1, 1, tzinfo=timezone.utc)
 def scheduled_domain(repository, *, due=START, interval=3600, grace=0, name="scheduled"):
     node = Node(name=f"node-{name}")
     repository.add_node(node)
+    destination = StorageDestination(
+        node_id=node.id, name="local", control_root="/control",
+        backup_data_root="/data", is_default=True,
+    )
+    repository.add_storage_destination(destination)
     vm = VM(node_id=node.id, name=name, external_id=name)
     repository.add_vm(vm)
     job = BackupJob(
-        vm_id=vm.id, name="interval", backup_policy=BackupPolicy(2),
+        vm_id=vm.id, name="interval", storage_destination_id=destination.id,
+        backup_policy=BackupPolicy(2),
         retention_policy=RetentionPolicy(5, 1),
         schedule_policy=SchedulePolicy(interval, grace), next_run_at=due,
     )

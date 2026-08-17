@@ -12,7 +12,8 @@ from vmbackupd.libvirt_backend import (
 )
 from vmbackupd.models import (
     ArtifactKind, BackupArtifact, BackupJob, BackupKind, BackupPolicy, JobRun,
-    LibvirtBackupOperation, Node, ReconciliationStatus, RetentionPolicy, RunState, VM,
+    LibvirtBackupOperation, Node, ReconciliationStatus, RetentionPolicy, RunState,
+    StorageDestination, VM,
 )
 from vmbackupd.repository import DomainInvariantError, SQLiteRepository
 
@@ -57,9 +58,11 @@ class Driver:
 def make_domain(repository, *, max_incrementals=2, name="vm"):
     node = Node(name=f"node-{name}")
     repository.add_node(node)
+    destination = StorageDestination("local", "/control", "/data", node.id, is_default=True)
+    repository.add_storage_destination(destination)
     vm = VM(node_id=node.id, name=name, external_id=name)
     repository.add_vm(vm)
-    job = BackupJob(vm_id=vm.id, name="backup",
+    job = BackupJob(vm_id=vm.id, name="backup", storage_destination_id=destination.id,
                     backup_policy=BackupPolicy(max_incrementals),
                     retention_policy=RetentionPolicy(5, 1))
     repository.add_job(job)

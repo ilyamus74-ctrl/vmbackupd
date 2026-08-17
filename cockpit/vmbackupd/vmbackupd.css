@@ -25,7 +25,32 @@ button {
     cursor: pointer;
 }
 
-button:disabled { cursor: wait; opacity: 0.65; }
+button:disabled { cursor: not-allowed; opacity: 0.65; }
+.primary-action { background: #06c; color: white; border-color: #06c; }
+.row-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; min-width: 14rem; }
+
+dialog {
+    width: min(34rem, calc(100vw - 2rem));
+    border: 1px solid color-mix(in srgb, CanvasText 20%, Canvas);
+    border-radius: 0.4rem;
+    background: Canvas;
+    color: CanvasText;
+}
+dialog::backdrop { background: rgb(0 0 0 / 45%); }
+#job-form { display: grid; gap: 0.9rem; }
+#job-form label { display: grid; gap: 0.3rem; font-weight: 600; }
+#job-form input, #job-form select {
+    box-sizing: border-box;
+    width: 100%;
+    padding: 0.5rem;
+    font: inherit;
+}
+#job-form .check-label { display: flex; align-items: center; gap: 0.5rem; }
+#job-form .check-label input { width: auto; }
+.inline-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 0.5rem; }
+.form-note { padding: 0.6rem; border-left: 0.25rem solid #06c; }
+.form-error { min-height: 1.2rem; color: #c9190b; }
 
 .notice {
     margin-top: 1rem;

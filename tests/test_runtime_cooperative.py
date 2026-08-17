@@ -4,7 +4,9 @@ import pytest
 
 from vmbackupd.clock import FakeClock
 from vmbackupd.engine import MockBackupEngine
-from vmbackupd.models import BackupJob, JobRun, Node, RunState, SchedulePolicy, VM
+from vmbackupd.models import (
+    BackupJob, JobRun, Node, RunState, SchedulePolicy, StorageDestination, VM,
+)
 from vmbackupd.repository import DomainInvariantError, SQLiteRepository
 from vmbackupd.runtime import DaemonRuntime
 from vmbackupd.scheduler import IntervalScheduler
@@ -17,12 +19,14 @@ def domain():
     repository = SQLiteRepository()
     node = Node(name="cooperative-node")
     repository.add_node(node)
+    destination = StorageDestination("local", "/control", "/data", node.id, is_default=True)
+    repository.add_storage_destination(destination)
     vm1 = VM(node_id=node.id, name="vm1", external_id="vm1")
     vm2 = VM(node_id=node.id, name="vm2", external_id="vm2")
     repository.add_vm(vm1)
     repository.add_vm(vm2)
-    job1 = BackupJob(vm_id=vm1.id, name="long")
-    job2 = BackupJob(vm_id=vm2.id, name="short")
+    job1 = BackupJob(vm_id=vm1.id, name="long", storage_destination_id=destination.id)
+    job2 = BackupJob(vm_id=vm2.id, name="short", storage_destination_id=destination.id)
     repository.add_job(job1)
     repository.add_job(job2)
     return repository, node, vm1, vm2, job1, job2, FakeClock(NOW)
@@ -151,6 +155,7 @@ def test_skip_if_busy_advances_cursor_without_creating_backlog():
     repository, _, _, _, job1, _, clock = domain()
     due_job = BackupJob(
         id="busy-job", vm_id=job1.vm_id, name="busy-scheduled",
+        storage_destination_id=repository.get_job(job1.id).storage_destination_id,
         schedule_policy=SchedulePolicy(60, 0), next_run_at=NOW,
     )
     repository.add_job(due_job)
@@ -170,6 +175,7 @@ def test_skip_if_busy_coalesces_multiple_due_occurrences():
     repository, _, _, _, job1, _, clock = domain()
     due_job = BackupJob(
         id="late-busy", vm_id=job1.vm_id, name="late-busy",
+        storage_destination_id=repository.get_job(job1.id).storage_destination_id,
         schedule_policy=SchedulePolicy(60, 0), next_run_at=NOW,
     )
     repository.add_job(due_job)

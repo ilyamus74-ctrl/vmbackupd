@@ -5,7 +5,7 @@
     const PROTOCOL_VERSION = 1;
     const MAX_RESPONSE_BYTES = 1024 * 1024;
     const API_REQUEST_TIMEOUT_MS = 45000;
-    const READ_ONLY_METHODS = Object.freeze([
+    const ALLOWED_METHODS = Object.freeze([
         "daemon.status",
         "vm.discover",
         "vm.list",
@@ -14,6 +14,10 @@
         "run.list",
         "restore_point.list",
         "recovery.list",
+        "vm.register",
+        "job.create",
+        "job.update",
+        "backup.run",
     ]);
     let requestSequence = 0;
 
@@ -57,8 +61,8 @@
         return { result: undefined, error: new ApiError(error.code, error.message) };
     }
 
-    function request(method) {
-        if (!READ_ONLY_METHODS.includes(method))
+    function request(method, params = {}) {
+        if (!ALLOWED_METHODS.includes(method))
             return Promise.reject(new ApiError("METHOD_NOT_ALLOWED", "Frontend method is not allowed"));
 
         const id = requestId();
@@ -66,7 +70,7 @@
             version: PROTOCOL_VERSION,
             id: id,
             method: method,
-            params: {},
+            params: params,
         }) + "\n";
 
         return new Promise((resolve, reject) => {
@@ -171,7 +175,7 @@
 
     global.VmbackupApi = Object.freeze({
         request: request,
-        methods: READ_ONLY_METHODS,
+        methods: ALLOWED_METHODS,
         ApiError: ApiError,
         ProtocolError: ProtocolError,
         TransportError: TransportError,

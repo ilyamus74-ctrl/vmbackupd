@@ -19,7 +19,7 @@ def _parser():
     top = parser.add_subparsers(dest="group", required=True)
     simple = {"daemon": ["status"], "node": ["list"], "storage": ["list", "show"],
               "vm": ["discover", "list", "show", "register"],
-              "job": ["list", "show", "create"], "backup": ["run"],
+              "job": ["list", "show", "create", "update"], "backup": ["run"],
               "run": ["list", "show"], "restore-point": ["list", "show"],
               "recovery": ["list", "show"], "event": ["list"]}
     for group, commands in simple.items():
@@ -32,12 +32,29 @@ def _parser():
                 item.add_argument("domain"); item.add_argument("--name")
             if group == "job" and command == "create":
                 item.add_argument("--vm", required=True); item.add_argument("--name", required=True)
-                item.add_argument("--storage"); item.add_argument("--storage-name")
+                destination = item.add_mutually_exclusive_group()
+                destination.add_argument("--storage"); destination.add_argument("--storage-name")
                 item.add_argument("--max-incrementals", type=int, default=0)
                 item.add_argument("--retain", type=int, default=7)
                 item.add_argument("--minimum-full-chains", type=int, default=1)
                 item.add_argument("--interval", type=int, default=3600)
                 item.add_argument("--misfire-grace", type=int, default=0)
+                item.add_argument("--schedule", action="store_true")
+                item.add_argument("--disabled", action="store_true")
+            if group == "job" and command == "update":
+                item.add_argument("id"); item.add_argument("--name")
+                destination = item.add_mutually_exclusive_group()
+                destination.add_argument("--storage"); destination.add_argument("--storage-name")
+                item.add_argument("--retain", type=int)
+                item.add_argument("--minimum-full-chains", type=int)
+                item.add_argument("--interval", type=int)
+                item.add_argument("--misfire-grace", type=int)
+                enabled = item.add_mutually_exclusive_group()
+                enabled.add_argument("--enable", action="store_true")
+                enabled.add_argument("--disable", action="store_true")
+                schedule = item.add_mutually_exclusive_group()
+                schedule.add_argument("--schedule", action="store_true")
+                schedule.add_argument("--manual", action="store_true")
             if group == "backup" and command == "run": item.add_argument("job_id")
             if group == "event" and command == "list": item.add_argument("--run")
     return parser
@@ -58,7 +75,19 @@ def _request(args):
                   "restore_points_to_retain": args.retain,
                   "minimum_full_chains": args.minimum_full_chains,
                   "interval_seconds": args.interval,
-                  "misfire_grace_seconds": args.misfire_grace}
+                  "misfire_grace_seconds": args.misfire_grace,
+                  "schedule_enabled": args.schedule,
+                  "enabled": not args.disabled}
+    elif args.group == "job" and args.command == "update":
+        params = {"id": args.id, "name": args.name,
+                  "storage_destination_id": args.storage,
+                  "storage_destination": args.storage_name,
+                  "restore_points_to_retain": args.retain,
+                  "minimum_full_chains": args.minimum_full_chains,
+                  "interval_seconds": args.interval,
+                  "misfire_grace_seconds": args.misfire_grace,
+                  "enabled": True if args.enable else False if args.disable else None,
+                  "schedule_enabled": True if args.schedule else False if args.manual else None}
     elif args.group == "backup": params = {"job_id": args.job_id}
     elif args.group == "event" and args.run: params = {"run_id": args.run}
     return method, params

@@ -20,7 +20,7 @@ from vmbackupd.libvirt_execution import (
 )
 from vmbackupd.models import (
     ArtifactKind, ArtifactState, BackupArtifact, BackupJob, BackupKind, BackupPolicy, JobRun,
-    LibvirtExternalState, Node, RetentionPolicy, RunState, VM,
+    LibvirtExternalState, Node, RetentionPolicy, RunState, StorageDestination, VM,
 )
 from vmbackupd.repository import SQLiteRepository
 
@@ -129,9 +129,15 @@ def execution(tmp_path):
     repository = SQLiteRepository()
     node = Node("local")
     repository.add_node(node)
+    destination = StorageDestination(
+        "local", str(tmp_path / "control"), str(tmp_path / "backup-data"),
+        node.id, is_default=True,
+    )
+    repository.add_storage_destination(destination)
     vm = VM(node.id, "guest", "guest")
     repository.add_vm(vm)
-    job = BackupJob(vm.id, "full", backup_policy=BackupPolicy(0),
+    job = BackupJob(vm.id, "full", storage_destination_id=destination.id,
+                    backup_policy=BackupPolicy(0),
                     retention_policy=RetentionPolicy(5, 1))
     repository.add_job(job)
     run = JobRun(job.id)

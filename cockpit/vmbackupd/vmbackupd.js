@@ -4,8 +4,13 @@
     const api = window.VmbackupApi;
     const notice = document.getElementById("notice");
     const refreshButton = document.getElementById("refresh");
+    const addJobButton = document.getElementById("add-job");
+    const jobDialog = document.getElementById("job-dialog");
+    const jobForm = document.getElementById("job-form");
     const TERMINAL_STATES = new Set(["SUCCESS", "FAILED"]);
     const RECENT_RUN_LIMIT = 20;
+    let currentModel = null;
+    let editingJobId = null;
 
     function text(value) {
         if (value === null || value === undefined || value === "")
@@ -52,6 +57,20 @@
         if (minutes)
             return `${minutes}m ${seconds}s`;
         return `${seconds}s`;
+    }
+
+    function intervalParts(secondsValue) {
+        const seconds = Number(secondsValue);
+        if (Number.isInteger(seconds) && seconds > 0) {
+            if (seconds % 86400 === 0)
+                return { amount: seconds / 86400, unit: 86400 };
+            if (seconds % 3600 === 0)
+                return { amount: seconds / 3600, unit: 3600 };
+            if (seconds % 60 === 0)
+                return { amount: seconds / 60, unit: 60 };
+            return { amount: seconds, unit: 1 };
+        }
+        return { amount: 60, unit: 60 };
     }
 
     function runDuration(run, now) {
@@ -152,6 +171,17 @@
         return row;
     }
 
+    function actionButton(label, action, disabled, reason) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = label;
+        button.disabled = disabled;
+        if (reason)
+            button.title = reason;
+        button.addEventListener("click", action);
+        return button;
+    }
+
     function emptyRow(columns, message) {
         const row = document.createElement("tr");
         const cell = tableCell(message, "empty-state");
@@ -237,6 +267,33 @@
                 job.id, model.restorePoints, model.runsById
             );
             const destination = model.storageById.get(job.storage_destination_id);
+            const activeForVm = model.runs.some(run => {
+                const candidate = model.jobById.get(run.job_id);
+                return candidate && candidate.vm_id === job.vm_id &&
+                    !TERMINAL_STATES.has(run.state);
+            });
+            const recoveryForVm = model.runs.some(run => {
+                const candidate = model.jobById.get(run.job_id);
+                return candidate && candidate.vm_id === job.vm_id && run.recovery_required;
+            });
+            let runDisabledReason = null;
+            if (!model.status.libvirt_mutation_enabled)
+                runDisabledReason = "Libvirt mutation is disabled";
+            else if (!job.enabled)
+                runDisabledReason = "The backup job is disabled";
+            else if (recoveryForVm)
+                runDisabledReason = "The VM requires recovery";
+            else if (activeForVm)
+                runDisabledReason = "The VM already has active work";
+            const actions = document.createElement("div");
+            actions.className = "row-actions";
+            actions.append(
+                actionButton("Edit", () => openJobDialog(job), false),
+                actionButton(job.enabled ? "Disable" : "Enable",
+                    () => updateJob(job.id, { enabled: !job.enabled }), false),
+                actionButton("Run now", () => runNow(job), Boolean(runDisabledReason),
+                    runDisabledReason),
+            );
             return tableRow([
                 vmName(model.vmById, job.vm_id),
                 job.name,
@@ -246,9 +303,10 @@
                 lastRun ? badge(statusLabel(lastRun), statusClass(lastRun)) : "—",
                 successfulPoint ? localTimestamp(successfulPoint.created_at) : "Never",
                 job.next_run_at ? localTimestamp(job.next_run_at) : "Manual / not scheduled",
+                actions,
             ]);
         });
-        replaceRows("jobs", rows, 8, "No backup jobs configured");
+        replaceRows("jobs", rows, 9, "No backup jobs configured");
     }
 
     function renderStorage(model) {
@@ -296,12 +354,133 @@
     }
 
     function renderModel(model) {
+        currentModel = model;
         renderSummary(model);
         renderRecentRuns(model);
         renderJobs(model);
         renderStorage(model);
         renderDiscoveredVms(model);
         renderSystemDetails(model.status);
+    }
+
+    function populateJobOptions(editingJob) {
+        const vmSelect = document.getElementById("job-vm");
+        const storageSelect = document.getElementById("job-storage");
+        const registeredByUuid = new Map(currentModel.registeredVms
+            .filter(vm => vm.libvirt_domain_uuid)
+            .map(vm => [vm.libvirt_domain_uuid, vm]));
+        const options = [];
+        for (const vm of currentModel.registeredVms)
+            options.push({ value: `registered:${vm.id}`, label: vm.name, registered: true });
+        currentModel.discoveredVms.forEach((vm, index) => {
+            if (!registeredByUuid.has(vm.uuid))
+                options.push({ value: `discovered:${index}`, label: `${vm.name} (will register)`, registered: false });
+        });
+        vmSelect.replaceChildren(...options.map(item => {
+            const option = element("option", item.label);
+            option.value = item.value;
+            return option;
+        }));
+        storageSelect.replaceChildren(...currentModel.storage.map(destination => {
+            const option = element("option", destination.name);
+            option.value = destination.id;
+            return option;
+        }));
+        if (editingJob) {
+            vmSelect.value = `registered:${editingJob.vm_id}`;
+            storageSelect.value = editingJob.storage_destination_id;
+        }
+        vmSelect.disabled = Boolean(editingJob);
+        updateRegistrationNote();
+    }
+
+    function updateRegistrationNote() {
+        document.getElementById("registration-note").hidden =
+            !document.getElementById("job-vm").value.startsWith("discovered:");
+    }
+
+    function openJobDialog(job = null) {
+        editingJobId = job ? job.id : null;
+        document.getElementById("job-dialog-title").textContent = job ? "Edit backup job" : "Add backup job";
+        populateJobOptions(job);
+        document.getElementById("job-name").value = job ? job.name : "";
+        document.getElementById("job-enabled").checked = job ? job.enabled : true;
+        document.getElementById("job-retain").value = job ? job.restore_points_to_retain : 7;
+        document.getElementById("job-minimum-chains").value = job ? job.minimum_full_chains : 1;
+        const scheduled = Boolean(job && job.next_run_at);
+        document.getElementById("job-schedule").value = scheduled ? "interval" : "manual";
+        const interval = intervalParts(job ? job.interval_seconds : 3600);
+        document.getElementById("job-interval").value = interval.amount;
+        document.getElementById("job-interval-unit").value = String(interval.unit);
+        document.getElementById("interval-fields").hidden = !scheduled;
+        document.getElementById("job-form-error").textContent = "";
+        jobDialog.showModal();
+    }
+
+    async function updateJob(id, params) {
+        try {
+            setNotice("Updating backup job…", "loading");
+            await api.request("job.update", { id: id, ...params });
+            await refresh();
+        } catch (error) {
+            setNotice(failureMessage(error), "error");
+        }
+    }
+
+    async function runNow(job) {
+        try {
+            setNotice(`Requesting backup for ${job.name}…`, "loading");
+            const result = await api.request("backup.run", { job_id: job.id });
+            await refresh();
+            setNotice(`Backup run ${text(result.run_id)} created in ${text(result.state)}`, "success");
+        } catch (error) {
+            setNotice(failureMessage(error), "error");
+        }
+    }
+
+    async function saveJob(event) {
+        event.preventDefault();
+        const errorNode = document.getElementById("job-form-error");
+        errorNode.textContent = "";
+        const interval = Number(document.getElementById("job-interval").value) *
+            Number(document.getElementById("job-interval-unit").value);
+        const params = {
+            name: document.getElementById("job-name").value.trim(),
+            storage_destination_id: document.getElementById("job-storage").value,
+            enabled: document.getElementById("job-enabled").checked,
+            schedule_enabled: document.getElementById("job-schedule").value === "interval",
+            interval_seconds: interval,
+            restore_points_to_retain: Number(document.getElementById("job-retain").value),
+            minimum_full_chains: Number(document.getElementById("job-minimum-chains").value),
+        };
+        let registeredVm = null;
+        try {
+            if (editingJobId) {
+                await api.request("job.update", { id: editingJobId, ...params });
+            } else {
+                const selection = document.getElementById("job-vm").value;
+                let vmId;
+                if (selection.startsWith("registered:")) {
+                    vmId = selection.slice("registered:".length);
+                } else {
+                    const discovered = currentModel.discoveredVms[Number(selection.split(":")[1])];
+                    registeredVm = await api.request("vm.register", {
+                        external_id: discovered.external_id, name: discovered.name,
+                    });
+                    vmId = registeredVm.id;
+                }
+                await api.request("job.create", {
+                    vm_id: vmId, max_incrementals_per_chain: 0, ...params,
+                });
+            }
+            jobDialog.close();
+            await refresh();
+            setNotice("Backup job saved", "success");
+        } catch (error) {
+            errorNode.textContent = registeredVm ?
+                `VM registration succeeded, but job creation failed: ${failureMessage(error)}` :
+                failureMessage(error);
+        }
     }
 
     function clearViews() {
@@ -365,5 +544,12 @@
     }
 
     refreshButton.addEventListener("click", refresh);
+    addJobButton.addEventListener("click", () => openJobDialog());
+    document.getElementById("job-cancel").addEventListener("click", () => jobDialog.close());
+    document.getElementById("job-vm").addEventListener("change", updateRegistrationNote);
+    document.getElementById("job-schedule").addEventListener("change", event => {
+        document.getElementById("interval-fields").hidden = event.target.value !== "interval";
+    });
+    jobForm.addEventListener("submit", saveJob);
     refresh();
 }());

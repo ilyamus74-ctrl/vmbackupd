@@ -1,5 +1,11 @@
 # vmbackupctl
 
+Phase 3E.5 adds `vmbackupctl job update ID` with name, retention, interval,
+misfire, `--enable`/`--disable`, `--schedule`/`--manual`, and mutually exclusive
+`--storage ID` or `--storage-name NAME` options. `job create` also accepts
+`--schedule` and `--disabled`; defaults remain enabled and manual. The CLI still
+uses only the UNIX API.
+
 `vmbackupctl` is a first-class console client and communicates exclusively with
 the versioned UNIX API. It does not import the repository or invoke virsh.
 
