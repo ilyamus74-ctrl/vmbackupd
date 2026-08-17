@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VM Backup</title>
+  <link rel="stylesheet" href="vmbackupd.css">
+  <script src="../base1/cockpit.js"></script>
+  <script defer src="api.js"></script>
+  <script defer src="vmbackupd.js"></script>
+</head>
+<body>
+  <main>
+    <header class="page-header">
+      <div>
+        <h1>VM Backup</h1>
+        <p>Read-only backup service overview</p>
+      </div>
+      <button id="refresh" type="button">Refresh</button>
+    </header>
+
+    <div id="notice" class="notice" role="status" aria-live="polite">Loading…</div>
+
+    <section aria-labelledby="dashboard-title">
+      <h2 id="dashboard-title">Dashboard</h2>
+      <dl id="dashboard" class="dashboard"></dl>
+    </section>
+
+    <section aria-labelledby="vms-title">
+      <h2 id="vms-title">Virtual Machines</h2>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Name</th><th>External ID</th><th>UUID</th><th>State</th></tr></thead>
+          <tbody id="vms"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section aria-labelledby="storage-title">
+      <h2 id="storage-title">Storage</h2>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Name</th><th>Type</th><th>Default</th><th>Backup data</th><th>Control</th><th>Free</th><th>Minimum free</th><th>Reserve</th></tr></thead>
+          <tbody id="storage"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

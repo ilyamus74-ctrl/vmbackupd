@@ -23,6 +23,16 @@ Phase 3D.2 provides the Fedora-style RPM layout and service profile:
 Cockpit remains a future separate `cockpit-vmbackupd` package. Logging uses the
 systemd journal; no package-owned log directory is currently needed.
 
+Phase 3E.2 provides repository source at `cockpit/vmbackupd/` only. It is not
+yet installed into `/usr/share/cockpit/vmbackupd/` and is not part of the
+current vmbackupd RPM. That future package will contain the manifest, HTML,
+JavaScript, and CSS while continuing to use the existing
+`/run/vmbackupd/vmbackupd.sock` control boundary.
+
+Browser validation used a temporary user-local symlink at
+`~/.local/share/cockpit/vmbackupd`; this development exposure is not the final
+installed layout and does not replace the future separate Cockpit RPM.
+
 ## Backup data placement
 
 QEMU-written push data is outside private daemon control state. A likely

@@ -89,10 +89,20 @@ Phase 3E.1 has live-validated this local DAC foundation with the Fedora 41 RPM:
 the packaged SGID directory and socket inherited `vmbackupd-admin`, access was
 denied before explicit enrollment and allowed from a fresh session afterward,
 and the administrator gained no direct database/control/backup-file access.
-The Cockpit frontend itself is not implemented or validated yet. SELinux
+That phase did not yet implement or validate the Cockpit frontend. SELinux
 Enforcing and non-interactive packaged-account authorization for the separate
-read-write `backup-begin` boundary also remain unresolved; no packaged-service
-backup was executed during this validation.
+read-write `backup-begin` boundary remain unresolved; no packaged-service
+backup was executed during that validation.
+
+Phase 3E.2 adds the first source-only read-only Cockpit slice. It uses a raw
+Cockpit stream channel to the existing UNIX API and exposes only daemon status,
+VM discovery, and Local storage listing. Fedora 41 Cockpit 345 browser
+validation passed through a user-local development symlink: fresh-session DAC
+authorization, Dashboard/VM/Local-storage rendering, and repeated three-method
+Refresh all worked. A separate `cockpit-vmbackupd` RPM remains the next Phase
+3E step; the existing vmbackupd RPM is unchanged. Mutation UI, packaged
+read-write authorization, SELinux Enforcing validation, and finer-grained roles
+remain deferred.
 
 Future retention deletion is constrained by a permanent fail-safe contract:
 **no new valid backup means no automatic deletion**. Automatic expiration is a

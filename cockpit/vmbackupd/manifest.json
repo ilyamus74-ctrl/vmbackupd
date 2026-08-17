@@ -1,0 +1,12 @@
+{
+  "requires": {
+    "cockpit": "215"
+  },
+  "menu": {
+    "index": {
+      "label": "VM Backup",
+      "path": "index.html",
+      "order": 65
+    }
+  }
+}

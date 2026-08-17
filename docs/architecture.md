@@ -2,9 +2,14 @@
 
 vmbackupd now includes the domain/persistence core, cooperative local runtime,
 FULL-only libvirt push executor, UNIX API and CLI, schema migrations, and a
-Fedora-style production service/package profile. Remote networking, Cockpit,
-incremental execution, restore, retention deletion, and additional hypervisor
-mutations remain outside the implemented scope.
+Fedora-style production service/package profile. It also includes the first
+read-only Cockpit frontend source slice for `daemon.status`, `vm.discover`, and
+`storage.list`, validated in a Cockpit 345 browser through the local API.
+Installable `cockpit-vmbackupd` RPM packaging, Cockpit mutation controls, remote
+networking, incremental execution, restore execution, retention deletion,
+additional hypervisor mutations, SELinux Enforcing validation, and
+packaged-account read-write `backup-begin` authorization remain pending. This
+is not a production-readiness claim.
 
 ## Jobs and persisted policies
 
@@ -294,3 +299,23 @@ unchanged. SELinux Enforcing policy/label validation and packaged-account
 authorization for the separate read-write `backup-begin` boundary remain
 incomplete release gates, so this is not yet a production readiness claim. See
 [`packaging.md`](packaging.md).
+
+## Phase 3E.2 Cockpit read-only slice
+
+The first Cockpit source package is a browser client of the same versioned
+local API used by `vmbackupctl`. The logged-in Cockpit bridge opens a raw stream
+channel directly to `/run/vmbackupd/vmbackupd.sock` under the user's
+`vmbackupd-admin` credentials. One bounded JSON-lines request/response uses one
+channel; arbitrary channel chunks are accumulated until a newline and then
+strictly checked for version and request identity.
+
+The frontend allow-list contains only `daemon.status`, `vm.discover`, and
+`storage.list`. It contains no privileged helper, subprocess client, direct
+database/libvirt/filesystem path, or mutation controls. Dashboard, discovered
+VMs, and Local storage are the initial views. Fedora 41 Cockpit 345 browser
+validation passed through a user-local development package symlink, including
+the stale-session permission failure, fresh-session group inheritance, live
+read-only data, and repeated refresh. This source slice is still not installed
+by the current RPM; separate `cockpit-vmbackupd` packaging, mutation-boundary
+authorization, and SELinux Enforcing validation remain pending. See
+[`cockpit.md`](cockpit.md).
