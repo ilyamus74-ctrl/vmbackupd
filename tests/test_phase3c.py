@@ -155,7 +155,7 @@ def test_local_node_bootstrap_is_idempotent():
 def test_domain_discovery_is_read_only_argv():
     from vmbackupd.command import FakeCommandRunner
     from vmbackupd.libvirt_backend import VirshLibvirtDriver
-    prefix = ("virsh", "--connect", "qemu:///system")
+    prefix = ("virsh", "--readonly", "--connect", "qemu:///system")
     runner = FakeCommandRunner({
         (*prefix, "list", "--all", "--name"): (0, "guest\n", ""),
         (*prefix, "domuuid", "guest"): (0, "uuid\n", ""),

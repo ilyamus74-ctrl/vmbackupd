@@ -62,8 +62,16 @@ data. Erase removed package-owned binaries and the unit while retaining mutable
 directories and data, and preserved edited configuration as `.rpmsave`.
 Warnings caused by unmounted `/proc` and `/sys` in the synthetic installroot do
 not represent a service lifecycle failure; tmpfiles was independently checked
-with `systemd-tmpfiles --root`. Real service execution as `User=vmbackupd` and
-SELinux Enforcing validation remain outstanding production-readiness gates.
+with `systemd-tmpfiles --root`.
+
+Phase 3D.3 subsequently validated the real packaged, hardened service as
+`User=vmbackupd`, `Group=vmbackupd`, with supplementary group `qemu`, using the
+mutation-disabled profile. Read-only libvirt discovery and inspection succeeded
+through `virsh --readonly --connect URI`; `backup.run` returned
+`MUTATION_DISABLED`, and no real backup or existing backup-data modification
+occurred. SELinux Enforcing validation and non-interactive authorization for
+the separate read-write `virsh --connect URI backup-begin ...` boundary remain
+outstanding production-release gates. Production readiness is not yet claimed.
 
 Phase 3D.1 adds `schema_version`, structural validation, and ordered
 transactional migrations. It can adopt the known unversioned integration

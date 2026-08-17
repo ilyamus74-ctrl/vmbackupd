@@ -144,7 +144,7 @@ def test_uuid_mismatch_is_structured_and_never_rebinds():
      ("malformed", 0, "", 1, DomainJobState.UNKNOWN)],
 )
 def test_structured_domain_job_inspection(job_info, job_rc, backup, backup_rc, expected):
-    prefix = ("virsh", "--connect", "qemu:///system")
+    prefix = ("virsh", "--readonly", "--connect", "qemu:///system")
     runner = FakeCommandRunner({
         (*prefix, "domjobinfo", "guest", "--rawstats"): (job_rc, job_info, "denied" if job_rc else ""),
         (*prefix, "backup-dumpxml", "guest"): (backup_rc, backup, "not a backup"),
@@ -156,7 +156,7 @@ def test_structured_domain_job_inspection(job_info, job_rc, backup, backup_rc, e
 
 
 def test_active_job_parses_type_and_operation_independently_and_numeric_backup():
-    prefix = ("virsh", "--connect", "qemu:///system")
+    prefix = ("virsh", "--readonly", "--connect", "qemu:///system")
     runner = FakeCommandRunner({
         (*prefix, "domjobinfo", "guest", "--rawstats"):
             (0, "Job type: 1\nOperation: 9\n", ""),
@@ -169,7 +169,7 @@ def test_active_job_parses_type_and_operation_independently_and_numeric_backup()
 
 
 def test_known_backup_operation_with_dumpxml_failure_is_unknown():
-    prefix = ("virsh", "--connect", "qemu:///system")
+    prefix = ("virsh", "--readonly", "--connect", "qemu:///system")
     runner = FakeCommandRunner({
         (*prefix, "domjobinfo", "guest", "--rawstats"):
             (0, "Job type: Bounded\nOperation: Backup\n", ""),
@@ -197,7 +197,7 @@ def test_known_backup_operation_with_dumpxml_failure_is_unknown():
 def test_completed_job_inspection_preserves_type_operation_and_result(
     job_info, expected_type, expected_operation, success,
 ):
-    prefix = ("virsh", "--connect", "qemu:///system")
+    prefix = ("virsh", "--readonly", "--connect", "qemu:///system")
     command = (*prefix, "domjobinfo", "guest", "--completed", "--keep-completed",
                "--anystats", "--rawstats")
     runner = FakeCommandRunner({command: (0, job_info, "")})
@@ -223,7 +223,7 @@ def test_completed_job_inspection_preserves_type_operation_and_result(
 def test_completed_job_no_stats_failure_and_malformed_are_distinct(
     returncode, stdout, stderr, available,
 ):
-    prefix = ("virsh", "--connect", "qemu:///system")
+    prefix = ("virsh", "--readonly", "--connect", "qemu:///system")
     command = (*prefix, "domjobinfo", "guest", "--completed", "--keep-completed",
                "--anystats", "--rawstats")
     inspection = VirshLibvirtDriver(FakeCommandRunner({

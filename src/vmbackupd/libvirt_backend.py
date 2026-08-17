@@ -134,7 +134,7 @@ class VirshLibvirtDriver:
         self.timeout = timeout
 
     def _virsh(self, *args: str, allow_failure: bool = False) -> str | None:
-        argv = ("virsh", "--connect", self.connection_uri, *args)
+        argv = ("virsh", "--readonly", "--connect", self.connection_uri, *args)
         result = self.runner.run(argv, timeout=self.timeout)
         if result.returncode != 0:
             if allow_failure:
@@ -144,7 +144,8 @@ class VirshLibvirtDriver:
 
     def _virsh_result(self, *args: str):
         return self.runner.run(
-            ("virsh", "--connect", self.connection_uri, *args), timeout=self.timeout
+            ("virsh", "--readonly", "--connect", self.connection_uri, *args),
+            timeout=self.timeout,
         )
 
     def version(self) -> str:

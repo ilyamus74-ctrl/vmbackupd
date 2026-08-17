@@ -163,6 +163,11 @@ repository. It requires explicit mutation opt-in and accepts only FULL plans for
 full-only policies. The only hypervisor mutation is `backup-begin`; there is no
 automatic abort or libvirt cleanup.
 
+The libvirt connection boundary is enforced as well as the command boundary:
+all connected inspection, preflight, and reconciliation commands use
+`virsh --readonly --connect URI`, while the separate `VirshBackupDriver` uses a
+normal read-write connection solely for `backup-begin`.
+
 External state progresses through `PLANNED`, `START_REQUESTED`, `RUNNING`, and
 `COMPLETED`, with ambiguous started work moving to `UNKNOWN`. `START_REQUESTED`
 is committed before command invocation. Semantic observation of the exact
@@ -263,9 +268,13 @@ nor migrate databases; schema migration remains an application-startup
 transaction. Package removal does not delete state or backup data. Binary RPM
 and SRPM builds, digest checks, and payload/dependency/scriptlet inspection have
 passed. Isolated RPM install/reinstall/erase lifecycle validation has also
-passed in a Fedora 41
-alternate root, including account creation, disabled service state, tmpfiles
+passed in a Fedora 41 alternate root, including account creation, disabled
+service state, tmpfiles
 ownership, `%config(noreplace)`, and mutable state/data preservation. A real
-production unit run as `vmbackupd` and SELinux Enforcing policy/label
-validation remain incomplete release gates, so this is not yet a production
-readiness claim. See [`packaging.md`](packaging.md).
+packaged service run as `vmbackupd` has passed for the mutation-disabled
+profile: read-only discovery/inspection worked, intentional backup execution
+was rejected, restart preserved Node identity, and existing backup data was
+unchanged. SELinux Enforcing policy/label validation and packaged-account
+authorization for the separate read-write `backup-begin` boundary remain
+incomplete release gates, so this is not yet a production readiness claim. See
+[`packaging.md`](packaging.md).

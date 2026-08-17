@@ -77,10 +77,30 @@ def test_domain_disk_parser_handles_file_block_and_ignores_cdrom():
 
 
 def test_virsh_driver_uses_argv_and_configurable_uri():
-    argv = ("virsh", "--connect", "test:///default", "dumpxml", "guest-id")
+    argv = (
+        "virsh", "--readonly", "--connect", "test:///default", "dumpxml", "guest-id",
+    )
     runner = FakeCommandRunner({argv: (0, DOMAIN_XML, "")})
     driver = VirshLibvirtDriver(runner, "test:///default")
     assert driver.domain_xml("guest-id") == DOMAIN_XML.strip()
+    assert runner.calls == [(argv, 30)]
+
+
+def test_virsh_result_path_uses_readonly_connection_before_connect():
+    job_argv = (
+        "virsh", "--readonly", "--connect", "test:///default",
+        "domjobinfo", "guest-id", "--rawstats",
+    )
+    runner = FakeCommandRunner({job_argv: (0, "Job type: None\n", "")})
+    inspection = VirshLibvirtDriver(runner, "test:///default").inspect_backup("guest-id")
+    assert inspection.state.value == "NONE"
+    assert runner.calls == [(job_argv, 30)]
+
+
+def test_virsh_version_does_not_open_connected_session():
+    argv = ("virsh", "--version")
+    runner = FakeCommandRunner({argv: (0, "10.6.0\n", "")})
+    assert VirshLibvirtDriver(runner).version() == "10.6.0"
     assert runner.calls == [(argv, 30)]
 
 

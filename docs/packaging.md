@@ -110,9 +110,31 @@ their contents, and saved the edited configuration as `.rpmsave`.
 The synthetic installroot emitted `/proc`/`/sys`-related systemd warnings
 because those virtual filesystems were not mounted. This is an environment
 limitation rather than a vmbackupd lifecycle failure; tmpfiles behavior was
-validated separately with `systemd-tmpfiles --root`. Still pending are a real
-production-unit run as `User=vmbackupd` and SELinux Enforcing policy/label
-validation. These gaps prevent a claim of production readiness.
+validated separately with `systemd-tmpfiles --root`.
+
+Phase 3D.3 production-service probing identified that inspection commands had
+used a normal libvirt connection, which requested `org.libvirt.unix.manage`
+authorization in the hardened non-interactive unit. The inspection driver now
+opens `virsh --readonly --connect URI`; the separate `backup-begin` mutation
+driver remains read-write.
+
+The rebuilt and installed RPM then passed real Fedora 41 production-service
+validation for the mutation-disabled profile. The packaged hardening ran the
+daemon as `User=vmbackupd`, `Group=vmbackupd`, with supplementary group `qemu`;
+the service remained disabled unless explicitly started. `daemon.status`
+reported a running runtime, schema version 1, mutation disabled, and no
+recovery-required runs. The local API discovered the running test domain and
+read-only `dumpxml`, `domblkinfo`, checkpoint, snapshot, and job inspection all
+succeeded. `backup.run` was rejected with `MUTATION_DISABLED` (CLI exit 4), so
+no real backup was executed. Restart preserved the Node identity while creating
+a new daemon instance. Existing backup qcow2 metadata—device, inode, size,
+mode, and owner—was unchanged after this validation.
+
+This does not establish production readiness. SELinux Enforcing policy/label
+validation remains pending, as does non-interactive authorization for the
+separate read-write `VirshBackupDriver` command
+`virsh --connect URI backup-begin ... --reuse-external` when run as the packaged
+account.
 
 ## Upgrade and removal
 
@@ -132,4 +154,6 @@ The Fedora 41 development host can validate function and RPM structure but is
 not the final support baseline. SELinux Enforcing behavior is an explicit
 production-release blocker: the current host has SELinux disabled, and the
 backup-data/control/socket labels and any required policy must be designed and
-tested separately. The package never disables or modifies SELinux.
+tested separately. Non-interactive authorization for packaged-account
+`backup-begin` execution is also unvalidated. The package never disables or
+modifies SELinux.

@@ -9,6 +9,10 @@ executor.
 
 ## Mutation and staging boundaries
 
+Inspection, final preflight, polling, and reconciliation use the separate
+`VirshLibvirtDriver` boundary and connect with `virsh --readonly --connect URI`.
+The mutation driver deliberately does not use `--readonly`.
+
 `VirshBackupDriver` exposes one mutation and invokes it with an argv list:
 
 ```text

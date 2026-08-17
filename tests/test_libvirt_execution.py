@@ -445,6 +445,7 @@ def test_mutating_driver_surface_is_exact_argv_with_restricted_reuse_external(tm
     )
     assert runner.calls == [(command, 3)]
     assert command[-1] == "--reuse-external"
+    assert "--readonly" not in command
 
 
 def test_qemu_output_preparation_is_argv_only_exclusive_and_identity_checked(tmp_path):
@@ -578,7 +579,8 @@ def test_qemu_image_inspector_is_read_only_json_argv():
 
 def test_virsh_domblkinfo_returns_structured_byte_sizes():
     command = (
-        "virsh", "--connect", "test:///default", "domblkinfo", "domain-uuid", "vda"
+        "virsh", "--readonly", "--connect", "test:///default",
+        "domblkinfo", "domain-uuid", "vda",
     )
     runner = FakeCommandRunner({
         command: (0, "Capacity: 107374182400\nAllocation: 4096\nPhysical: 8192\n", "")
@@ -600,7 +602,8 @@ def test_virsh_domblkinfo_returns_structured_byte_sizes():
 ])
 def test_virsh_domblkinfo_rejects_untrustworthy_capacity(output):
     command = (
-        "virsh", "--connect", "test:///default", "domblkinfo", "domain-uuid", "vda"
+        "virsh", "--readonly", "--connect", "test:///default",
+        "domblkinfo", "domain-uuid", "vda",
     )
     driver = VirshLibvirtDriver(
         FakeCommandRunner({command: (0, output, "")}), "test:///default"

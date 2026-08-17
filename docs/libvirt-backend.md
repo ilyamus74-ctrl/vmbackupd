@@ -3,7 +3,12 @@
 ## Live block sizing boundary
 
 Capacity planning for an attached disk uses the read-only command
-`virsh --connect URI domblkinfo DOMAIN TARGET`. The driver parses byte-valued
+`virsh --readonly --connect URI domblkinfo DOMAIN TARGET`. Every connected
+inspection performed by `VirshLibvirtDriver` uses an actual libvirt read-only
+connection, including discovery, identity/XML/state queries, checkpoint and
+snapshot metadata, active/completed job inspection, backup XML, and block
+sizing. (`virsh --version` is local version reporting and opens no connection.)
+The driver parses byte-valued
 `Capacity`, `Allocation`, and `Physical` fields under the C locale, requires a
 positive unambiguous capacity, and treats the latter two fields as optional.
 The executor queries the persisted domain identity and frozen `RunDisk` target;
