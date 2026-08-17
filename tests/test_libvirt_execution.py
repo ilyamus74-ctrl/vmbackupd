@@ -9,8 +9,9 @@ import pytest
 from vmbackupd.clock import FakeClock
 from vmbackupd.command import CommandResult, FakeCommandRunner
 from vmbackupd.libvirt_backend import (
-    BackupInspection, CompletedJobInspection, DomainJobOperation, DomainJobState,
-    DomainJobType, LibvirtPlanningService, StagingPathPlanner,
+    BackupInspection, CompletedJobInspection, DomainBlockInfo, DomainJobOperation,
+    DomainJobState, DomainJobType, LibvirtPlanningService, StagingPathPlanner,
+    VirshLibvirtDriver,
 )
 from vmbackupd.libvirt_execution import (
     ImageInfo, LibvirtBackupExecutor, LibvirtExecutionSafetyError,
@@ -40,6 +41,11 @@ class ReadDriver:
         self.completed = CompletedJobInspection(
             False, DomainJobType.NONE, DomainJobOperation.UNKNOWN
         )
+        self.block_info = {
+            "vda": DomainBlockInfo(1024),
+            "vdb": DomainBlockInfo(1024),
+        }
+        self.block_info_calls = []
 
     def domain_uuid(self, external_id):
         return self.uuid
@@ -61,6 +67,13 @@ class ReadDriver:
 
     def inspect_completed_job(self, external_id):
         return self.completed
+
+    def domain_block_info(self, external_id, target_dev):
+        self.block_info_calls.append((external_id, target_dev))
+        value = self.block_info[target_dev]
+        if isinstance(value, Exception):
+            raise value
+        return value
 
 
 class Images:
@@ -216,6 +229,52 @@ def test_insufficient_free_space_blocks_start(execution):
     value, mutation = executor(execution, minimum_free_bytes=10**30)
     assert value.advance_run(execution[3].id).state is RunState.CLEANUP
     assert mutation.calls == []
+    assert not execution[5].run_directory(execution[3].id).exists()
+    assert not execution[5].data_run_directory(execution[3].id).exists()
+
+
+def test_live_capacity_uses_libvirt_targets_and_not_source_qemu_img(execution):
+    images = Images()
+    value, mutation = executor(execution, images=images)
+    value.advance_run(execution[3].id)
+    assert execution[4].block_info_calls == [
+        ("domain-uuid", "vda"), ("domain-uuid", "vdb")
+    ]
+    assert images.paths == []
+    assert mutation.calls
+
+
+def test_capacity_sums_enabled_disks_and_excludes_disabled(execution):
+    _, _, _, run, driver, *_ = execution
+    driver.block_info = {
+        "vda": DomainBlockInfo(100),
+        "vdb": DomainBlockInfo(250),
+    }
+    value, _ = executor(execution)
+    disks = list(execution[0].list_run_disks(run.id))
+    disabled = type(disks[1])(
+        disks[1].run_id, disks[1].target_dev, disks[1].source_type,
+        disks[1].source_path, disks[1].source_format, False,
+        disks[1].planned_artifact_id,
+    )
+    assert value._capacity_estimate("domain-uuid", (disks[0], disabled)) == 100
+    assert driver.block_info_calls == [("domain-uuid", "vda")]
+
+
+@pytest.mark.parametrize("bad", [
+    RuntimeError("malformed domblkinfo"),
+    DomainBlockInfo(0),
+    DomainBlockInfo(-1),
+])
+def test_untrustworthy_block_capacity_fails_before_staging_or_backup_begin(execution, bad):
+    execution[4].block_info["vda"] = bad
+    value, mutation = executor(execution)
+    result = value.advance_run(execution[3].id)
+    assert result.state is RunState.CLEANUP
+    assert "block capacity inspection failed" in (result.error or "")
+    assert mutation.calls == []
+    assert not execution[5].run_directory(result.id).exists()
+    assert not execution[5].data_run_directory(result.id).exists()
 
 
 def test_start_requested_is_committed_before_command_and_success_becomes_running(execution):
@@ -368,6 +427,59 @@ def test_qemu_image_inspector_is_read_only_json_argv():
     })
     assert QemuImageInspector(runner).inspect("/image") == ImageInfo("qcow2", 4096, 4)
     assert runner.calls == [(command, 15)]
+
+
+def test_virsh_domblkinfo_returns_structured_byte_sizes():
+    command = (
+        "virsh", "--connect", "test:///default", "domblkinfo", "domain-uuid", "vda"
+    )
+    runner = FakeCommandRunner({
+        command: (0, "Capacity: 107374182400\nAllocation: 4096\nPhysical: 8192\n", "")
+    })
+    driver = VirshLibvirtDriver(runner, "test:///default")
+    assert driver.domain_block_info("domain-uuid", "vda") == DomainBlockInfo(
+        107374182400, 4096, 8192
+    )
+    assert runner.calls == [(command, 30)]
+
+
+@pytest.mark.parametrize("output", [
+    "Allocation: 1\n",
+    "Capacity: 0\n",
+    "Capacity: -1\n",
+    "Capacity: not-a-number\n",
+    "Capacity: 10\nCapacity: 11\n",
+    "Capacity 10\n",
+])
+def test_virsh_domblkinfo_rejects_untrustworthy_capacity(output):
+    command = (
+        "virsh", "--connect", "test:///default", "domblkinfo", "domain-uuid", "vda"
+    )
+    driver = VirshLibvirtDriver(
+        FakeCommandRunner({command: (0, output, "")}), "test:///default"
+    )
+    with pytest.raises(RuntimeError, match="block capacity inspection failed"):
+        driver.domain_block_info("domain-uuid", "vda")
+
+
+def test_completed_backup_outputs_still_use_qemu_img_during_verification(execution):
+    images = Images()
+    value = start(execution)
+    operation = execution[0].get_libvirt_operation(execution[3].id)
+    execution[4].active = BackupInspection(DomainJobState.BACKUP, operation.backup_xml)
+    value.advance_run(execution[3].id)
+    execution[4].active = BackupInspection(DomainJobState.NONE)
+    execution[4].completed = CompletedJobInspection(
+        True, DomainJobType.COMPLETED, DomainJobOperation.BACKUP, True
+    )
+    value.advance_run(execution[3].id)
+    value.advance_run(execution[3].id)
+    data_dir = execution[5].data_run_directory(execution[3].id)
+    (data_dir / "vda.qcow2").write_bytes(b"a")
+    (data_dir / "vdb.qcow2").write_bytes(b"b")
+    value.image_inspector = images
+    value.advance_run(execution[3].id)
+    assert images.paths == [str(data_dir / "vda.qcow2"), str(data_dir / "vdb.qcow2")]
 
 
 def test_planned_artifacts_separate_control_and_backup_data_roots(execution):

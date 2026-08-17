@@ -26,6 +26,15 @@ class DomainDisk:
 
 
 @dataclass(frozen=True, slots=True)
+class DomainBlockInfo:
+    """Byte-valued size metadata reported by libvirt for an attached disk."""
+
+    capacity: int
+    allocation: int | None = None
+    physical: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class PreflightIssue:
     code: str
     message: str
@@ -170,6 +179,47 @@ class VirshLibvirtDriver:
 
     def domain_state(self, external_id: str) -> str:
         return str(self._virsh("domstate", external_id)).strip().lower()
+
+    def domain_block_info(self, external_id: str, target_dev: str) -> DomainBlockInfo:
+        """Inspect an attached block device without opening its source image."""
+        try:
+            output = str(self._virsh("domblkinfo", external_id, target_dev))
+        except CommandError as exc:
+            raise RuntimeError(
+                f"block capacity inspection failed for {target_dev}: {exc}"
+            ) from exc
+        values: dict[str, int] = {}
+        for line in output.splitlines():
+            if not line.strip():
+                continue
+            match = re.fullmatch(r"\s*(Capacity|Allocation|Physical)\s*:\s*([^\s]+)\s*", line)
+            if match is None:
+                raise RuntimeError(
+                    f"block capacity inspection failed for {target_dev}: malformed output"
+                )
+            key, raw_value = match.groups()
+            normalized = key.lower()
+            if normalized in values or not re.fullmatch(r"[0-9]+", raw_value):
+                raise RuntimeError(
+                    f"block capacity inspection failed for {target_dev}: ambiguous {key}"
+                )
+            value = int(raw_value)
+            if value < 0:
+                raise RuntimeError(
+                    f"block capacity inspection failed for {target_dev}: negative {key}"
+                )
+            values[normalized] = value
+        capacity = values.get("capacity")
+        if capacity is None or capacity <= 0:
+            raise RuntimeError(
+                f"block capacity inspection failed for {target_dev}: "
+                "missing or non-positive Capacity"
+            )
+        return DomainBlockInfo(
+            capacity=capacity,
+            allocation=values.get("allocation"),
+            physical=values.get("physical"),
+        )
 
     def checkpoint_names(self, external_id: str) -> tuple[str, ...]:
         output = str(self._virsh("checkpoint-list", external_id, "--name"))

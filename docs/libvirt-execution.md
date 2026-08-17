@@ -34,8 +34,15 @@ mutation. Ambiguous state is quarantined instead of aborted or retried.
 Both roots are configurable. Before start, the executor repeats identity,
 running-state, domain-job, disk-inventory, destination-collision, and free-space
 checks. Capacity is the sum of source virtual sizes reported by read-only
-`qemu-img info --output=json`. Free space is measured on the backup-data
-filesystem; byte and percentage reserves must remain after the estimate.
+`virsh domblkinfo DOMAIN TARGET` queries for the persisted domain identity and
+each frozen, backup-enabled disk target. The conservative requirement is the
+sum of full virtual `Capacity`, not current allocation. vmbackupd deliberately
+does not open an attached live source image with `qemu-img`: QEMU holds its
+image lock, and shared inspection of concurrently modified image metadata is
+not treated as trustworthy. Free space is measured on the backup-data
+filesystem; byte and percentage reserves must remain after the estimate. A
+missing, malformed, zero, or negative libvirt capacity refuses the backup
+before staging or `backup-begin`.
 
 The control directory is mode 0700. vmbackupd may create the QEMU data directory
 with an explicit non-world-writable mode and optional configured UID/GID, but
@@ -81,6 +88,10 @@ parse and contain the persisted UUID. A deterministic JSON manifest records
 run, VM, domain and disk identities, artifact paths, sizes and formats,
 crash-consistent application consistency, structural verification level, and a
 null Phase 3B checkpoint.
+
+These inspection roles are intentionally distinct: live source sizing uses
+libvirt `domblkinfo`, while `qemu-img info` is used only on completed backup
+outputs during structural verification.
 
 Artifacts progress through constrained repository transitions to `VERIFIED`.
 Existing atomic finalization then publishes all artifacts, the AVAILABLE restore

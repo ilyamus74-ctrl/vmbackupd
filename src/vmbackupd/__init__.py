@@ -4,7 +4,7 @@ from .engine import MockBackupEngine
 from .clock import FakeClock, SystemClock
 from .command import FakeCommandRunner, SubprocessCommandRunner
 from .libvirt_backend import (
-    BackupIdentity, BackupInspection, CompletedJobInspection, DomainJobOperation,
+    BackupIdentity, BackupInspection, CompletedJobInspection, DomainBlockInfo, DomainJobOperation,
     DomainJobState, DomainJobType, LibvirtPlanningService, LibvirtPreflight,
     RecoveryEvidence, StagingPathPlanner, VirshLibvirtDriver,
 )
@@ -27,6 +27,7 @@ __all__ = [
     "CompletedJobInspection",
     "DaemonRuntime",
     "DomainJobOperation",
+    "DomainBlockInfo",
     "DomainJobState",
     "DomainJobType",
     "FakeClock",

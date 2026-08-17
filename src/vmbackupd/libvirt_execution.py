@@ -381,7 +381,7 @@ class LibvirtBackupExecutor:
             raise LibvirtExecutionSafetyError("; ".join(
                 f"{issue.code}: {issue.message}" for issue in preflight.errors
             ))
-        estimate = self._capacity_estimate(plan.disks)
+        estimate = self._capacity_estimate(operation.domain_uuid, plan.disks)
         free, total = self.staging.free_space()
         reserve = max(self.minimum_free_bytes, int(total * self.minimum_free_percent / 100))
         if estimate > free - reserve:
@@ -587,17 +587,23 @@ class LibvirtBackupExecutor:
         self.staging.cleanup_metadata(run_id, self.repository.list_artifacts_for_run(run_id))
         return self.repository.finish_cleanup(run_id)
 
-    def _capacity_estimate(self, disks: tuple[RunDisk, ...]) -> int:
+    def _capacity_estimate(self, domain: str, disks: tuple[RunDisk, ...]) -> int:
         total = 0
         for disk in disks:
-            if not disk.backup_enabled or not disk.source_path:
+            if not disk.backup_enabled:
                 continue
-            info = self.image_inspector.inspect(disk.source_path)
-            if info.virtual_size <= 0:
+            try:
+                info = self.read_driver.domain_block_info(domain, disk.target_dev)
+            except Exception as exc:
                 raise LibvirtExecutionSafetyError(
-                    f"cannot estimate virtual size for {disk.target_dev}"
+                    f"block capacity inspection failed for {disk.target_dev}: {exc}"
+                ) from exc
+            if info.capacity <= 0:
+                raise LibvirtExecutionSafetyError(
+                    f"block capacity inspection failed for {disk.target_dev}: "
+                    "Capacity must be positive"
                 )
-            total += info.virtual_size
+            total += info.capacity
         if total <= 0:
             raise LibvirtExecutionSafetyError("backup capacity cannot be estimated safely")
         return total

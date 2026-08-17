@@ -1,5 +1,20 @@
 # Libvirt backend planning
 
+## Live block sizing boundary
+
+Capacity planning for an attached disk uses the read-only command
+`virsh --connect URI domblkinfo DOMAIN TARGET`. The driver parses byte-valued
+`Capacity`, `Allocation`, and `Physical` fields under the C locale, requires a
+positive unambiguous capacity, and treats the latter two fields as optional.
+The executor queries the persisted domain identity and frozen `RunDisk` target;
+it never accepts an arbitrary source path for capacity inspection.
+
+The running VM's source image is intentionally not opened with `qemu-img info`,
+including shared/force-share modes: an attached qcow2 image is locked and may
+be concurrently modified. `qemu-img info` remains the read-only structural
+inspector for completed backup output after libvirt/QEMU has finished writing
+it.
+
 Phase 3A prepares persistent multi-disk backup plans and performs read-only
 libvirt inspection. It never modifies a domain, backup, checkpoint, or snapshot,
 and it creates no staging files.
