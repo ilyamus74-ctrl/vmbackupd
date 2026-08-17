@@ -246,6 +246,7 @@ class LibvirtBackupOperation:
     started_at: datetime | None = None
     last_polled_at: datetime | None = None
     completed_at: datetime | None = None
+    active_match_observed_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)

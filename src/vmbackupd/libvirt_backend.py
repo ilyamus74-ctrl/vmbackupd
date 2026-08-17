@@ -375,14 +375,30 @@ _SAFE_TARGET = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
 class StagingPathPlanner:
-    def __init__(self, root: str = "/var/lib/vmbackupd/staging") -> None:
-        self.root = PurePosixPath(root)
-        if not self.root.is_absolute() or ".." in self.root.parts:
-            raise ValueError("staging root must be an absolute traversal-free path")
+    def __init__(
+        self, control_root: str = "/var/lib/vmbackupd/control",
+        backup_data_root: str | None = None,
+    ) -> None:
+        self.control_root = PurePosixPath(control_root)
+        if backup_data_root is None:
+            backup_data_root = "/var/lib/libvirt/images/vmbackupd"
+        self.backup_data_root = PurePosixPath(backup_data_root)
+        for label, root in (("control", self.control_root),
+                            ("backup data", self.backup_data_root)):
+            if not root.is_absolute() or ".." in root.parts:
+                raise ValueError(f"{label} root must be absolute and traversal-free")
+        if self.control_root == self.backup_data_root:
+            raise ValueError("control and backup data roots must be separate")
+        # Compatibility for callers that inspect the former single-root property.
+        self.root = self.control_root
 
     def _run_root(self, run_id: str) -> PurePosixPath:
         self._validate_component(run_id, "run ID")
-        return self.root / run_id
+        return self.control_root / run_id
+
+    def _data_run_root(self, run_id: str) -> PurePosixPath:
+        self._validate_component(run_id, "run ID")
+        return self.backup_data_root / run_id
 
     @staticmethod
     def _validate_component(value: str, label: str) -> None:
@@ -391,7 +407,7 @@ class StagingPathPlanner:
 
     def disk(self, run_id: str, target: str) -> str:
         self._validate_component(target, "disk target")
-        return str(self._run_root(run_id) / f"{target}.qcow2")
+        return str(self._data_run_root(run_id) / f"{target}.qcow2")
 
     def domain_xml(self, run_id: str) -> str:
         return str(self._run_root(run_id) / "domain.xml")

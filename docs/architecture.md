@@ -141,3 +141,37 @@ and can preserve completed-success, failure, cancellation, no-evidence, and
 unknown outcomes for future Phase 3B decisions. Retention derives future
 deletion candidates from every published artifact rather than the legacy first
 object.
+
+## Phase 3B cooperative FULL execution
+
+The first execution backend composes the immutable plan, read-only inspection,
+a one-command mutation driver, staging filesystem, image inspector, and
+repository. It requires explicit mutation opt-in and accepts only FULL plans for
+full-only policies. The only hypervisor mutation is `backup-begin`; there is no
+automatic abort or libvirt cleanup.
+
+External state progresses through `PLANNED`, `START_REQUESTED`, `RUNNING`, and
+`COMPLETED`, with ambiguous started work moving to `UNKNOWN`. `START_REQUESTED`
+is committed before command invocation. Semantic observation of the exact
+active backup is persisted separately from completed statistics so another
+run's completion cannot publish this run's restore point.
+
+Execution and structural verification are cooperative. A running backup is
+polled once per daemon tick while the runtime independently renews its VM lease.
+Local `TRANSFERRING` is a no-op pending a peer layer. Verified multi-artifact
+output continues through the existing atomic publication transaction. See
+[`libvirt-execution.md`](libvirt-execution.md).
+
+Phase 3B.1 separates daemon-owned control artifacts from QEMU-created disk data,
+including independently configurable roots and free-space accounting on the
+data filesystem. Data-directory mode and optional ownership are explicit; no
+QEMU UID/GID is embedded in the backend.
+
+Fast completed backups are accepted without active-match observation only for
+an uninterrupted executor call fenced by the live node controller and VM lease.
+Recovery and takeover paths retain conservative identity requirements.
+
+The product has one daemon backend serving both the future first-class console
+client and Cockpit GUI through one local API. RPM/DNF is the required deployment
+model. See [`product-roadmap.md`](product-roadmap.md) and
+[`installation-layout.md`](installation-layout.md).

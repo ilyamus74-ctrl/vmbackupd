@@ -1,0 +1,67 @@
+# vmbackupd product roadmap
+
+This is the agreed product architecture and implementation order, not a list of
+independent feature ideas.
+
+## One backend, three product surfaces
+
+The final product has one backup backend and three delivery/control surfaces:
+
+1. `vmbackupd`, the persistent daemon and sole backup orchestrator.
+2. `vmbackupctl`, a first-class console client.
+3. `cockpit-vmbackupd`, a first-class Cockpit GUI package.
+
+Installation and lifecycle management use RPM packages and DNF. Neither CLI nor
+Cockpit may independently implement backup, recovery, retention, scheduling, or
+libvirt logic. Both call the same local vmbackupd API:
+
+```text
+                       Cockpit
+                          |
+                          v
+                    vmbackupd API
+                          ^
+                          |
+                     vmbackupctl
+
+                          |
+                          v
+                     vmbackupd core
+                          |
+                  libvirt / QEMU
+```
+
+The Phase 3C API is expected to support operations equivalent to:
+
+```text
+node list
+vm list
+job list
+job create/update
+backup run
+run list/show
+restore-point list/show
+daemon status
+recovery list/show
+```
+
+Exact command spellings and wire schemas remain Phase 3C decisions. Cockpit
+will consume equivalent API operations rather than invoke the console client.
+
+## Agreed sequence
+
+- Phase 3B.1: first-real-backup safety hardening.
+- Phase 3C: long-running daemon process, UNIX-domain local API, `vmbackupctl`,
+  and configuration model.
+- Integration: first real FULL backup on the development laptop.
+- Phase 3D: RPM packaging, systemd service, filesystem/system-user ownership,
+  and DNF installation, update, and removal.
+- Phase 3E: the `cockpit-vmbackupd` Cockpit package.
+- Phase 3F: remote destinations and peer-node communication.
+- Phase 4: checkpoint-capable FULL and incremental backup.
+- Later: restore execution, retention deletion, deeper verification, and remote
+  replication.
+
+GitHub, COPR, and Fedora repositories are future publishing channels. Choosing
+one does not change the daemon/API/client architecture or permit
+distribution-specific backup logic.

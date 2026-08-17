@@ -124,6 +124,7 @@ class SQLiteRepository:
                     ('PLANNED', 'START_REQUESTED', 'RUNNING', 'COMPLETED',
                      'ABORT_REQUESTED', 'UNKNOWN')),
                 started_at TEXT, last_polled_at TEXT, completed_at TEXT
+                , active_match_observed_at TEXT
             );
             CREATE TABLE IF NOT EXISTS events (
                 id TEXT PRIMARY KEY, job_run_id TEXT REFERENCES job_runs(id),
@@ -358,14 +359,16 @@ class SQLiteRepository:
 
     def add_libvirt_operation(self, operation: LibvirtBackupOperation) -> None:
         self.connection.execute(
-            "INSERT INTO libvirt_backup_operations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO libvirt_backup_operations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (operation.run_id, operation.domain_uuid, operation.domain_name,
              operation.connection_uri, operation.backup_mode, operation.checkpoint_name,
              operation.incremental_base_checkpoint, operation.backup_xml,
              operation.checkpoint_xml, operation.external_state,
              operation.started_at.isoformat() if operation.started_at else None,
              operation.last_polled_at.isoformat() if operation.last_polled_at else None,
-             operation.completed_at.isoformat() if operation.completed_at else None),
+             operation.completed_at.isoformat() if operation.completed_at else None,
+             operation.active_match_observed_at.isoformat()
+             if operation.active_match_observed_at else None),
         )
         self.connection.commit()
 
@@ -416,7 +419,7 @@ class SQLiteRepository:
                      disk.source_format, int(disk.backup_enabled), disk.planned_artifact_id),
                 )
             self.connection.execute(
-                "INSERT INTO libvirt_backup_operations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO libvirt_backup_operations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (run_id, operation.domain_uuid, operation.domain_name,
                  operation.connection_uri, operation.backup_mode,
                  operation.checkpoint_name, operation.incremental_base_checkpoint,
@@ -424,7 +427,9 @@ class SQLiteRepository:
                  operation.external_state,
                  operation.started_at.isoformat() if operation.started_at else None,
                  operation.last_polled_at.isoformat() if operation.last_polled_at else None,
-                 operation.completed_at.isoformat() if operation.completed_at else None),
+                 operation.completed_at.isoformat() if operation.completed_at else None,
+                 operation.active_match_observed_at.isoformat()
+                 if operation.active_match_observed_at else None),
             )
 
     def get_libvirt_operation(self, run_id: str) -> LibvirtBackupOperation | None:
@@ -443,7 +448,113 @@ class SQLiteRepository:
             started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
             last_polled_at=datetime.fromisoformat(row["last_polled_at"]) if row["last_polled_at"] else None,
             completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
+            active_match_observed_at=datetime.fromisoformat(row["active_match_observed_at"])
+            if row["active_match_observed_at"] else None,
         )
+
+    def transition_libvirt_external_state(
+        self, run_id: str, target: LibvirtExternalState, now: datetime,
+        *, message: str | None = None,
+    ) -> LibvirtBackupOperation:
+        """Advance the Phase 3B external-state machine transactionally."""
+        operation = self.get_libvirt_operation(run_id)
+        if operation is None:
+            raise DomainInvariantError("run has no libvirt operation")
+        allowed = {
+            LibvirtExternalState.PLANNED: {LibvirtExternalState.START_REQUESTED},
+            LibvirtExternalState.START_REQUESTED: {
+                LibvirtExternalState.RUNNING, LibvirtExternalState.UNKNOWN,
+            },
+            LibvirtExternalState.RUNNING: {
+                LibvirtExternalState.COMPLETED, LibvirtExternalState.UNKNOWN,
+            },
+        }
+        if target not in allowed.get(operation.external_state, set()):
+            raise DomainInvariantError(
+                f"invalid libvirt external transition {operation.external_state} -> {target}"
+            )
+        event_types = {
+            LibvirtExternalState.START_REQUESTED: "LIBVIRT_BACKUP_START_REQUESTED",
+            LibvirtExternalState.RUNNING: "LIBVIRT_BACKUP_STARTED",
+            LibvirtExternalState.COMPLETED: "LIBVIRT_BACKUP_COMPLETED",
+            LibvirtExternalState.UNKNOWN: "LIBVIRT_BACKUP_UNKNOWN",
+        }
+        started_at = now.isoformat() if target is LibvirtExternalState.RUNNING else None
+        completed_at = now.isoformat() if target is LibvirtExternalState.COMPLETED else None
+        with self.connection:
+            self.connection.execute(
+                """UPDATE libvirt_backup_operations SET external_state = ?,
+                   started_at = COALESCE(started_at, ?), last_polled_at = ?,
+                   completed_at = COALESCE(completed_at, ?) WHERE run_id = ?""",
+                (target, started_at, now.isoformat(), completed_at, run_id),
+            )
+            self._insert_event(Event(
+                job_run_id=run_id, event_type=event_types[target],
+                message=message or f"libvirt external state is {target}", created_at=now,
+            ))
+        return self.get_libvirt_operation(run_id)  # type: ignore[return-value]
+
+    def record_libvirt_poll(self, run_id: str, now: datetime) -> LibvirtBackupOperation:
+        operation = self.get_libvirt_operation(run_id)
+        if operation is None or operation.external_state is not LibvirtExternalState.RUNNING:
+            raise DomainInvariantError("only a RUNNING libvirt operation may be polled")
+        with self.connection:
+            self.connection.execute(
+                "UPDATE libvirt_backup_operations SET last_polled_at = ? WHERE run_id = ?",
+                (now.isoformat(), run_id),
+            )
+        return self.get_libvirt_operation(run_id)  # type: ignore[return-value]
+
+    def record_libvirt_active_match(
+        self, run_id: str, now: datetime,
+    ) -> LibvirtBackupOperation:
+        operation = self.get_libvirt_operation(run_id)
+        if operation is None or operation.external_state not in {
+            LibvirtExternalState.START_REQUESTED, LibvirtExternalState.RUNNING,
+        }:
+            raise DomainInvariantError("active match requires a started libvirt operation")
+        with self.connection:
+            self.connection.execute(
+                """UPDATE libvirt_backup_operations
+                   SET active_match_observed_at = COALESCE(active_match_observed_at, ?),
+                       last_polled_at = ? WHERE run_id = ?""",
+                (now.isoformat(), now.isoformat(), run_id),
+            )
+            if operation.active_match_observed_at is None:
+                self._insert_event(Event(
+                    job_run_id=run_id, event_type="LIBVIRT_BACKUP_ACTIVE_MATCH",
+                    message="observed the planned semantic backup identity active",
+                    created_at=now,
+                ))
+        return self.get_libvirt_operation(run_id)  # type: ignore[return-value]
+
+    def transition_artifact_state(
+        self, artifact_id: str, expected: ArtifactState, target: ArtifactState,
+        *, size_bytes: int | None = None, now: datetime | None = None,
+    ) -> BackupArtifact:
+        allowed = {
+            (ArtifactState.PLANNED, ArtifactState.WRITING),
+            (ArtifactState.PLANNED, ArtifactState.COMPLETE),
+            (ArtifactState.WRITING, ArtifactState.COMPLETE),
+            (ArtifactState.COMPLETE, ArtifactState.VERIFIED),
+        }
+        if (expected, target) not in allowed:
+            raise DomainInvariantError(f"unsupported artifact transition {expected} -> {target}")
+        artifact = self.get_artifact(artifact_id)
+        if artifact.state is not expected:
+            raise DomainInvariantError(
+                f"artifact {artifact_id} is {artifact.state}, expected {expected}"
+            )
+        if size_bytes is not None and size_bytes < 0:
+            raise DomainInvariantError("artifact size cannot be negative")
+        verified_at = (now or utcnow()).isoformat() if target is ArtifactState.VERIFIED else None
+        with self.connection:
+            self.connection.execute(
+                """UPDATE backup_artifacts SET state = ?, size_bytes = COALESCE(?, size_bytes),
+                   verified_at = COALESCE(?, verified_at) WHERE id = ?""",
+                (target, size_bytes, verified_at, artifact_id),
+            )
+        return self.get_artifact(artifact_id)
 
     def get_persisted_libvirt_plan(self, run_id: str) -> PersistedLibvirtPlan | None:
         operation = self.get_libvirt_operation(run_id)
@@ -1062,6 +1173,21 @@ class SQLiteRepository:
             "SELECT * FROM execution_leases WHERE run_id = ?", (run_id,)
         ).fetchone()
         return self._lease(row) if row else None
+
+    def assert_run_execution_owned(
+        self, run_id: str, daemon_instance_id: str, now: datetime,
+    ) -> None:
+        """Fence a cooperative executor step to the live controller and VM lease."""
+        context = self._run_context(run_id)
+        node = self.connection.execute(
+            "SELECT node_id FROM vms WHERE id = ?", (context["vm_id"],)
+        ).fetchone()
+        assert node is not None
+        self._assert_controller(daemon_instance_id, node["node_id"], now)
+        lease = self.get_lease_for_run(run_id)
+        if (lease is None or lease.daemon_instance_id != daemon_instance_id
+                or lease.lease_expires_at <= now):
+            raise DomainInvariantError("daemon does not hold the live VM execution lease")
 
     def list_leases(self) -> list[ExecutionLease]:
         return [self._lease(row) for row in self.connection.execute("SELECT * FROM execution_leases")]

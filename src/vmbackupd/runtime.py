@@ -139,6 +139,9 @@ class DaemonRuntime:
 
     def _advance_run(self, run: JobRun) -> JobRun:
         try:
+            prepare = getattr(self.executor, "prepare_advance", None)
+            if prepare is not None:
+                prepare(run.id, self._instance(), self.clock.now())
             result = self.executor.advance_run(run.id)
         except Exception as exc:
             result = self._handle_executor_exception(run.id, exc)

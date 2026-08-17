@@ -8,6 +8,10 @@ from .libvirt_backend import (
     DomainJobState, DomainJobType, LibvirtPlanningService, LibvirtPreflight,
     RecoveryEvidence, StagingPathPlanner, VirshLibvirtDriver,
 )
+from .libvirt_execution import (
+    LibvirtBackupExecutor, LibvirtExecutionSafetyError, QemuImageInspector,
+    StagingFilesystem, VirshBackupDriver,
+)
 from .models import BackupPolicy, OverlapPolicy, RetentionPolicy, SchedulePolicy
 from .planner import BackupPlanner
 from .repository import SQLiteRepository
@@ -30,16 +34,21 @@ __all__ = [
     "IntervalScheduler",
     "LibvirtPlanningService",
     "LibvirtPreflight",
+    "LibvirtBackupExecutor",
+    "LibvirtExecutionSafetyError",
     "MockBackupEngine",
     "OverlapPolicy",
     "RetentionPlan",
     "RetentionPlanner",
     "RetentionPolicy",
     "RecoveryEvidence",
+    "QemuImageInspector",
     "SchedulePolicy",
     "SQLiteRepository",
     "StagingPathPlanner",
+    "StagingFilesystem",
     "SubprocessCommandRunner",
     "SystemClock",
     "VirshLibvirtDriver",
+    "VirshBackupDriver",
 ]

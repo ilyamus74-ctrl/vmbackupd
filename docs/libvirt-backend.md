@@ -43,14 +43,17 @@ XML. Only `<disk device='disk'>` devices are considered. File and block sources
 are initially supported; CD-ROM, floppy, passthrough filesystems, and unresolved
 source forms are ignored or reported as structured unsupported-source errors.
 
-No directory is created. The configurable planner generates only paths:
+Planning creates no directory. The configurable planner generates separated
+control and QEMU data paths:
 
 ```text
-/var/lib/vmbackupd/staging/<run-id>/
+<control-root>/<run-id>/
     domain.xml
+    manifest.json
+
+<backup-data-root>/<run-id>/
     vda.qcow2
     vdb.qcow2
-    manifest.json
 ```
 
 Run IDs and disk targets must be safe single path components; traversal and
@@ -131,3 +134,8 @@ backup may already have completed, so this is not evidence that it never started
 or is safe to restart. If completed statistics are absent or cannot prove the
 outcome, recovery stays conservative. Phase 3A does not adopt, abort, or resolve
 anything.
+
+Phase 3B execution is described in
+[`libvirt-execution.md`](libvirt-execution.md). The read-only driver remains
+separate from the narrowly scoped mutation driver. The first executable plans
+are FULL-only jobs with incrementals disabled and no checkpoint metadata.
