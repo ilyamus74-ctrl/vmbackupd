@@ -135,14 +135,21 @@ asyncio API repository. Health progresses through `STARTING`, `RUNNING`,
 `last_error`, stops runtime conservatively, and closes SQLite in the worker.
 The API remains available in diagnostic-only mode and rejects `backup.run` with
 `RUNTIME_UNAVAILABLE`. It does not automatically restart the worker or infer
-success for external work. Future systemd integration may choose process-level
-restart policy.
+success for external work. The Phase 3D.2 production unit applies
+`Restart=on-failure` at process level while preserving conservative startup
+recovery.
 
 Both the API and runtime connections independently pass through schema-version
 validation before use. SQLite's migration write transaction serializes the
 first opener; a second connection to an already-current database performs no
 schema mutation. WAL and busy-timeout coordination remain unchanged, and no
 connection crosses thread ownership boundaries.
+
+The packaged foreground daemon runs as the dedicated `vmbackupd` account.
+Systemd creates its 0750 runtime directory, sends SIGTERM on stop, and allows 30
+seconds for the current bounded cooperative step and clean controller/socket
+shutdown. Installing the RPM does not start a backup or explicitly start the
+unit.
 
 At startup, expired leases and leases owned by a fenced previous controller are
 removed and record `LEASE_EXPIRED`. An unsafe associated run is marked for

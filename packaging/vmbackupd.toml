@@ -1,0 +1,24 @@
+[daemon]
+node_name = "auto"
+database_path = "/var/lib/vmbackupd/state.db"
+socket_path = "/run/vmbackupd/vmbackupd.sock"
+socket_mode = "0660"
+tick_interval_seconds = 1
+controller_lease_seconds = 30
+execution_lease_seconds = 300
+
+[libvirt]
+uri = "qemu:///system"
+allow_mutation = false
+
+[storage]
+default_destination = "local-root"
+
+[[storage.destinations]]
+name = "local-root"
+control_root = "/var/lib/vmbackupd/control"
+backup_data_root = "/var/lib/libvirt/images/vmbackupd"
+backup_data_mode = "0750"
+backup_data_group = "qemu"
+minimum_free_bytes = 1073741824
+minimum_free_percent = 5

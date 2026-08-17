@@ -5,6 +5,7 @@ from __future__ import annotations
 import grp
 import os
 import pwd
+import socket
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -87,6 +88,7 @@ def load_config(
     user_lookup: Callable[[str], object] = pwd.getpwnam,
     group_lookup: Callable[[str], object] = grp.getgrnam,
     effective_uid: int | None = None,
+    hostname_lookup: Callable[[], str] = socket.gethostname,
 ) -> AppConfig:
     daemon_uid = os.geteuid() if effective_uid is None else effective_uid
     try:
@@ -97,6 +99,10 @@ def load_config(
     try:
         daemon_raw, libvirt_raw, storage_raw = raw["daemon"], raw["libvirt"], raw["storage"]
         node_name = str(daemon_raw["node_name"]).strip()
+        if node_name == "auto":
+            node_name = hostname_lookup().strip()
+            if not node_name:
+                raise ConfigError("daemon.node_name auto resolution returned an empty hostname")
         if not node_name:
             raise ConfigError("daemon.node_name cannot be empty")
         tick = float(daemon_raw.get("tick_interval_seconds", 1))

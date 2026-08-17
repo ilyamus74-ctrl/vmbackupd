@@ -1,7 +1,10 @@
 # vmbackupd core architecture
 
-This phase is a domain and persistence foundation only. It does not contact
-libvirt, QEMU, SSH, Cockpit, systemd, a network service, or a backup filesystem.
+vmbackupd now includes the domain/persistence core, cooperative local runtime,
+FULL-only libvirt push executor, UNIX API and CLI, schema migrations, and a
+Fedora-style production service/package profile. Remote networking, Cockpit,
+incremental execution, restore, retention deletion, and additional hypervisor
+mutations remain outside the implemented scope.
 
 ## Jobs and persisted policies
 
@@ -230,8 +233,7 @@ Fresh databases are created directly at `CURRENT_SCHEMA_VERSION`; known current
 unversioned databases are adopted without rebuilding operational tables, and
 the immediately preceding Phase 3C artifact layout is migrated transactionally.
 Unknown, malformed, damaged, or newer schemas fail closed. See
-[`database-schema.md`](database-schema.md). RPM packaging and upgrade policy are
-still not implemented.
+[`database-schema.md`](database-schema.md).
 
 StorageDestination is Node-owned local operational configuration. Names and the
 single default are scoped by `node_id`; job creation and runtime routing enforce
@@ -241,12 +243,29 @@ mutates another Node's destinations.
 Runtime worker health is explicit: `STARTING`, `RUNNING`, `STOPPING`, `STOPPED`,
 or `FAILED`. A fatal tick captures a safe error, conservatively stops runtime,
 and closes its repository in the worker thread. The process remains alive for
-diagnostics, but new backup runs are refused. Automatic worker restart is
-deliberately deferred because abandoned libvirt work needs reconciliation;
-future systemd policy may restart the process.
+diagnostics, but new backup runs are refused. Automatic in-process worker
+restart is deliberately absent because abandoned libvirt work needs
+reconciliation; the Phase 3D.2 systemd profile may restart the whole process
+with conservative startup recovery.
 
 Events carry nullable structured `node_id`. Run events derive ownership through
 run/job/VM relations; daemon and controller events persist their Node directly.
 Human-readable messages are never searched to make authorization or ownership
 decisions. Truly node-less global events are excluded from local operational
 event lists unless a future explicit global API defines their exposure.
+
+## Phase 3D.2 packaging boundary
+
+The repository provides Fedora RPM metadata, a dedicated unprivileged
+`vmbackupd` sysusers account, restrictive tmpfiles paths, production TOML, and a
+hardened foreground systemd unit. Package scriptlets neither execute backups
+nor migrate databases; schema migration remains an application-startup
+transaction. Package removal does not delete state or backup data. Binary RPM
+and SRPM builds, digest checks, and payload/dependency/scriptlet inspection have
+passed. Isolated RPM install/reinstall/erase lifecycle validation has also
+passed in a Fedora 41
+alternate root, including account creation, disabled service state, tmpfiles
+ownership, `%config(noreplace)`, and mutable state/data preservation. A real
+production unit run as `vmbackupd` and SELinux Enforcing policy/label
+validation remain incomplete release gates, so this is not yet a production
+readiness claim. See [`packaging.md`](packaging.md).

@@ -59,8 +59,10 @@ rule remains: no new valid restore point means no automatic backup deletion.
 
 ## Upgrade operations
 
-Phase 3D.1 provides migration infrastructure, not RPM packaging or automatic
-database backup. Until package upgrade/rollback policy is implemented,
-operators should make an external copy of SQLite metadata before package
-upgrades. No `.bak` is created automatically, and backup image objects are
-never part of database migration.
+Phase 3D.2 RPM scriptlets deliberately do not run migration or create automatic
+database backups. After package files are upgraded, the next daemon
+start/restart invokes the same transactional schema manager. Until a dedicated
+upgrade backup/rollback policy is implemented, operators should make an
+external copy of SQLite metadata before upgrades. No `.bak` is created
+automatically, and backup image objects are never part of database migration or
+package removal.

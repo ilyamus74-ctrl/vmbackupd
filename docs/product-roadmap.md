@@ -55,14 +55,22 @@ will consume equivalent API operations rather than invoke the console client.
   and configuration model.
 - Phase 3D.1: SQLite schema versioning, safe known-unversioned adoption, and
   ordered transactional migration infrastructure.
+- Phase 3D.2: Fedora RPM build metadata, dedicated system account, production
+  filesystem layout, tmpfiles/sysusers integration, and hardened systemd unit.
 - Integration: first real FULL backup on the development laptop.
-- Phase 3D: RPM packaging, systemd service, filesystem/system-user ownership,
-  and DNF installation, update, and removal.
+- Later Phase 3D.x: SELinux policy/labeling and Enforcing validation before the
+  RPM is declared production-ready.
 - Phase 3E: the `cockpit-vmbackupd` Cockpit package.
 - Phase 3F: remote destinations and peer-node communication.
 - Phase 4: checkpoint-capable FULL and incremental backup.
 - Later: restore execution, retention deletion, deeper verification, and remote
-  replication.
+replication.
+
+Phase 3E Cockpit storage screens must expose an explicit destination `Type`
+field from their first version. Initially the only displayed and supported type
+is `Local`. Phase 3F adds `SSH / rsync`. This prevents the UI from being shaped
+around local filesystem paths even though remote destination persistence and
+transport are intentionally not implemented yet.
 
 Future retention deletion is constrained by a permanent fail-safe contract:
 **no new valid backup means no automatic deletion**. Automatic expiration is a

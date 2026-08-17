@@ -3,6 +3,8 @@
 `vmbackupd` reads typed TOML using `tomllib`. The production-oriented default is
 `/etc/vmbackupd/vmbackupd.toml`; `--config PATH` supports source-tree and test
 operation. `config/vmbackupd.example.toml` is mutation-disabled.
+The RPM installs `packaging/vmbackupd.toml` at that production path as
+`%config(noreplace)` and also leaves mutation disabled.
 
 `[daemon]` defines local node identity, database/socket paths and mode, tick
 interval, and controller/execution lease lengths. `[libvirt]` defines URI and
@@ -11,6 +13,11 @@ explicit `default_destination` and contains one or more
 `[[storage.destinations]]` tables. Names are unique and the default must exist.
 Each destination independently configures control/data roots, directory mode,
 reserves, and optional user/group names.
+
+`daemon.node_name = "auto"` resolves to the local hostname during configuration
+loading. This avoids embedding a development hostname or generating a random
+Node identity. Operators should treat hostname changes as an identity change
+and configure an explicit stable name where host renaming is expected.
 
 Paths are absolute and traversal-free; roots differ; modes are octal and not
 world-writable; intervals and reserves are bounded. User/group names resolve
@@ -36,3 +43,7 @@ Database paths are opened through the versioned schema manager. Configuration
 cannot opt out of validation, force adoption of an unknown layout, request a
 downgrade, or replace an unsupported database. See
 [`database-schema.md`](database-schema.md).
+
+The packaged Fedora storage profile selects group `qemu` by name, never numeric
+GID. Startup fails clearly if the configured host group does not exist. See
+[`packaging.md`](packaging.md) for service-account requirements.

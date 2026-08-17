@@ -1,0 +1,36 @@
+[Unit]
+Description=vmbackupd virtual machine backup daemon
+Documentation=file:///usr/share/doc/vmbackupd/packaging.md
+After=local-fs.target libvirtd.service virtqemud.socket
+
+[Service]
+Type=simple
+User=vmbackupd
+Group=vmbackupd
+SupplementaryGroups=qemu
+ExecStart=/usr/bin/vmbackupd --config /etc/vmbackupd/vmbackupd.toml
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+RuntimeDirectory=vmbackupd
+RuntimeDirectoryMode=0750
+StateDirectory=vmbackupd
+StateDirectoryMode=0750
+UMask=0007
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ReadWritePaths=/var/lib/vmbackupd /var/lib/libvirt/images/vmbackupd /run/vmbackupd
+
+[Install]
+WantedBy=multi-user.target

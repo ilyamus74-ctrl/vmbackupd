@@ -1,0 +1,3 @@
+d /var/lib/vmbackupd 0750 vmbackupd vmbackupd -
+d /var/lib/vmbackupd/control 0750 vmbackupd vmbackupd -
+d /var/lib/libvirt/images/vmbackupd 0750 vmbackupd qemu -

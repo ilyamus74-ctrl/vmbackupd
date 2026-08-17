@@ -1,7 +1,6 @@
-# Intended installation layout
+# Production installation layout
 
-RPM/DNF packaging is deferred to Phase 3D, but future implementation must
-converge on an explicit installed layout instead of scattered hard-coded paths.
+Phase 3D.2 provides the Fedora-style RPM layout and service profile:
 
 ```text
 /usr/bin/vmbackupd
@@ -13,16 +12,13 @@ converge on an explicit installed layout instead of scattered hard-coded paths.
     state.db
     control/
 
-/var/log/vmbackupd/       # only if journald is insufficient
-
 /usr/lib/systemd/system/vmbackupd.service
-/usr/share/cockpit/vmbackupd/
+/usr/lib/sysusers.d/vmbackupd.conf
+/usr/lib/tmpfiles.d/vmbackupd.conf
 ```
 
-The Cockpit directory belongs to the future separate `cockpit-vmbackupd`
-package. Entry points, service units, configuration parsing, logging, system
-accounts, RPM scripts, and installation-time directory creation are not
-implemented yet.
+Cockpit remains a future separate `cockpit-vmbackupd` package. Logging uses the
+systemd journal; no package-owned log directory is currently needed.
 
 ## Backup data placement
 
@@ -33,30 +29,45 @@ Fedora-oriented default is:
 /var/lib/libvirt/images/vmbackupd/<run-id>/<disk-target>.qcow2
 ```
 
-Control and data roots are independently configurable. Product code must obtain
-them from the future configuration model rather than repeat example paths.
+Control and data roots are independently configurable and supplied through the
+production TOML rather than repeated in backend code.
 Control run directories are private. Data run directories use an explicit mode
 and optional UID/GID suitable for the installed libvirt/QEMU environment;
 vmbackupd never invents a Fedora QEMU identity or falls back to mode 0777.
 The run directory may remain 0750 because vmbackupd exclusively pre-creates
 each output image. Prepared images are daemon-owned, use the configured QEMU
 group where supplied, and are mode 0660 so QEMU can write them and vmbackupd can
-read them afterward. RPM integration must arrange daemon/QEMU group membership
-and directory traversal without world-writable fallbacks.
+read them afterward. The Fedora unit supplies narrow qemu supplementary-group
+membership and never uses world-writable fallbacks.
+Fedora 41 validation confirmed that `qemu:///system` access does not require a
+`libvirt` supplementary group on the tested socket configuration. Other
+distribution profiles must evaluate their socket policy explicitly and must
+not globally weaken libvirt socket permissions.
 If a data user is configured, it must resolve to the account actually running
 vmbackupd; configuration cannot transfer the run directory to QEMU. The
 configured data group is applied without changing daemon ownership.
 
-RPM integration must establish durable ownership and Fedora SELinux labels or
-policy. SELinux behavior must be tested under Enforcing before production RPM
-release; a development host with SELinux disabled cannot validate it.
+Sysusers creates the dedicated non-login account without fixed numeric IDs.
+Tmpfiles and systemd state/runtime directories establish narrowly scoped 0750
+paths. Fedora SELinux labels or policy remain unimplemented; Enforcing
+validation is required before production release.
 
-Phase 3C provides configuration and foreground entry points but deliberately
-does not install these paths. RPM ownership, socket parent creation, service
-units, and system accounts remain Phase 3D work.
+An isolated Fedora 41 alternate-root lifecycle test validated installation,
+reinstallation, and erase. The account was created with home
+`/var/lib/vmbackupd` and `/usr/sbin/nologin`; the service remained disabled;
+and tmpfiles produced `/var/lib/vmbackupd` and its control directory as
+`vmbackupd:vmbackupd`, plus the backup-data root as `vmbackupd:qemu`, all mode
+0750. Reinstall preserved edited `%config(noreplace)`, `state.db`, and backup
+data. Erase removed package-owned binaries and the unit while retaining mutable
+directories and data, and preserved edited configuration as `.rpmsave`.
+Warnings caused by unmounted `/proc` and `/sys` in the synthetic installroot do
+not represent a service lifecycle failure; tmpfiles was independently checked
+with `systemd-tmpfiles --root`. Real service execution as `User=vmbackupd` and
+SELinux Enforcing validation remain outstanding production-readiness gates.
 
 Phase 3D.1 adds `schema_version`, structural validation, and ordered
 transactional migrations. It can adopt the known unversioned integration
 schema without rebuilding backup metadata. RPM upgrade/rollback policy is not
-yet implemented, so operators should make an external database copy before a
-package upgrade; vmbackupd does not create automatic `.bak` files.
+yet automated, so operators should make an external database copy before a
+package upgrade; vmbackupd does not create automatic `.bak` files. RPM erase
+does not recursively remove state or backup data.
