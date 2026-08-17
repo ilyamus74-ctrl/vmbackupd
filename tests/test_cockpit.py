@@ -76,7 +76,7 @@ def test_cockpit_success_waits_for_normal_close_and_rejects_lifecycle_errors():
     assert "channel.close()" not in close_handler
 
 
-def test_cockpit_method_allow_list_is_exactly_initial_read_only_slice():
+def test_cockpit_method_allow_list_is_exactly_operational_read_only_slice():
     api = source("api.js")
     match = re.search(
         r"const READ_ONLY_METHODS = Object\.freeze\(\[(.*?)\]\);",
@@ -85,7 +85,16 @@ def test_cockpit_method_allow_list_is_exactly_initial_read_only_slice():
     )
     assert match is not None
     methods = re.findall(r'"([a-z_.]+)"', match.group(1))
-    assert methods == ["daemon.status", "vm.discover", "storage.list"]
+    assert methods == [
+        "daemon.status",
+        "vm.discover",
+        "vm.list",
+        "storage.list",
+        "job.list",
+        "run.list",
+        "restore_point.list",
+        "recovery.list",
+    ]
     for mutation in ("vm.register", "job.create", "backup.run"):
         assert mutation not in api
 
@@ -104,7 +113,10 @@ def test_cockpit_frontend_has_no_privileged_or_direct_backend_path():
 def test_cockpit_ui_is_read_only_and_has_required_sections():
     html = source("index.html")
     javascript = source("vmbackupd.js")
-    assert all(value in html for value in ("Dashboard", "Virtual Machines", "Storage"))
+    assert all(value in html for value in (
+        "Backup health", "Recent backup runs", "Backup jobs", "Storage",
+        "Discovered virtual machines", "System details",
+    ))
     assert ">Type<" in html
     assert '"Local"' in javascript
     assert "Mutation disabled" in javascript
@@ -116,3 +128,61 @@ def test_cockpit_ui_is_read_only_and_has_required_sections():
     assert javascript.index("clearViews();") < javascript.index('api.request("daemon.status")')
     for control in ("Register", "Create job", "Run backup", "Restore", "Delete"):
         assert control not in html
+
+
+def test_cockpit_dashboard_derives_operational_run_summaries():
+    html = source("index.html")
+    javascript = source("vmbackupd.js")
+    for label in ("Successful today", "Failed today", "Active", "Recovery required"):
+        assert label in html
+    assert 'run.state === "SUCCESS" && isToday(run.updated_at, now)' in javascript
+    assert 'run.state === "FAILED" && isToday(run.updated_at, now)' in javascript
+    assert '!TERMINAL_STATES.has(run.state)' in javascript
+    assert 'dataset.runs.filter(run => run.recovery_required)' in javascript
+    assert 'const TERMINAL_STATES = new Set(["SUCCESS", "FAILED"]);' in javascript
+
+
+def test_cockpit_recent_runs_join_jobs_and_vms_with_explicit_statuses():
+    html = source("index.html")
+    javascript = source("vmbackupd.js")
+    assert all(column in html for column in (
+        "VM", "Job", "Type", "Started", "Status", "Duration", "Error",
+    ))
+    assert "model.jobById.get(run.job_id)" in javascript
+    assert "vmName(model.vmById, job.vm_id)" in javascript
+    assert "Unknown job" in javascript
+    assert "Unknown VM" in javascript
+    assert 'if (run.state === "FAILED")' in javascript
+    assert 'if (run.state === "CLEANUP")' in javascript
+    assert "run.recovery_required" in javascript
+    assert "status-recovery" in javascript
+    assert "run.recovery_reason || run.cleanup_error || run.error" in javascript
+
+
+def test_cockpit_jobs_join_storage_and_use_available_restore_points():
+    html = source("index.html")
+    javascript = source("vmbackupd.js")
+    assert all(column in html for column in (
+        "Destination", "Last run", "Last status", "Last successful backup", "Next run",
+    ))
+    assert "model.storageById.get(job.storage_destination_id)" in javascript
+    assert 'point.status === "AVAILABLE"' in javascript
+    assert "run && run.job_id === jobId" in javascript
+    assert "latestSuccessfulRestorePoint" in javascript
+    assert '"Manual / not scheduled"' in javascript
+    assert '"Never"' in javascript
+
+
+def test_cockpit_has_timestamp_duration_and_atomic_refresh_helpers():
+    javascript = source("vmbackupd.js")
+    assert "function localTimestamp(value)" in javascript
+    assert "parsed.toLocaleString()" in javascript
+    assert "function durationBetween(startValue, endValue)" in javascript
+    assert "function runDuration(run, now)" in javascript
+    assert "Promise.all([" in javascript
+    assert 'api.request("vm.list")' in javascript
+    assert 'api.request("job.list")' in javascript
+    assert 'api.request("run.list")' in javascript
+    assert 'api.request("restore_point.list")' in javascript
+    assert 'api.request("recovery.list")' in javascript
+    assert javascript.index("clearViews();") < javascript.index("Promise.all([")

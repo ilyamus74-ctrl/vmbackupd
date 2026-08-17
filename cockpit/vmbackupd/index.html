@@ -21,17 +21,38 @@
 
     <div id="notice" class="notice" role="status" aria-live="polite">Loading…</div>
 
-    <section aria-labelledby="dashboard-title">
-      <h2 id="dashboard-title">Dashboard</h2>
-      <dl id="dashboard" class="dashboard"></dl>
+    <section aria-labelledby="dashboard-title" class="dashboard-section">
+      <div class="section-heading">
+        <h2 id="dashboard-title">Backup health</h2>
+        <div class="health-line">
+          <span id="daemon-health" class="badge status-neutral">Unavailable</span>
+          <span id="mutation-state" class="badge status-neutral">Mutation state unknown</span>
+        </div>
+      </div>
+      <div class="summary-grid">
+        <article class="summary-card success-card"><span>Successful today</span><strong id="successful-today">—</strong></article>
+        <article class="summary-card failed-card"><span>Failed today</span><strong id="failed-today">—</strong></article>
+        <article class="summary-card active-card"><span>Active</span><strong id="active-runs">—</strong></article>
+        <article class="summary-card recovery-card"><span>Recovery required</span><strong id="recovery-required">—</strong></article>
+      </div>
     </section>
 
-    <section aria-labelledby="vms-title">
-      <h2 id="vms-title">Virtual Machines</h2>
+    <section aria-labelledby="recent-title">
+      <h2 id="recent-title">Recent backup runs</h2>
       <div class="table-scroll">
-        <table>
-          <thead><tr><th>Name</th><th>External ID</th><th>UUID</th><th>State</th></tr></thead>
-          <tbody id="vms"></tbody>
+        <table class="operational-table">
+          <thead><tr><th>VM</th><th>Job</th><th>Type</th><th>Started</th><th>Status</th><th>Duration</th><th>Error</th></tr></thead>
+          <tbody id="recent-runs"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section aria-labelledby="jobs-title">
+      <h2 id="jobs-title">Backup jobs</h2>
+      <div class="table-scroll">
+        <table class="operational-table">
+          <thead><tr><th>VM</th><th>Job</th><th>Enabled</th><th>Destination</th><th>Last run</th><th>Last status</th><th>Last successful backup</th><th>Next run</th></tr></thead>
+          <tbody id="jobs"></tbody>
         </table>
       </div>
     </section>
@@ -39,11 +60,29 @@
     <section aria-labelledby="storage-title">
       <h2 id="storage-title">Storage</h2>
       <div class="table-scroll">
-        <table>
-          <thead><tr><th>Name</th><th>Type</th><th>Default</th><th>Backup data</th><th>Control</th><th>Free</th><th>Minimum free</th><th>Reserve</th></tr></thead>
+        <table class="operational-table">
+          <thead><tr><th>Name</th><th>Type</th><th>Default</th><th>Free</th><th>Reserve</th><th>Usable after byte reserve</th><th>Backup data root</th></tr></thead>
           <tbody id="storage"></tbody>
         </table>
       </div>
+      <p class="table-note">Usable space subtracts only the configured byte reserve; VM-specific capacity preflight and percentage reserve still apply.</p>
+    </section>
+
+    <section aria-labelledby="vms-title">
+      <h2 id="vms-title">Discovered virtual machines</h2>
+      <div class="table-scroll">
+        <table class="operational-table">
+          <thead><tr><th>Name</th><th>External ID</th><th>UUID</th><th>State</th></tr></thead>
+          <tbody id="vms"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section aria-labelledby="details-title">
+      <details>
+        <summary id="details-title">System details</summary>
+        <dl id="system-details" class="details-grid"></dl>
+      </details>
     </section>
   </main>
 </body>

@@ -3,8 +3,8 @@
 vmbackupd now includes the domain/persistence core, cooperative local runtime,
 FULL-only libvirt push executor, UNIX API and CLI, schema migrations, and a
 Fedora-style production service/package profile. It also includes the first
-read-only Cockpit frontend source slice for `daemon.status`, `vm.discover`, and
-`storage.list`, validated in a Cockpit 345 browser through the local API.
+read-only Cockpit frontend, whose validated initial transport slice has now
+been expanded into an operational dashboard using existing list APIs.
 The shared RPM spec now produces a separate `cockpit-vmbackupd` binary
 subpackage from the same source RPM. Packaged-browser installation validation,
 Cockpit mutation controls, remote networking, incremental execution, restore
@@ -325,3 +325,21 @@ development symlink. Erase removed only the static frontend; vmbackupd, its
 state, and backup artifacts remained unchanged. Mutation controls,
 mutation-boundary authorization, finer-grained API roles, and SELinux Enforcing
 validation remain pending. See [`cockpit.md`](cockpit.md).
+
+## Phase 3E.4 operational dashboard
+
+The Cockpit frontend now derives an operational backup view from the existing
+read-only `daemon.status`, VM, storage, job, run, restore-point, and recovery
+list methods. Client-side joins resolve jobs to VMs and destinations, summarize
+today's terminal results and current active/recovery work, and show recent run
+activity. No dashboard-specific backend endpoint or mutation boundary was
+introduced.
+
+Displayed run duration is total persisted lifecycle elapsed time, not solely
+hypervisor execution time. A job's last successful backup is derived only from
+an `AVAILABLE` restore point published for one of that job's runs; a newer
+failed run cannot masquerade as success. Storage retains an explicit Local type
+and presents free/reserve information without replacing execution's VM-specific
+capacity preflight. Configuration/edit actions remain Phase 3E.5/3E.6 work,
+peer/node overview remains Phase 3F, and this expanded dashboard still awaits
+manual browser validation.

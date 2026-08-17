@@ -113,6 +113,16 @@ frontend erase have passed. Erase preserved the daemon, metadata, and backup
 objects. Mutation UI, packaged read-write authorization, SELinux Enforcing
 validation, and finer-grained roles remain later work.
 
+Phase 3E.4 expands the packaged read-only frontend source into an operational
+backup dashboard without adding API or mutation boundaries. Existing list
+methods are joined in the browser to show local-time success/failure summaries,
+active and recovery-required work, recent runs, each job's destination and last
+run, and its newest published `AVAILABLE` restore point. Displayed duration is
+total run lifecycle elapsed time. Storage remains explicitly `Type = Local`
+with compact free/reserve information. Manual browser validation of this
+expanded slice is still pending. Configuration/edit actions are reserved for
+Phases 3E.5/3E.6, while peer/node overview remains Phase 3F.
+
 Future retention deletion is constrained by a permanent fail-safe contract:
 **no new valid backup means no automatic deletion**. Automatic expiration is a
 post-success action, permitted only after an `AVAILABLE` restore point has been

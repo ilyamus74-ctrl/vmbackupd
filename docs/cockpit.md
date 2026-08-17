@@ -49,32 +49,60 @@ carrying a Cockpit problem code. Timers are cleared on every completion.
 Transport errors, protocol errors, and structurally valid daemon API errors
 remain distinct.
 
-The Phase 3E.2 allow-list is exactly:
+Phase 3E.4 expands the read-only allow-list to exactly:
 
 - `daemon.status`
 - `vm.discover`
+- `vm.list`
 - `storage.list`
+- `job.list`
+- `run.list`
+- `restore_point.list`
+- `recovery.list`
 
 There is no generic arbitrary-method entry point and no mutation control.
 
-## Initial page
+## Operational dashboard
 
-The Dashboard shows runtime/controller identity, schema and daemon versions,
-libvirt URI and mutation state, free data bytes, and run/recovery counts. It
-distinguishes a running runtime from failure/unavailability and displays human
-readable bytes while retaining the exact byte value in the rendered text.
+Phase 3E.4 turns the technical page into a read-only operational backup
+dashboard. Compact cards show successful and failed runs today in the browser's
+local timezone, all active non-terminal runs (including cleanup), and runs that
+require recovery. Daemon health and mutation state remain prominent. These
+values are derived client-side from existing API lists; this phase adds no API
+method or mutation boundary.
+
+Recent backup activity joins runs to jobs and registered VMs and shows type,
+local start time, state, total lifecycle elapsed duration, and the most relevant
+recovery/cleanup/run error. Lifecycle duration is measured from run creation to
+its final update for terminal runs, or to the current browser time for active
+runs; it is not hypervisor-only execution time. Recovery-required work is
+visually stronger than ordinary active work.
+
+The job overview joins each job to its VM and storage destination. Its last
+successful backup is the newest `AVAILABLE` restore point whose run belongs to
+that job, not merely the newest run. Jobs that have never published a restore
+point and jobs without a schedule use explicit `Never` and
+`Manual / not scheduled` states.
 
 Virtual Machines shows discovered name, external ID, UUID, and state. Storage
-shows destination name, explicit `Type = Local`, default status, control/data
-roots, free bytes, and reserve policy. The explicit type column is the stable UI
-shape for future Phase 3F SSH/rsync destinations.
+shows destination name, explicit `Type = Local`, default status, backup-data
+root, free space, reserve, and display-only usable bytes after the configured
+byte reserve. That value is not a guarantee that a particular VM backup will
+fit; execution retains its VM-specific capacity preflight. The explicit type
+column is the stable UI shape for future Phase 3F SSH/rsync destinations.
 
-Refresh requests all three read-only views again. Loading, permission/channel
+Refresh concurrently requests the complete read-only dataset and renders only
+after all requests succeed. Loading, permission/channel
 failure, malformed response, API error, failed runtime, and successful states
 are visible; permission guidance names `vmbackupd-admin` and fresh-session
-requirements. Refresh clears all three previous data views before requesting
-new values, so an error cannot leave stale content looking current. API strings
+requirements. Refresh clears all previous data views before requesting new
+values, so an error cannot leave stale content looking current. API strings
 are inserted with DOM text APIs, never raw HTML.
+
+The detailed daemon identity, controller, schema, and libvirt fields remain in
+a compact System details section below the operational views. Configuration and
+edit actions remain Phase 3E.5/3E.6 work, and peer/node overview remains Phase
+3F. The Phase 3E.4 dashboard has not yet received manual browser validation.
 
 ## Current status
 

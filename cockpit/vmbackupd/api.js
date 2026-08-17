@@ -8,7 +8,12 @@
     const READ_ONLY_METHODS = Object.freeze([
         "daemon.status",
         "vm.discover",
+        "vm.list",
         "storage.list",
+        "job.list",
+        "run.list",
+        "restore_point.list",
+        "recovery.list",
     ]);
     let requestSequence = 0;
 
