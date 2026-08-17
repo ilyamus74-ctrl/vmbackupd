@@ -1,0 +1,71 @@
+# vmbackupd core architecture
+
+This phase is a domain and persistence foundation only. It does not contact
+libvirt, QEMU, SSH, Cockpit, systemd, a network service, or a backup filesystem.
+
+## Jobs and persisted policies
+
+`Node` owns `VM` records. A persistent `BackupJob` describes recurring work for
+one VM, while each execution has a separate `JobRun`. Jobs persist two distinct
+policies:
+
+- `BackupPolicy.max_incrementals_per_chain` controls chain construction. Zero
+  makes every successful backup a new full chain; two produces `FULL, INC, INC`
+  before the next full.
+- `RetentionPolicy.restore_points_to_retain` and `minimum_full_chains` control
+  dry-run expiration selection only.
+
+Keeping both policies on the job means execution and retention decisions survive
+process restarts. SQLite constraints enforce their numeric ranges.
+
+## Planning and execution
+
+The successful execution path remains strictly linear:
+
+```text
+SCHEDULED -> QUEUED -> PRECHECK -> PREPARING -> BACKING_UP
+          -> TRANSFERRING -> VERIFYING -> FINALIZING -> SUCCESS
+```
+
+`BackupPlanner` runs while the job is `PREPARING`. Before the transition to
+`BACKING_UP`, the run persists its planned kind, chain ID, sequence, and
+incremental parent restore-point ID. SQLite-backed repository validation rejects
+entry into `BACKING_UP` without this plan.
+
+Generic transitions cannot produce `SUCCESS`. `finalize_success` is the only
+publication path. In one SQLite transaction it validates the run, job, VM,
+chain, sequence, kind, and parent relationships; applies chain lifecycle
+changes; creates the `AVAILABLE` restore point; moves the run to `SUCCESS`; and
+records its transition event. Any failure rolls all of this work back, leaving
+the run in `FINALIZING` with no partially published state.
+
+## Chain lifecycle
+
+A VM can have at most one `ACTIVE` chain, enforced with a partial SQLite unique
+index. Older chains are `CLOSED`.
+
+Planning a replacement full only reserves a new chain ID on the run. It neither
+creates that chain nor closes the current active chain. Successful full
+finalization atomically closes the old chain, creates the new active chain, and
+publishes its full restore point. Thus a failed replacement full leaves the old
+chain active. Incremental finalization rechecks that its planned chain is still
+active and that its sequence and parent are still the expected next members.
+
+## Recoverable cleanup
+
+Every unsuccessful execution path enters `CLEANUP`. Generic transitions cannot
+produce `FAILED`: `finish_cleanup` does so only after cleanup succeeds. If
+cleanup fails, `record_cleanup_failure` leaves the run in `CLEANUP`, stores the
+error, increments the attempt count, and records an event. Cleanup may be
+retried later. No watchdog or scheduler is included yet.
+
+## Persistence boundary
+
+SQLite is the invariant boundary rather than `MockBackupEngine`. Foreign keys,
+checks, uniqueness constraints, repository validation, and transactional writes
+protect cross-entity relationships. Restore points cannot be added through a
+general public repository method; they are created only during successful
+finalization.
+
+`MockBackupEngine` drives these same operations deterministically and can inject
+backup or cleanup failures. It performs no actual backup I/O.
