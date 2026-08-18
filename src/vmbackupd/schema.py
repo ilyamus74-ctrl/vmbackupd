@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import Callable, Mapping
 
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 
 class SchemaError(RuntimeError):
@@ -46,6 +46,60 @@ JOB_RUNS_TABLE_SQL = """CREATE TABLE job_runs (
                planned_sequence IS NOT NULL)),
         UNIQUE(job_id, scheduled_for)
     )"""
+
+
+RECLAIM_SCHEMA_STATEMENTS = (
+    """CREATE TABLE reclaim_operations (
+        id TEXT PRIMARY KEY,
+        job_run_id TEXT NOT NULL REFERENCES job_runs(id),
+        job_id TEXT NOT NULL REFERENCES backup_jobs(id),
+        vm_id TEXT NOT NULL REFERENCES vms(id),
+        storage_destination_id TEXT NOT NULL REFERENCES storage_destinations(id),
+        state TEXT NOT NULL CHECK(state IN (
+            'PLANNED', 'RETIRING', 'QUARANTINED', 'CATALOG_REMOVED',
+            'PURGING', 'PURGED', 'COMPLETED', 'RECOVERY_REQUIRED', 'ABORTED'
+        )),
+        required_backup_bytes INTEGER NOT NULL CHECK(required_backup_bytes >= 0),
+        free_bytes_before INTEGER NOT NULL CHECK(free_bytes_before >= 0),
+        reserve_bytes INTEGER NOT NULL CHECK(reserve_bytes >= 0),
+        expected_reclaim_bytes INTEGER NOT NULL CHECK(expected_reclaim_bytes >= 0),
+        free_bytes_after INTEGER CHECK(
+            free_bytes_after IS NULL OR free_bytes_after >= 0
+        ),
+        error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(job_run_id)
+    )""",
+    """CREATE TABLE reclaim_chains (
+        operation_id TEXT NOT NULL REFERENCES reclaim_operations(id),
+        chain_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+        expected_physical_bytes INTEGER NOT NULL
+            CHECK(expected_physical_bytes >= 0),
+        PRIMARY KEY(operation_id, chain_id),
+        UNIQUE(operation_id, ordinal)
+    )""",
+    """CREATE TABLE reclaim_bundles (
+        operation_id TEXT NOT NULL REFERENCES reclaim_operations(id),
+        chain_id TEXT NOT NULL,
+        restore_point_id TEXT NOT NULL,
+        source_bundle_object_id TEXT NOT NULL,
+        quarantine_object_id TEXT,
+        expected_physical_bytes INTEGER CHECK(
+            expected_physical_bytes IS NULL OR expected_physical_bytes >= 0
+        ),
+        source_device INTEGER,
+        source_inode INTEGER,
+        state TEXT NOT NULL CHECK(state IN (
+            'PLANNED', 'QUARANTINED', 'PURGED'
+        )),
+        PRIMARY KEY(operation_id, restore_point_id),
+        UNIQUE(operation_id, source_bundle_object_id),
+        FOREIGN KEY(operation_id, chain_id)
+            REFERENCES reclaim_chains(operation_id, chain_id)
+    )""",
+)
 
 
 CURRENT_SCHEMA_STATEMENTS = (
@@ -235,9 +289,27 @@ CURRENT_COLUMNS = {
                          "lease_expires_at", "heartbeat_at"},
     "node_controller_leases": {"node_id", "daemon_instance_id", "acquired_at",
                                "heartbeat_at", "expires_at"},
+    "reclaim_operations": {
+        "id", "job_run_id", "job_id", "vm_id", "storage_destination_id",
+        "state", "required_backup_bytes", "free_bytes_before", "reserve_bytes",
+        "expected_reclaim_bytes", "free_bytes_after", "error",
+        "created_at", "updated_at",
+    },
+    "reclaim_chains": {
+        "operation_id", "chain_id", "ordinal", "expected_physical_bytes",
+    },
+    "reclaim_bundles": {
+        "operation_id", "chain_id", "restore_point_id",
+        "source_bundle_object_id", "quarantine_object_id",
+        "expected_physical_bytes", "source_device", "source_inode", "state",
+    },
 }
 
-VERSION_4_COLUMNS = {name: set(columns) for name, columns in CURRENT_COLUMNS.items()}
+VERSION_5_COLUMNS = {name: set(columns) for name, columns in CURRENT_COLUMNS.items()}
+for _table in ("reclaim_bundles", "reclaim_chains", "reclaim_operations"):
+    VERSION_5_COLUMNS.pop(_table)
+
+VERSION_4_COLUMNS = {name: set(columns) for name, columns in VERSION_5_COLUMNS.items()}
 VERSION_4_COLUMNS["backup_jobs"] -= {
     "full_chains_to_retain", "space_reclaim_mode", "backup_size_margin_percent",
 }
@@ -275,6 +347,20 @@ REQUIRED_FOREIGN_KEYS = {
                          ("daemon_instance_id", "daemon_instances", "instance_id")},
     "node_controller_leases": {("node_id", "nodes", "id"),
                                ("daemon_instance_id", "daemon_instances", "instance_id")},
+    "reclaim_operations": {
+        ("job_run_id", "job_runs", "id"),
+        ("job_id", "backup_jobs", "id"),
+        ("vm_id", "vms", "id"),
+        ("storage_destination_id", "storage_destinations", "id"),
+    },
+    "reclaim_chains": {
+        ("operation_id", "reclaim_operations", "id"),
+    },
+    "reclaim_bundles": {
+        ("operation_id", "reclaim_operations", "id"),
+        ("operation_id", "reclaim_chains", "operation_id"),
+        ("chain_id", "reclaim_chains", "chain_id"),
+    },
 }
 
 REQUIRED_INDEXES = {
@@ -382,7 +468,12 @@ def _validate_fingerprint(
                 f"schema column fingerprint mismatch for {table}"
             )
     for table, required in REQUIRED_FOREIGN_KEYS.items():
-        required = {item for item in required if item[0] in expected_columns[table]}
+        if table not in expected_columns:
+            continue
+        required = {
+            item for item in required
+            if item[0] in expected_columns[table]
+        }
         actual = {(row[3], row[2], row[4]) for row in
                   connection.execute(f'PRAGMA foreign_key_list("{table}")')}
         if not required <= actual:
@@ -463,6 +554,46 @@ def _validate_version_four_schema(connection: sqlite3.Connection) -> None:
         raise UnsupportedSchemaError("published artifact has no durable object identity")
 
 
+def _validate_version_five_schema(connection: sqlite3.Connection) -> None:
+    _validate_fingerprint(connection, VERSION_5_COLUMNS)
+    _validate_version_two_data(connection)
+    triggers = {row[0] for row in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+    )}
+    if not REQUIRED_TRIGGERS <= triggers:
+        raise UnsupportedSchemaError("schema storage-identity trigger is missing")
+    invalid_default = connection.execute(
+        """SELECT node_id FROM storage_destinations
+           GROUP BY node_id
+           HAVING COUNT(*) > 0
+              AND SUM(CASE WHEN is_default = 1 THEN 1 ELSE 0 END) != 1
+           LIMIT 1"""
+    ).fetchone()
+    if invalid_default:
+        raise UnsupportedSchemaError(
+            "non-empty node storage catalog must contain exactly one default"
+        )
+    if connection.execute(
+        """SELECT 1 FROM backup_artifacts
+           WHERE state = 'PUBLISHED'
+             AND published_object_id IS NULL LIMIT 1"""
+    ).fetchone():
+        raise UnsupportedSchemaError(
+            "published artifact has no durable object identity"
+        )
+    if connection.execute(
+        """SELECT 1 FROM backup_jobs
+           WHERE full_chains_to_retain < minimum_full_chains
+              OR space_reclaim_mode NOT IN ('SAFE', 'SPACE_OPTIMIZED')
+              OR backup_size_margin_percent < 0
+              OR backup_size_margin_percent > 100
+           LIMIT 1"""
+    ).fetchone():
+        raise UnsupportedSchemaError(
+            "backup job retention policy is invalid"
+        )
+
+
 def validate_current_schema(connection: sqlite3.Connection) -> None:
     _validate_fingerprint(connection, CURRENT_COLUMNS)
     _validate_version_two_data(connection)
@@ -498,6 +629,41 @@ def validate_current_schema(connection: sqlite3.Connection) -> None:
     ).fetchone():
         raise UnsupportedSchemaError("backup job retention policy is invalid")
 
+    invalid_reclaim_lineage = connection.execute(
+        """SELECT ro.id
+           FROM reclaim_operations ro
+           LEFT JOIN job_runs jr ON jr.id = ro.job_run_id
+           LEFT JOIN backup_jobs bj ON bj.id = ro.job_id
+           LEFT JOIN vms vm ON vm.id = ro.vm_id
+           LEFT JOIN storage_destinations sd
+             ON sd.id = ro.storage_destination_id
+           WHERE jr.id IS NULL OR bj.id IS NULL OR vm.id IS NULL OR sd.id IS NULL
+              OR jr.job_id != ro.job_id
+              OR bj.vm_id != ro.vm_id
+              OR jr.storage_destination_id != ro.storage_destination_id
+              OR vm.node_id != sd.node_id
+           LIMIT 1"""
+    ).fetchone()
+    if invalid_reclaim_lineage:
+        raise UnsupportedSchemaError(
+            "reclaim operation lineage is invalid"
+        )
+
+    invalid_reclaim_total = connection.execute(
+        """SELECT ro.id
+           FROM reclaim_operations ro
+           LEFT JOIN reclaim_chains rc ON rc.operation_id = ro.id
+           GROUP BY ro.id
+           HAVING COUNT(rc.chain_id) = 0
+              OR COALESCE(SUM(rc.expected_physical_bytes), 0)
+                 != ro.expected_reclaim_bytes
+           LIMIT 1"""
+    ).fetchone()
+    if invalid_reclaim_total:
+        raise UnsupportedSchemaError(
+            "reclaim operation expected byte total is invalid"
+        )
+
 
 def _validate_version_three_schema(connection: sqlite3.Connection) -> None:
     _validate_fingerprint(connection, VERSION_3_COLUMNS)
@@ -521,6 +687,8 @@ def _validate_version_three_schema(connection: sqlite3.Connection) -> None:
 
 def _create_current(connection: sqlite3.Connection) -> None:
     for statement in CURRENT_SCHEMA_STATEMENTS:
+        connection.execute(statement)
+    for statement in RECLAIM_SCHEMA_STATEMENTS:
         connection.execute(statement)
     connection.execute(SCHEMA_VERSION_SQL)
     connection.execute(
@@ -621,12 +789,18 @@ def migrate_4_to_5(connection: sqlite3.Connection) -> None:
     )
 
 
+def migrate_5_to_6(connection: sqlite3.Connection) -> None:
+    for statement in RECLAIM_SCHEMA_STATEMENTS:
+        connection.execute(statement)
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: migrate_0_to_1,
     1: migrate_1_to_2,
     2: migrate_2_to_3,
     3: migrate_3_to_4,
     4: migrate_4_to_5,
+    5: migrate_5_to_6,
 }
 
 
@@ -760,6 +934,8 @@ def ensure_current_schema(
             _validate_version_three_schema(connection)
         elif version == 4:
             _validate_version_four_schema(connection)
+        elif version == 5:
+            _validate_version_five_schema(connection)
         current = version
         while current < CURRENT_SCHEMA_VERSION:
             step = migration_steps.get(current)
@@ -772,6 +948,8 @@ def ensure_current_schema(
                 step(connection)
                 if current + 1 == CURRENT_SCHEMA_VERSION:
                     validate_current_schema(connection)
+                elif current + 1 == 5:
+                    _validate_version_five_schema(connection)
                 elif current + 1 == 4:
                     _validate_version_four_schema(connection)
                 elif current + 1 == 3:

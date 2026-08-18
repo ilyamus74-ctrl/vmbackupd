@@ -21,6 +21,12 @@ from vmbackupd.schema import (
 NOW = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
 
 
+def drop_v6_reclaim_tables(connection):
+    connection.execute("DROP TABLE reclaim_bundles")
+    connection.execute("DROP TABLE reclaim_chains")
+    connection.execute("DROP TABLE reclaim_operations")
+
+
 def catalog(repository):
     node = Node("EU")
     repository.add_node(node)
@@ -51,6 +57,7 @@ def version_one_database(path):
     repository.close()
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = OFF")
+    drop_v6_reclaim_tables(connection)
     connection.execute("DROP TRIGGER job_runs_destination_required_insert")
     connection.execute("DROP TRIGGER job_runs_destination_required_update")
     connection.execute("DROP TRIGGER job_runs_destination_immutable")

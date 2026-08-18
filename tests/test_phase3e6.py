@@ -24,6 +24,12 @@ from vmbackupd.schema import (
 NOW = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
 
 
+def drop_v6_reclaim_tables(connection):
+    connection.execute("DROP TABLE reclaim_bundles")
+    connection.execute("DROP TABLE reclaim_chains")
+    connection.execute("DROP TABLE reclaim_operations")
+
+
 def catalog(repository, tmp_path):
     node = Node("local")
     repository.add_node(node)
@@ -54,6 +60,7 @@ def version_three_database(path, tmp_path):
     ))
     repository.close()
     connection = sqlite3.connect(path)
+    drop_v6_reclaim_tables(connection)
     connection.execute("DROP TRIGGER storage_destination_identity_immutable_after_run")
     connection.execute("ALTER TABLE storage_destinations ADD COLUMN control_root TEXT")
     connection.execute(
@@ -89,6 +96,7 @@ def published_version_three_database(path, tmp_path):
     }
     repository.close()
     connection = sqlite3.connect(path)
+    drop_v6_reclaim_tables(connection)
     connection.execute("DROP TRIGGER storage_destination_identity_immutable_after_run")
     connection.execute("ALTER TABLE storage_destinations ADD COLUMN control_root TEXT")
     connection.execute("UPDATE storage_destinations SET control_root='/legacy/control'")
@@ -189,10 +197,14 @@ def test_schema_current_fresh_and_v3_migration_preserve_rows(tmp_path):
 def test_v3_published_artifacts_backfill_without_filesystem_access(tmp_path, monkeypatch):
     path = tmp_path / "legacy-published.db"
     _, run, original = published_version_three_database(path, tmp_path)
-    monkeypatch.setattr("pathlib.Path.exists", lambda *_: (_ for _ in ()).throw(
-        AssertionError("migration must not inspect backup files")
-    ))
-    migrated = SQLiteRepository(path)
+    with monkeypatch.context() as guard:
+        guard.setattr(
+            "pathlib.Path.exists",
+            lambda *_: (_ for _ in ()).throw(
+                AssertionError("migration must not inspect backup files")
+            ),
+        )
+        migrated = SQLiteRepository(path)
     artifacts = migrated.list_artifacts_for_run(run.id)
     assert {item.id: item.object_id for item in artifacts} == {
         artifact_id: value[0] for artifact_id, value in original.items()

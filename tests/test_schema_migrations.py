@@ -15,6 +15,12 @@ from vmbackupd.schema import (
 )
 
 
+def drop_v6_reclaim_tables(connection):
+    connection.execute("DROP TABLE reclaim_bundles")
+    connection.execute("DROP TABLE reclaim_chains")
+    connection.execute("DROP TABLE reclaim_operations")
+
+
 EXPECTED_INDEXES = {
     "one_default_storage_destination", "one_active_chain_per_vm",
     "one_libvirt_uuid_per_node", "one_nondisk_artifact_kind_per_run",
@@ -49,6 +55,7 @@ def make_unversioned(path, *, legacy=False):
     values = populated_database(path)
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = OFF")
+    drop_v6_reclaim_tables(connection)
     connection.execute("DROP TABLE schema_version")
     connection.execute("DROP TRIGGER job_runs_destination_required_insert")
     connection.execute("DROP TRIGGER job_runs_destination_required_update")
@@ -328,6 +335,7 @@ def test_v4_to_v5_backfills_capacity_retention_policy(tmp_path):
     connection.execute("ALTER TABLE backup_jobs DROP COLUMN backup_size_margin_percent")
     connection.execute("ALTER TABLE backup_jobs DROP COLUMN space_reclaim_mode")
     connection.execute("ALTER TABLE backup_jobs DROP COLUMN full_chains_to_retain")
+    drop_v6_reclaim_tables(connection)
     connection.execute("UPDATE schema_version SET version = 4 WHERE id = 1")
 
     created = "2026-01-01T00:00:00+00:00"
@@ -364,7 +372,7 @@ def test_v4_to_v5_backfills_capacity_retention_policy(tmp_path):
     connection.close()
 
     migrated = SQLiteRepository(path)
-    assert migrated.schema_version == 5
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION
     job = migrated.get_job("job")
     assert job.retention_policy.restore_points_to_retain == 7
     assert job.retention_policy.minimum_full_chains == 3
@@ -372,3 +380,95 @@ def test_v4_to_v5_backfills_capacity_retention_policy(tmp_path):
     assert job.retention_policy.space_reclaim_mode.value == "SAFE"
     assert job.retention_policy.backup_size_margin_percent == 20.0
     migrated.close()
+
+
+def test_v5_to_v6_adds_durable_reclaim_journal_without_data_loss(tmp_path):
+    path = tmp_path / "v5-to-v6.db"
+    values = populated_database(path)
+
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA foreign_keys = OFF")
+    drop_v6_reclaim_tables(connection)
+    connection.execute(
+        "UPDATE schema_version SET version = 5 WHERE id = 1"
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = SQLiteRepository(path)
+
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 6
+    assert {
+        "reclaim_operations",
+        "reclaim_chains",
+        "reclaim_bundles",
+    } <= {
+        row[0] for row in migrated.connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+
+    node, destination, vm, job, run, point, artifact_ids = values
+    assert migrated.get_node(node.id).id == node.id
+    assert (
+        migrated.get_storage_destination(node.id, destination.id).id
+        == destination.id
+    )
+    assert migrated.get_vm(vm.id).id == vm.id
+    assert migrated.get_job(job.id).id == job.id
+    assert migrated.get_run(run.id).id == run.id
+    assert migrated.get_restore_point(point.id).id == point.id
+    assert [
+        item.id for item in migrated.list_artifacts_for_run(run.id)
+    ] == artifact_ids
+    assert list(
+        migrated.connection.execute("PRAGMA foreign_key_check")
+    ) == []
+
+    migrated.close()
+
+
+def test_reclaim_bundle_composite_foreign_key_is_complete(tmp_path):
+    repository = SQLiteRepository(tmp_path / "reclaim-fk.db")
+
+    rows = [
+        tuple(row)
+        for row in repository.connection.execute(
+            'PRAGMA foreign_key_list("reclaim_bundles")'
+        )
+    ]
+
+    actual = {
+        (row[3], row[2], row[4])
+        for row in rows
+    }
+
+    assert (
+        "operation_id",
+        "reclaim_operations",
+        "id",
+    ) in actual
+
+    assert (
+        "operation_id",
+        "reclaim_chains",
+        "operation_id",
+    ) in actual
+
+    assert (
+        "chain_id",
+        "reclaim_chains",
+        "chain_id",
+    ) in actual
+
+    composite_rows = [
+        row for row in rows
+        if row[2] == "reclaim_chains"
+    ]
+
+    assert len(composite_rows) == 2
+    assert len({row[0] for row in composite_rows}) == 1
+    assert {row[1] for row in composite_rows} == {0, 1}
+
+    repository.close()

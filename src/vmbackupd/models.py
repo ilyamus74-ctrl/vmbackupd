@@ -96,6 +96,24 @@ class SpaceReclaimMode(StrEnum):
     SPACE_OPTIMIZED = "SPACE_OPTIMIZED"
 
 
+class ReclaimOperationState(StrEnum):
+    PLANNED = "PLANNED"
+    RETIRING = "RETIRING"
+    QUARANTINED = "QUARANTINED"
+    CATALOG_REMOVED = "CATALOG_REMOVED"
+    PURGING = "PURGING"
+    PURGED = "PURGED"
+    COMPLETED = "COMPLETED"
+    RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
+    ABORTED = "ABORTED"
+
+
+class ReclaimBundleState(StrEnum):
+    PLANNED = "PLANNED"
+    QUARANTINED = "QUARANTINED"
+    PURGED = "PURGED"
+
+
 @dataclass(frozen=True, slots=True)
 class RetentionPolicy:
     restore_points_to_retain: int = 7
@@ -230,6 +248,86 @@ class RestorePoint:
     status: RestorePointStatus = RestorePointStatus.AVAILABLE
     id: str = field(default_factory=new_id)
     created_at: datetime = field(default_factory=utcnow)
+
+
+@dataclass(frozen=True, slots=True)
+class ReclaimOperation:
+    job_run_id: str
+    job_id: str
+    vm_id: str
+    storage_destination_id: str
+    required_backup_bytes: int
+    free_bytes_before: int
+    reserve_bytes: int
+    expected_reclaim_bytes: int
+    state: ReclaimOperationState = ReclaimOperationState.PLANNED
+    free_bytes_after: int | None = None
+    error: str | None = None
+    id: str = field(default_factory=new_id)
+    created_at: datetime = field(default_factory=utcnow)
+    updated_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("required_backup_bytes", self.required_backup_bytes),
+            ("free_bytes_before", self.free_bytes_before),
+            ("reserve_bytes", self.reserve_bytes),
+            ("expected_reclaim_bytes", self.expected_reclaim_bytes),
+        ):
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative")
+        if self.free_bytes_after is not None and self.free_bytes_after < 0:
+            raise ValueError("free_bytes_after must be non-negative")
+        try:
+            state = ReclaimOperationState(self.state)
+        except ValueError as exc:
+            raise ValueError("invalid reclaim operation state") from exc
+        object.__setattr__(self, "state", state)
+
+
+@dataclass(frozen=True, slots=True)
+class ReclaimChain:
+    operation_id: str
+    chain_id: str
+    ordinal: int
+    expected_physical_bytes: int
+
+    def __post_init__(self) -> None:
+        if self.ordinal < 0:
+            raise ValueError("reclaim chain ordinal must be non-negative")
+        if self.expected_physical_bytes < 0:
+            raise ValueError(
+                "reclaim chain expected_physical_bytes must be non-negative"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ReclaimBundle:
+    operation_id: str
+    chain_id: str
+    restore_point_id: str
+    source_bundle_object_id: str
+    state: ReclaimBundleState = ReclaimBundleState.PLANNED
+    quarantine_object_id: str | None = None
+    expected_physical_bytes: int | None = None
+    source_device: int | None = None
+    source_inode: int | None = None
+
+    def __post_init__(self) -> None:
+        if not self.source_bundle_object_id:
+            raise ValueError("source_bundle_object_id must not be empty")
+        if (
+            self.expected_physical_bytes is not None
+            and self.expected_physical_bytes < 0
+        ):
+            raise ValueError(
+                "reclaim bundle expected_physical_bytes must be non-negative"
+            )
+        try:
+            state = ReclaimBundleState(self.state)
+        except ValueError as exc:
+            raise ValueError("invalid reclaim bundle state") from exc
+        object.__setattr__(self, "state", state)
 
 
 @dataclass(frozen=True, slots=True)
