@@ -1361,11 +1361,136 @@ or atomic remote promotion.
 
 ---
 
+# SSH.2b — Strict SSH host key trust
+
+Status: CLOSED
+
+Implementation commit:
+
+    1294141 — Add strict SSH host key trust
+
+Implemented an explicit daemon-owned known_hosts trust store:
+
+    /var/lib/vmbackupd/ssh/known_hosts
+
+Filesystem contract:
+
+    SSH root       0700
+    known_hosts    0600
+
+No schema change was required and CURRENT_SCHEMA_VERSION remains 10.
+
+Trust is associated with the SSH destination endpoint stored in SQLite.
+The API accepts destination_id and resolves the immutable/current SSH host
+and port from the destination definition.
+
+OpenSSH host tokens are represented as:
+
+    host.example.net
+        for port 22
+
+    [host.example.net]:3322
+        for non-standard ports
+
+Implemented operations:
+
+    ssh.hostkey.show
+    ssh.hostkey.add
+    ssh.hostkey.revoke
+
+The same operations are exposed through vmbackupctl:
+
+    vmbackupctl ssh hostkey-show <destination-id>
+    vmbackupctl ssh hostkey-add <destination-id> --key '<public-host-key>'
+    vmbackupctl ssh hostkey-revoke <destination-id>
+
+Trust behavior is deliberately explicit and fail-closed:
+
+- an unknown host key is not trusted;
+- no TOFU behavior is implemented;
+- no ssh-keyscan or automatic enrollment is performed;
+- adding the identical key is idempotent;
+- a different key for an already trusted endpoint is rejected;
+- key replacement requires explicit revoke followed by explicit add;
+- malformed existing known_hosts content is rejected;
+- duplicate endpoint entries are rejected;
+- symlink and non-regular known_hosts files are rejected;
+- known_hosts permissions must be 0600;
+- updates use temporary-file creation, fsync, atomic replace, and parent
+  directory fsync;
+- known_hosts filesystem paths are not serialized through API/CLI;
+- trust/key material is not stored in SQLite.
+
+Acceptance includes:
+
+- default port host-token behavior;
+- non-standard [host]:port behavior;
+- add/show/revoke lifecycle;
+- idempotent identical-key addition;
+- conflicting-key refusal;
+- malformed-store refusal;
+- unsafe permission and symlink refusal;
+- destination-bound API behavior;
+- endpoint changes causing the previous host trust not to apply;
+- CLI request mapping;
+- real OpenSSH Ed25519 public host key acceptance;
+- real known_hosts file creation and removal;
+- complete project pytest regression;
+- Python compilation;
+- Cockpit JavaScript syntax validation;
+- all SSH.2 vmbackupctl command help;
+- schema remains v10;
+- git diff validation.
+
+This phase does not perform an SSH network connection and does not
+automatically acquire or approve a remote server host key.
+
+---
+
+# SSH.2 — SSH identities and host trust
+
+Status: CLOSED
+
+Implementation commits:
+
+    e9447c8 — Add per-destination SSH identities
+    1294141 — Add strict SSH host key trust
+
+SSH.2 establishes both sides of the cryptographic SSH relationship required
+by later transport phases.
+
+Client identity:
+
+    /var/lib/vmbackupd/ssh/identities/<destination-id>/id_ed25519
+    /var/lib/vmbackupd/ssh/identities/<destination-id>/id_ed25519.pub
+
+Server trust:
+
+    /var/lib/vmbackupd/ssh/known_hosts
+
+The daemon now has:
+
+- per-destination Ed25519 client identities;
+- explicit public-key fingerprints;
+- strict destination endpoint host trust;
+- non-standard SSH port support in known_hosts;
+- explicit key generation and rotation;
+- explicit host-key add and revoke;
+- fail-closed validation for incomplete, mismatched, malformed, or unsafe
+  SSH identity/trust state;
+- no private-key serialization;
+- no TOFU or automatic host-key acceptance.
+
+SSH.2 intentionally does not yet perform connection preflight, receiver
+enrollment, remote transfer, remote verification, or atomic remote promotion.
+
+---
+
 # Current position
 
 Current implementation milestone:
 
-    SSH.2a per-destination SSH identities — CLOSED
+    SSH.2 identities and strict host trust — CLOSED
 
 Current safety boundary:
 
@@ -1391,6 +1516,8 @@ Current safety boundary:
     SSH identity generation       YES
     SSH identity rotation         YES
     private key API isolation     YES
-    SSH known_hosts trust         NO
+    SSH known_hosts trust         YES
+    explicit host key lifecycle   YES
+    non-standard host trust port  YES
     SSH connection preflight      NO
     remote SSH transfer           NO
