@@ -1670,6 +1670,106 @@ Acceptance:
 
 ---
 
+# SSH.3c.1 — Receiver authorized source registry
+
+Status: CLOSED
+
+Implementation commit:
+
+    9d89ab0 — Add receiver authorized source registry
+
+The receiver now has a daemon-owned registry of SSH source public identities.
+
+Persistent state:
+
+    /var/lib/vmbackupd/receiver/
+        authorized_sources.json
+
+Filesystem contract:
+
+    receiver directory             0700
+    authorized_sources.json        0600
+
+The registry is intentionally independent from SQLite. The database schema
+remains at version 10.
+
+Receiver API:
+
+    receiver.key.list
+    receiver.key.add
+    receiver.key.revoke
+
+CLI:
+
+    vmbackupctl receiver key-list
+
+    vmbackupctl receiver key-add         --label <source-label>         --key '<ssh-ed25519-public-key>'
+
+    vmbackupctl receiver key-revoke         <SHA256-fingerprint>
+
+Each stored source contains:
+
+    label
+    public_key
+    fingerprint
+    created_at
+
+Security properties:
+
+- only Ed25519 public keys are accepted;
+- SSH key blobs are parsed and structurally validated;
+- comments are not persisted as part of the canonical public key;
+- SHA256 fingerprints are calculated from the actual SSH key blob;
+- private keys cannot be stored through the receiver API;
+- malformed registry JSON fails closed;
+- unsupported registry schema fails closed;
+- invalid stored fingerprints fail closed;
+- duplicate stored identities fail closed;
+- receiver root symlinks fail closed;
+- registry-file symlinks fail closed;
+- non-0600 registry files fail closed;
+- identical public-key addition is idempotent;
+- an existing label with a different public key is rejected as a conflict;
+- revocation is explicit and fingerprint-based;
+- repeated revocation of an already absent fingerprint is idempotent;
+- writes use a temporary sibling file, fsync, atomic replace, and parent
+  directory fsync;
+- registry filesystem paths are internal and are not serialized through the
+  public API.
+
+Packaging creates:
+
+    /var/lib/vmbackupd/receiver
+
+as a persistent 0700 vmbackupd:vmbackupd directory.
+
+SSH.3c.1 deliberately does not yet provide:
+
+    vmbackupd-transfer system account
+    openssh-server integration
+    AuthorizedKeysCommand
+    sshd configuration
+    forced receiver command
+    remote data transfer
+
+Those belong to SSH.3c.2.
+
+Acceptance:
+
+- dedicated receiver registry tests passed;
+- existing SSH identity regression passed;
+- existing strict known_hosts regression passed;
+- SSH destination API/configuration regression passed;
+- application and CLI regression passed;
+- packaging regression passed;
+- complete project pytest regression passed;
+- Python compilation passed;
+- git diff validation passed;
+- schema remained at version 10;
+- no sshd or transfer-account integration was introduced in this subphase.
+
+---
+
 # Storage replication roadmap
 
 A backup job will support one primary destination and zero or more replica
@@ -1726,7 +1826,7 @@ capture to multiple disks or remote receivers.
 
 Current implementation milestone:
 
-    SSH.3b Cockpit SSH identity and host trust — CLOSED
+    SSH.3c.1 Receiver authorized source registry — CLOSED
 
 Current safety boundary:
 
@@ -1758,6 +1858,10 @@ Current safety boundary:
     Cockpit SSH storage UI        YES
     Cockpit SSH identity UI       YES
     Cockpit SSH host trust UI     YES
+    receiver source registry      YES
+    receiver source key API       YES
+    receiver source key CLI       YES
+    receiver OS/sshd integration  NO
     SSH connection preflight      NO
     remote SSH transfer           NO
     backup replication            ROADMAP
