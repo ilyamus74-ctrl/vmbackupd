@@ -1486,11 +1486,110 @@ enrollment, remote transfer, remote verification, or atomic remote promotion.
 
 ---
 
+# SSH.3a — Cockpit SSH storage destinations
+
+Status: CLOSED
+
+Implementation commit:
+
+    38c055d — Add SSH storage destination Cockpit UI
+
+Cockpit Storage now distinguishes local and SSH storage destinations.
+
+Storage table:
+
+    Name
+    Type
+    Target
+    Destination path
+    Default
+    Free
+    Reserve
+    Actions
+
+LOCAL destinations show:
+
+- the local node as Target;
+- the local backup_data_root as Destination path;
+- locally measured free space;
+- existing reserve policy;
+- Local filesystem Test;
+- Set default when eligible.
+
+SSH destinations show:
+
+- Type SSH;
+- SSH host and non-standard port as Target;
+- ssh_remote_root as the final Destination path;
+- backup_data_root separately as Local staging;
+- remote capacity as Not checked until SSH.4;
+- staging reserve separately from future remote capacity;
+- no Local filesystem Test action;
+- no Set default action while remote transport is not implemented.
+
+The Add/Edit destination dialog now supports:
+
+    LOCAL
+    SSH
+
+SSH configuration fields:
+
+    Local staging path
+    Remote host
+    SSH port
+    Remote user
+    Remote destination path
+
+Existing destination transport identity remains immutable after creation,
+and physical storage identity remains protected after backup history locks
+the destination.
+
+SSH destinations are visible in the Backup Job destination selector but are
+disabled until remote SSH transport is implemented. Cockpit therefore does
+not imply that an SSH backup can currently execute successfully.
+
+SSH.3a does not expose SSH identity or known_hosts management. Those controls
+belong to SSH.3b.
+
+SSH.3a does not claim successful SSH connectivity, authentication, remote
+filesystem readiness, or remote free capacity. Connection preflight belongs
+to SSH.4.
+
+Acceptance:
+
+- existing Cockpit regression passed;
+- dedicated SSH.3a frontend contract tests passed;
+- packaging regression passed;
+- complete project pytest regression passed;
+- Python compilation passed;
+- Cockpit JavaScript syntax validation passed;
+- source api.js was unchanged by SSH.3a;
+- dev database migrated successfully from schema v9 to v10;
+- pre-migration SQLite snapshot passed integrity_check;
+- existing LOCAL destination IDs and configuration survived migration;
+- migrated database passed integrity_check;
+- dev daemon restarted successfully on schema v10;
+- temporary live SSH destination was created through the real daemon API;
+- live SSH destination correctly returned free_bytes=null;
+- real backend storage.test for SSH failed closed with
+  REMOTE_TRANSPORT_NOT_IMPLEMENTED;
+- deployed Cockpit rendered LOCAL and SSH destinations separately;
+- SSH Target, remote destination path, local staging, and Not checked remote
+  capacity were visually verified;
+- SSH destination did not expose Test or Set default actions;
+- dev api.js was deliberately preserved during frontend deployment;
+- temporary SSH acceptance data was removed by restoring the clean v10
+  snapshot;
+- restored dev database passed integrity_check and the daemon returned to
+  RUNNING state.
+
+---
+
 # Current position
 
 Current implementation milestone:
 
-    SSH.2 identities and strict host trust — CLOSED
+    SSH.3a Cockpit SSH storage destinations — CLOSED
 
 Current safety boundary:
 
@@ -1519,5 +1618,6 @@ Current safety boundary:
     SSH known_hosts trust         YES
     explicit host key lifecycle   YES
     non-standard host trust port  YES
+    Cockpit SSH storage UI        YES
     SSH connection preflight      NO
     remote SSH transfer           NO
