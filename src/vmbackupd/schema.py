@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import Callable, Mapping
 
 
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 8
 
 
 class SchemaError(RuntimeError):
@@ -98,7 +98,7 @@ RECLAIM_SCHEMA_STATEMENTS = (
         source_device INTEGER,
         source_inode INTEGER,
         state TEXT NOT NULL CHECK(state IN (
-            'PLANNED', 'QUARANTINED', 'PURGED'
+            'PLANNED', 'QUARANTINED', 'PURGING', 'PURGED'
         )),
         PRIMARY KEY(operation_id, restore_point_id),
         UNIQUE(operation_id, source_bundle_object_id),
@@ -366,8 +366,12 @@ CURRENT_COLUMNS = {
     },
 }
 
-VERSION_6_COLUMNS = {
+VERSION_7_COLUMNS = {
     name: set(columns) for name, columns in CURRENT_COLUMNS.items()
+}
+
+VERSION_6_COLUMNS = {
+    name: set(columns) for name, columns in VERSION_7_COLUMNS.items()
 }
 VERSION_6_COLUMNS["reclaim_operations"].remove("recovery_from_state")
 
@@ -998,6 +1002,80 @@ def migrate_6_to_7(connection: sqlite3.Connection) -> None:
     )
 
 
+def migrate_7_to_8(connection: sqlite3.Connection) -> None:
+    """Add durable per-bundle PURGING intent without guessing old purge state."""
+
+    ambiguous = connection.execute(
+        """SELECT 1
+           FROM reclaim_operations
+           WHERE state = 'PURGING'
+              OR (
+                  state = 'RECOVERY_REQUIRED'
+                  AND recovery_from_state = 'PURGING'
+              )
+           LIMIT 1"""
+    ).fetchone()
+
+    if ambiguous is not None:
+        raise SchemaMigrationError(
+            "schema v7 reclaim PURGING state has no durable "
+            "per-bundle purge intent"
+        )
+
+    connection.execute(
+        """CREATE TABLE reclaim_bundles_v8 (
+            operation_id TEXT NOT NULL REFERENCES reclaim_operations(id),
+            chain_id TEXT NOT NULL,
+            restore_point_id TEXT NOT NULL,
+            source_bundle_object_id TEXT NOT NULL,
+            quarantine_object_id TEXT,
+            expected_physical_bytes INTEGER CHECK(
+                expected_physical_bytes IS NULL
+                OR expected_physical_bytes >= 0
+            ),
+            source_device INTEGER,
+            source_inode INTEGER,
+            state TEXT NOT NULL CHECK(state IN (
+                'PLANNED', 'QUARANTINED', 'PURGING', 'PURGED'
+            )),
+            PRIMARY KEY(operation_id, restore_point_id),
+            UNIQUE(operation_id, source_bundle_object_id),
+            FOREIGN KEY(operation_id, chain_id)
+                REFERENCES reclaim_chains(operation_id, chain_id)
+        )"""
+    )
+
+    connection.execute(
+        """INSERT INTO reclaim_bundles_v8 (
+               operation_id,
+               chain_id,
+               restore_point_id,
+               source_bundle_object_id,
+               quarantine_object_id,
+               expected_physical_bytes,
+               source_device,
+               source_inode,
+               state
+           )
+           SELECT
+               operation_id,
+               chain_id,
+               restore_point_id,
+               source_bundle_object_id,
+               quarantine_object_id,
+               expected_physical_bytes,
+               source_device,
+               source_inode,
+               state
+           FROM reclaim_bundles"""
+    )
+
+    connection.execute("DROP TABLE reclaim_bundles")
+    connection.execute(
+        "ALTER TABLE reclaim_bundles_v8 RENAME TO reclaim_bundles"
+    )
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: migrate_0_to_1,
     1: migrate_1_to_2,
@@ -1006,6 +1084,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     4: migrate_4_to_5,
     5: migrate_5_to_6,
     6: migrate_6_to_7,
+    7: migrate_7_to_8,
 }
 
 

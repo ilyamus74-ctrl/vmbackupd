@@ -111,6 +111,7 @@ class ReclaimOperationState(StrEnum):
 class ReclaimBundleState(StrEnum):
     PLANNED = "PLANNED"
     QUARANTINED = "QUARANTINED"
+    PURGING = "PURGING"
     PURGED = "PURGED"
 
 

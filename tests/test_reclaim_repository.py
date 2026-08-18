@@ -847,6 +847,10 @@ def test_reclaim_purge_and_completion_require_bundle_progress(tmp_path):
     operation = repository.begin_reclaim_purge(operation.id)
     assert operation.state is ReclaimOperationState.PURGING
 
+    repository.begin_reclaim_bundle_purge(
+        operation.id,
+        points[0].id,
+    )
     repository.mark_reclaim_bundle_purged(
         operation.id,
         points[0].id,
@@ -858,6 +862,10 @@ def test_reclaim_purge_and_completion_require_bundle_progress(tmp_path):
     ):
         repository.mark_reclaim_purged(operation.id)
 
+    repository.begin_reclaim_bundle_purge(
+        operation.id,
+        points[1].id,
+    )
     repository.mark_reclaim_bundle_purged(
         operation.id,
         points[1].id,
@@ -1281,7 +1289,7 @@ def test_recovery_resume_rejects_incompatible_database_evidence(
 
     with pytest.raises(
         DomainInvariantError,
-        match="PURGED bundle",
+        match="invalid bundle state",
     ):
         repository.resume_reclaim_recovery(operation.id)
 
@@ -1665,3 +1673,137 @@ def test_catalog_retirement_rolls_back_every_catalog_change_on_failure(
     assert len(
         repository.list_reclaim_bundles(operation.id)
     ) == 1
+
+
+def test_bundle_purge_requires_durable_per_bundle_intent(
+    tmp_path,
+):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "bundle-purge-intent.db"
+    )
+
+    operation, _, points = make_quarantined_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+    )
+
+    operation = repository.retire_reclaim_catalog(
+        operation.id
+    )
+    operation = repository.begin_reclaim_purge(
+        operation.id
+    )
+
+    bundle = repository.list_reclaim_bundles(
+        operation.id
+    )[0]
+
+    assert bundle.state.value == "QUARANTINED"
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="completion requires PURGING",
+    ):
+        repository.mark_reclaim_bundle_purged(
+            operation.id,
+            points[0].id,
+        )
+
+    bundle = repository.begin_reclaim_bundle_purge(
+        operation.id,
+        points[0].id,
+    )
+
+    assert bundle.state.value == "PURGING"
+
+    bundle = repository.mark_reclaim_bundle_purged(
+        operation.id,
+        points[0].id,
+    )
+
+    assert bundle.state.value == "PURGED"
+
+
+def test_purging_recovery_accepts_durable_bundle_purge_intent(
+    tmp_path,
+):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "bundle-purge-recovery.db"
+    )
+
+    operation, _, points = make_quarantined_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+    )
+
+    operation = repository.retire_reclaim_catalog(
+        operation.id
+    )
+    operation = repository.begin_reclaim_purge(
+        operation.id
+    )
+
+    repository.begin_reclaim_bundle_purge(
+        operation.id,
+        points[0].id,
+    )
+
+    recovery = repository.require_reclaim_recovery(
+        operation.id,
+        "simulated crash during physical purge",
+    )
+
+    assert (
+        recovery.state
+        is ReclaimOperationState.RECOVERY_REQUIRED
+    )
+    assert (
+        recovery.recovery_from_state
+        is ReclaimOperationState.PURGING
+    )
+
+    resumed = repository.resume_reclaim_recovery(
+        operation.id
+    )
+
+    assert resumed.state is ReclaimOperationState.PURGING
+
+    bundles = repository.list_reclaim_bundles(
+        operation.id
+    )
+    assert len(bundles) == 1
+    assert bundles[0].state.value == "PURGING"
+
+
+def test_begin_bundle_purge_intent_requires_operation_purging(
+    tmp_path,
+):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "bundle-purge-operation-state.db"
+    )
+
+    operation, _, points = make_quarantined_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+    )
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="requires PURGING, got QUARANTINED",
+    ):
+        repository.begin_reclaim_bundle_purge(
+            operation.id,
+            points[0].id,
+        )
+
+    bundle = repository.list_reclaim_bundles(
+        operation.id
+    )[0]
+
+    assert bundle.state.value == "QUARANTINED"

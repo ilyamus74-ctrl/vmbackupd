@@ -3044,6 +3044,85 @@ class SQLiteRepository:
 
         return self.get_reclaim_operation(operation_id)
 
+    def begin_reclaim_bundle_purge(
+        self,
+        operation_id: str,
+        restore_point_id: str,
+    ) -> ReclaimBundle:
+        """Persist destructive per-bundle purge intent before filesystem removal."""
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_reclaim_operation_state(
+                operation_id,
+                ReclaimOperationState.PURGING,
+            )
+
+            row = self.connection.execute(
+                """SELECT *
+                   FROM reclaim_bundles
+                   WHERE operation_id = ?
+                     AND restore_point_id = ?""",
+                (operation_id, restore_point_id),
+            ).fetchone()
+
+            if row is None:
+                raise KeyError(restore_point_id)
+
+            if (
+                ReclaimBundleState(row["state"])
+                is not ReclaimBundleState.QUARANTINED
+            ):
+                raise DomainInvariantError(
+                    "reclaim bundle purge intent requires QUARANTINED"
+                )
+
+            if (
+                row["quarantine_object_id"] is None
+                or row["expected_physical_bytes"] is None
+                or row["source_device"] is None
+                or row["source_inode"] is None
+            ):
+                raise DomainInvariantError(
+                    "reclaim bundle purge intent requires "
+                    "complete quarantine evidence"
+                )
+
+            cursor = self.connection.execute(
+                """UPDATE reclaim_bundles
+                   SET state = 'PURGING'
+                   WHERE operation_id = ?
+                     AND restore_point_id = ?
+                     AND state = 'QUARANTINED'""",
+                (
+                    operation_id,
+                    restore_point_id,
+                ),
+            )
+
+            if cursor.rowcount != 1:
+                raise DomainInvariantError(
+                    "reclaim bundle changed concurrently"
+                )
+
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+        bundles = [
+            item
+            for item in self.list_reclaim_bundles(operation_id)
+            if item.restore_point_id == restore_point_id
+        ]
+
+        if len(bundles) != 1:
+            raise DomainInvariantError(
+                "persisted reclaim bundle disappeared"
+            )
+
+        return bundles[0]
+
     def mark_reclaim_bundle_purged(
         self,
         operation_id: str,
@@ -3070,10 +3149,10 @@ class SQLiteRepository:
 
             if (
                 ReclaimBundleState(row["state"])
-                is not ReclaimBundleState.QUARANTINED
+                is not ReclaimBundleState.PURGING
             ):
                 raise DomainInvariantError(
-                    "reclaim bundle purge requires QUARANTINED"
+                    "reclaim bundle purge completion requires PURGING"
                 )
             if (
                 row["quarantine_object_id"] is None
@@ -3090,7 +3169,7 @@ class SQLiteRepository:
                    SET state = 'PURGED'
                    WHERE operation_id = ?
                      AND restore_point_id = ?
-                     AND state = 'QUARANTINED'""",
+                     AND state = 'PURGING'""",
                 (operation_id, restore_point_id),
             )
             if cursor.rowcount != 1:
@@ -3365,7 +3444,7 @@ class SQLiteRepository:
                         )
                 else:
                     raise DomainInvariantError(
-                        "RETIRING recovery contains PURGED bundle"
+                        "RETIRING recovery contains invalid bundle state"
                     )
             return
 
@@ -3423,6 +3502,7 @@ class SQLiteRepository:
                 ReclaimBundleState(bundle["state"])
                 not in {
                     ReclaimBundleState.QUARANTINED,
+                    ReclaimBundleState.PURGING,
                     ReclaimBundleState.PURGED,
                 }
                 for bundle in bundles

@@ -404,7 +404,7 @@ def test_v5_to_v6_adds_durable_reclaim_journal_without_data_loss(tmp_path):
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 7
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 8
     assert {
         "reclaim_operations",
         "reclaim_chains",
@@ -496,7 +496,7 @@ def test_v6_to_v7_adds_recovery_provenance_without_data_loss(tmp_path):
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 7
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 8
     assert "recovery_from_state" in table_columns(
         migrated.connection,
         "reclaim_operations",
@@ -628,3 +628,211 @@ def test_v5_to_v6_step_uses_frozen_historical_reclaim_schema(tmp_path):
 
     connection.rollback()
     connection.close()
+
+
+def rebuild_reclaim_bundles_as_v7(
+    connection: sqlite3.Connection,
+) -> None:
+    """Replace current reclaim_bundles with the exact pre-v8 state CHECK."""
+
+    connection.execute(
+        """CREATE TABLE reclaim_bundles_v7 (
+            operation_id TEXT NOT NULL REFERENCES reclaim_operations(id),
+            chain_id TEXT NOT NULL,
+            restore_point_id TEXT NOT NULL,
+            source_bundle_object_id TEXT NOT NULL,
+            quarantine_object_id TEXT,
+            expected_physical_bytes INTEGER CHECK(
+                expected_physical_bytes IS NULL
+                OR expected_physical_bytes >= 0
+            ),
+            source_device INTEGER,
+            source_inode INTEGER,
+            state TEXT NOT NULL CHECK(state IN (
+                'PLANNED', 'QUARANTINED', 'PURGED'
+            )),
+            PRIMARY KEY(operation_id, restore_point_id),
+            UNIQUE(operation_id, source_bundle_object_id),
+            FOREIGN KEY(operation_id, chain_id)
+                REFERENCES reclaim_chains(operation_id, chain_id)
+        )"""
+    )
+
+    connection.execute(
+        """INSERT INTO reclaim_bundles_v7 (
+               operation_id,
+               chain_id,
+               restore_point_id,
+               source_bundle_object_id,
+               quarantine_object_id,
+               expected_physical_bytes,
+               source_device,
+               source_inode,
+               state
+           )
+           SELECT
+               operation_id,
+               chain_id,
+               restore_point_id,
+               source_bundle_object_id,
+               quarantine_object_id,
+               expected_physical_bytes,
+               source_device,
+               source_inode,
+               state
+           FROM reclaim_bundles"""
+    )
+
+    connection.execute("DROP TABLE reclaim_bundles")
+    connection.execute(
+        "ALTER TABLE reclaim_bundles_v7 RENAME TO reclaim_bundles"
+    )
+
+
+def test_v7_to_v8_adds_bundle_purging_state_without_data_loss(
+    tmp_path,
+):
+    path = tmp_path / "v7-to-v8.db"
+    values = populated_database(path)
+
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA foreign_keys = OFF")
+    rebuild_reclaim_bundles_as_v7(connection)
+    connection.execute(
+        "UPDATE schema_version SET version = 7 WHERE id = 1"
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = SQLiteRepository(path)
+
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 8
+
+    bundle_sql = migrated.connection.execute(
+        """SELECT sql
+           FROM sqlite_master
+           WHERE type = 'table'
+             AND name = 'reclaim_bundles'"""
+    ).fetchone()[0]
+
+    assert "'PURGING'" in bundle_sql
+
+    node, destination, vm, job, run, point, artifact_ids = values
+
+    assert migrated.get_node(node.id).id == node.id
+    assert (
+        migrated.get_storage_destination(
+            node.id,
+            destination.id,
+        ).id
+        == destination.id
+    )
+    assert migrated.get_vm(vm.id).id == vm.id
+    assert migrated.get_job(job.id).id == job.id
+    assert migrated.get_run(run.id).id == run.id
+    assert migrated.get_restore_point(point.id).id == point.id
+    assert [
+        item.id
+        for item in migrated.list_artifacts_for_run(run.id)
+    ] == artifact_ids
+
+    assert list(
+        migrated.connection.execute("PRAGMA foreign_key_check")
+    ) == []
+
+    migrated.close()
+
+
+@pytest.mark.parametrize(
+    ("state", "recovery_from_state"),
+    [
+        ("PURGING", None),
+        ("RECOVERY_REQUIRED", "PURGING"),
+    ],
+)
+def test_v7_ambiguous_purge_state_refuses_v8_migration(
+    tmp_path,
+    state,
+    recovery_from_state,
+):
+    path = tmp_path / (
+        "ambiguous-v7-"
+        + state.lower()
+        + ".db"
+    )
+
+    values = populated_database(path)
+    node, destination, vm, job, run, _, _ = values
+
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA foreign_keys = OFF")
+    rebuild_reclaim_bundles_as_v7(connection)
+
+    created = "2026-08-18T12:00:00+00:00"
+
+    connection.execute(
+        """INSERT INTO reclaim_operations (
+               id,
+               job_run_id,
+               job_id,
+               vm_id,
+               storage_destination_id,
+               state,
+               required_backup_bytes,
+               free_bytes_before,
+               reserve_bytes,
+               expected_reclaim_bytes,
+               free_bytes_after,
+               error,
+               recovery_from_state,
+               created_at,
+               updated_at
+           )
+           VALUES (
+               ?, ?, ?, ?, ?,
+               ?, 1, 0, 0, 1,
+               NULL, ?, ?,
+               ?, ?
+           )""",
+        (
+            "ambiguous-v7-purge",
+            run.id,
+            job.id,
+            vm.id,
+            destination.id,
+            state,
+            "legacy ambiguous physical purge",
+            recovery_from_state,
+            created,
+            created,
+        ),
+    )
+
+    connection.execute(
+        "UPDATE schema_version SET version = 7 WHERE id = 1"
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(
+        SchemaMigrationError,
+        match="no durable per-bundle purge intent",
+    ):
+        SQLiteRepository(path)
+
+    raw = sqlite3.connect(path)
+
+    assert raw.execute(
+        "SELECT version FROM schema_version WHERE id = 1"
+    ).fetchone()[0] == 7
+
+    bundle_sql = raw.execute(
+        """SELECT sql
+           FROM sqlite_master
+           WHERE type = 'table'
+             AND name = 'reclaim_bundles'"""
+    ).fetchone()[0]
+
+    assert "'PURGING'" not in bundle_sql
+
+    raw.close()
