@@ -4,3 +4,5 @@
 *.py[cod]
 *.egg-info/
 *.db
+
+.aider*
