@@ -8,7 +8,10 @@ from .bundle import BundleInspectionError, BundlePhysicalInspector
 from .models import (
     BackupChain, BackupChainStatus, BackupKind, RestorePoint,
 )
-from .retention import FullChainCapacity
+from .repository import SQLiteRepository
+from .retention import (
+    CapacityReclaimPlan, CapacityReclaimPlanner, FullChainCapacity,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,3 +150,115 @@ class FullChainCapacityCollector:
                 return "published bundle identity is reused"
 
         return None
+
+
+class CapacityPlanningError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class JobCapacityPlan:
+    """Read-only capacity decision for one persisted backup job."""
+
+    job_id: str
+    vm_id: str
+    storage_destination_id: str
+    total_bytes: int
+    chains: tuple[FullChainCapacity, ...]
+    inspection_issues: tuple[CapacityInspectionIssue, ...]
+    reclaim_plan: CapacityReclaimPlan
+
+
+class CapacityPlanningService:
+    """Join persisted policy, physical chain facts and capacity planning."""
+
+    def __init__(
+        self,
+        repository: SQLiteRepository,
+        collector: FullChainCapacityCollector,
+        planner: CapacityReclaimPlanner | None = None,
+    ) -> None:
+        self.repository = repository
+        self.collector = collector
+        self.planner = planner or CapacityReclaimPlanner()
+
+    def plan_job(
+        self,
+        job_id: str,
+        *,
+        free_bytes: int,
+        total_bytes: int,
+        required_backup_bytes: int,
+    ) -> JobCapacityPlan:
+        if total_bytes <= 0:
+            raise CapacityPlanningError(
+                "total_bytes must be positive"
+            )
+        if free_bytes < 0 or free_bytes > total_bytes:
+            raise CapacityPlanningError(
+                "free_bytes must be between zero and total_bytes"
+            )
+        if required_backup_bytes < 0:
+            raise CapacityPlanningError(
+                "required_backup_bytes must be non-negative"
+            )
+
+        job = self.repository.get_job(job_id)
+        vm = self.repository.get_vm(job.vm_id)
+
+        if job.storage_destination_id is None:
+            raise CapacityPlanningError(
+                "backup job has no storage destination"
+            )
+
+        try:
+            destination = self.repository.get_storage_destination(
+                vm.node_id,
+                job.storage_destination_id,
+            )
+        except KeyError as exc:
+            raise CapacityPlanningError(
+                "backup job storage destination is missing"
+            ) from exc
+
+        if (
+            destination.minimum_free_bytes < 0
+            or not 0 <= destination.minimum_free_percent <= 100
+        ):
+            raise CapacityPlanningError(
+                "storage destination reserve policy is invalid"
+            )
+
+        chains = self.repository.list_chains(vm.id)
+        restore_points = self.repository.list_restore_points(vm.id)
+        collection = self.collector.collect(
+            chains,
+            restore_points,
+        )
+
+        reserve_bytes = max(
+            destination.minimum_free_bytes,
+            int(
+                total_bytes
+                * destination.minimum_free_percent
+                / 100
+            ),
+        )
+
+        reclaim_plan = self.planner.plan(
+            list(collection.chains),
+            free_bytes=free_bytes,
+            reserve_bytes=reserve_bytes,
+            required_backup_bytes=required_backup_bytes,
+            policy=job.retention_policy,
+        )
+
+        return JobCapacityPlan(
+            job_id=job.id,
+            vm_id=vm.id,
+            storage_destination_id=destination.id,
+            total_bytes=total_bytes,
+            chains=collection.chains,
+            inspection_issues=collection.issues,
+            reclaim_plan=reclaim_plan,
+        )
