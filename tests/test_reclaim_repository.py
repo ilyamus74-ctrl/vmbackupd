@@ -558,3 +558,739 @@ def test_reclaim_operation_model_requires_exact_recovery_provenance():
         operation.recovery_from_state
         is ReclaimOperationState.PURGING
     )
+
+
+def make_planned_reclaim(
+    repository,
+    job,
+    vm,
+    target_run,
+    *,
+    points=1,
+    physical_bytes=100,
+):
+    selected, selected_points = add_chain(
+        repository,
+        job,
+        vm,
+        "transition-selected",
+        status=BackupChainStatus.CLOSED,
+        points=points,
+        created_offset=-20,
+    )
+    add_chain(
+        repository,
+        job,
+        vm,
+        "transition-survivor",
+        status=BackupChainStatus.ACTIVE,
+        points=1,
+        created_offset=-10,
+    )
+
+    operation = repository.create_reclaim_operation(
+        target_run.id,
+        [(selected.id, physical_bytes)],
+        required_backup_bytes=physical_bytes,
+        free_bytes_before=0,
+        reserve_bytes=0,
+    )
+    return operation, selected, selected_points
+
+
+def quarantine_bundle(
+    repository,
+    operation,
+    point,
+    *,
+    physical_bytes,
+    suffix,
+):
+    return repository.mark_reclaim_bundle_quarantined(
+        operation.id,
+        point.id,
+        quarantine_object_id=f"/reclaim/{operation.id}/{suffix}",
+        expected_physical_bytes=physical_bytes,
+        source_device=100,
+        source_inode=1000 + suffix,
+    )
+
+
+def test_reclaim_retirement_and_quarantine_require_complete_evidence(
+    tmp_path,
+):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "state.db"
+    )
+    operation, _, points = make_planned_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+        points=2,
+        physical_bytes=100,
+    )
+
+    operation = repository.begin_reclaim_retirement(operation.id)
+    assert operation.state is ReclaimOperationState.RETIRING
+
+    quarantine_bundle(
+        repository,
+        operation,
+        points[0],
+        physical_bytes=40,
+        suffix=1,
+    )
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="all bundles QUARANTINED",
+    ):
+        repository.mark_reclaim_quarantined(operation.id)
+
+    quarantine_bundle(
+        repository,
+        operation,
+        points[1],
+        physical_bytes=60,
+        suffix=2,
+    )
+
+    operation = repository.mark_reclaim_quarantined(operation.id)
+    assert operation.state is ReclaimOperationState.QUARANTINED
+
+    bundles = repository.list_reclaim_bundles(operation.id)
+    assert all(
+        bundle.state is ReclaimBundleState.QUARANTINED
+        for bundle in bundles
+    )
+    assert sum(
+        bundle.expected_physical_bytes
+        for bundle in bundles
+        if bundle.expected_physical_bytes is not None
+    ) == 100
+
+
+def test_quarantine_total_must_match_planned_reclaim_snapshot(tmp_path):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "state.db"
+    )
+    operation, _, points = make_planned_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+        points=1,
+        physical_bytes=100,
+    )
+
+    repository.begin_reclaim_retirement(operation.id)
+    quarantine_bundle(
+        repository,
+        operation,
+        points[0],
+        physical_bytes=99,
+        suffix=1,
+    )
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="physical total differs",
+    ):
+        repository.mark_reclaim_quarantined(operation.id)
+
+    assert (
+        repository.get_reclaim_operation(operation.id).state
+        is ReclaimOperationState.RETIRING
+    )
+
+
+def test_duplicate_quarantine_identity_is_refused_atomically(tmp_path):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "state.db"
+    )
+    operation, _, points = make_planned_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+        points=2,
+        physical_bytes=100,
+    )
+
+    repository.begin_reclaim_retirement(operation.id)
+
+    repository.mark_reclaim_bundle_quarantined(
+        operation.id,
+        points[0].id,
+        quarantine_object_id="/reclaim/shared",
+        expected_physical_bytes=40,
+        source_device=100,
+        source_inode=1001,
+    )
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="already in use",
+    ):
+        repository.mark_reclaim_bundle_quarantined(
+            operation.id,
+            points[1].id,
+            quarantine_object_id="/reclaim/shared",
+            expected_physical_bytes=60,
+            source_device=100,
+            source_inode=1002,
+        )
+
+    bundles = repository.list_reclaim_bundles(operation.id)
+    states = {
+        bundle.restore_point_id: bundle.state
+        for bundle in bundles
+    }
+    assert states[points[0].id] is ReclaimBundleState.QUARANTINED
+    assert states[points[1].id] is ReclaimBundleState.PLANNED
+
+
+def test_catalog_removed_transition_requires_catalog_actually_absent(
+    tmp_path,
+):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "state.db"
+    )
+    operation, selected, points = make_planned_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+        points=1,
+        physical_bytes=100,
+    )
+
+    repository.begin_reclaim_retirement(operation.id)
+    quarantine_bundle(
+        repository,
+        operation,
+        points[0],
+        physical_bytes=100,
+        suffix=1,
+    )
+    repository.mark_reclaim_quarantined(operation.id)
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="restore points remain",
+    ):
+        repository.mark_reclaim_catalog_removed(operation.id)
+
+    repository.connection.execute(
+        "DELETE FROM restore_points WHERE id = ?",
+        (points[0].id,),
+    )
+    repository.connection.execute(
+        "DELETE FROM backup_chains WHERE id = ?",
+        (selected.id,),
+    )
+    repository.connection.commit()
+
+    operation = repository.mark_reclaim_catalog_removed(operation.id)
+    assert (
+        operation.state
+        is ReclaimOperationState.CATALOG_REMOVED
+    )
+
+
+def test_reclaim_purge_and_completion_require_bundle_progress(tmp_path):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "state.db"
+    )
+    operation, selected, points = make_planned_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+        points=2,
+        physical_bytes=100,
+    )
+
+    repository.begin_reclaim_retirement(operation.id)
+    quarantine_bundle(
+        repository,
+        operation,
+        points[0],
+        physical_bytes=40,
+        suffix=1,
+    )
+    quarantine_bundle(
+        repository,
+        operation,
+        points[1],
+        physical_bytes=60,
+        suffix=2,
+    )
+    repository.mark_reclaim_quarantined(operation.id)
+
+    repository.connection.execute(
+        "DELETE FROM restore_points WHERE id = ?",
+        (points[1].id,),
+    )
+    repository.connection.execute(
+        "DELETE FROM restore_points WHERE id = ?",
+        (points[0].id,),
+    )
+    repository.connection.execute(
+        "DELETE FROM backup_chains WHERE id = ?",
+        (selected.id,),
+    )
+    repository.connection.commit()
+
+    repository.mark_reclaim_catalog_removed(operation.id)
+    operation = repository.begin_reclaim_purge(operation.id)
+    assert operation.state is ReclaimOperationState.PURGING
+
+    repository.mark_reclaim_bundle_purged(
+        operation.id,
+        points[0].id,
+    )
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="every bundle PURGED",
+    ):
+        repository.mark_reclaim_purged(operation.id)
+
+    repository.mark_reclaim_bundle_purged(
+        operation.id,
+        points[1].id,
+    )
+
+    operation = repository.mark_reclaim_purged(operation.id)
+    assert operation.state is ReclaimOperationState.PURGED
+
+    operation = repository.complete_reclaim(
+        operation.id,
+        free_bytes_after=123456,
+    )
+
+    assert operation.state is ReclaimOperationState.COMPLETED
+    assert operation.free_bytes_after == 123456
+    assert operation.recovery_from_state is None
+
+
+def test_reclaim_abort_is_allowed_only_before_retirement(tmp_path):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "state.db"
+    )
+    operation, _, _ = make_planned_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+    )
+
+    aborted = repository.abort_reclaim(operation.id)
+    assert aborted.state is ReclaimOperationState.ABORTED
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="requires PLANNED",
+    ):
+        repository.begin_reclaim_retirement(operation.id)
+
+
+def test_reclaim_recovery_preserves_and_resumes_exact_state(tmp_path):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "state.db"
+    )
+    operation, _, _ = make_planned_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+    )
+
+    operation = repository.begin_reclaim_retirement(operation.id)
+
+    recovery = repository.require_reclaim_recovery(
+        operation.id,
+        "simulated crash ambiguity",
+    )
+
+    assert (
+        recovery.state
+        is ReclaimOperationState.RECOVERY_REQUIRED
+    )
+    assert (
+        recovery.recovery_from_state
+        is ReclaimOperationState.RETIRING
+    )
+    assert recovery.error == "simulated crash ambiguity"
+
+    pending = repository.list_reclaim_operations_requiring_recovery()
+    assert [item.id for item in pending] == [operation.id]
+
+    resumed = repository.resume_reclaim_recovery(operation.id)
+
+    assert resumed.state is ReclaimOperationState.RETIRING
+    assert resumed.recovery_from_state is None
+    assert resumed.error == "simulated crash ambiguity"
+    assert repository.list_reclaim_operations_requiring_recovery() == []
+
+
+@pytest.mark.parametrize(
+    "terminal_state",
+    [
+        ReclaimOperationState.PLANNED,
+        ReclaimOperationState.ABORTED,
+        ReclaimOperationState.COMPLETED,
+    ],
+)
+def test_reclaim_recovery_rejects_non_destructive_states(
+    tmp_path,
+    terminal_state,
+):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / f"{terminal_state.value}.db"
+    )
+    operation, _, _ = make_planned_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+    )
+
+    if terminal_state is ReclaimOperationState.ABORTED:
+        repository.abort_reclaim(operation.id)
+    elif terminal_state is ReclaimOperationState.COMPLETED:
+        # Direct SQL here intentionally constructs a terminal repository
+        # state solely to test recovery-state admission.
+        repository.connection.execute(
+            """UPDATE reclaim_operations
+               SET state = 'COMPLETED',
+                   free_bytes_after = 1
+               WHERE id = ?""",
+            (operation.id,),
+        )
+        repository.connection.commit()
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="destructive state",
+    ):
+        repository.require_reclaim_recovery(
+            operation.id,
+            "must refuse",
+        )
+
+
+def test_retiring_restore_points_become_effectively_unavailable(
+    tmp_path,
+):
+    repository, node, _, vm, job, target_run = catalog(
+        tmp_path / "visibility.db"
+    )
+
+    operation, _, selected_points = make_planned_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+        points=1,
+        physical_bytes=100,
+    )
+
+    selected_point = selected_points[0]
+
+    visible_before = {
+        point.id
+        for point in repository.list_restore_points(vm.id)
+    }
+    assert selected_point.id in visible_before
+
+    assert (
+        repository.get_restore_point(selected_point.id).id
+        == selected_point.id
+    )
+
+    repository.begin_reclaim_retirement(operation.id)
+
+    visible_after = {
+        point.id
+        for point in repository.list_restore_points(vm.id)
+    }
+    assert selected_point.id not in visible_after
+
+    visible_for_node = {
+        point.id
+        for point in repository.list_restore_points_for_node(node.id)
+    }
+    assert selected_point.id not in visible_for_node
+
+    with pytest.raises(KeyError):
+        repository.get_restore_point(selected_point.id)
+
+
+def test_aborted_reclaim_does_not_hide_restore_points(tmp_path):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "aborted-visibility.db"
+    )
+
+    operation, _, selected_points = make_planned_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+    )
+
+    selected_point = selected_points[0]
+
+    repository.abort_reclaim(operation.id)
+
+    assert (
+        repository.get_restore_point(selected_point.id).id
+        == selected_point.id
+    )
+    assert selected_point.id in {
+        point.id
+        for point in repository.list_restore_points(vm.id)
+    }
+
+
+def test_retirement_revalidates_space_optimized_policy(tmp_path):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "policy-revalidation.db"
+    )
+
+    operation, _, _ = make_planned_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+    )
+
+    repository.connection.execute(
+        """UPDATE backup_jobs
+           SET space_reclaim_mode = 'SAFE'
+           WHERE id = ?""",
+        (job.id,),
+    )
+    repository.connection.commit()
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="SPACE_OPTIMIZED",
+    ):
+        repository.begin_reclaim_retirement(operation.id)
+
+    assert (
+        repository.get_reclaim_operation(operation.id).state
+        is ReclaimOperationState.PLANNED
+    )
+
+
+def test_retirement_revalidates_restore_point_snapshot(tmp_path):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "snapshot-revalidation.db"
+    )
+
+    operation, _, selected_points = make_planned_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+    )
+
+    repository.connection.execute(
+        """UPDATE restore_points
+           SET bundle_object_id = ?
+           WHERE id = ?""",
+        (
+            "/backup/changed-after-planning",
+            selected_points[0].id,
+        ),
+    )
+    repository.connection.commit()
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="snapshot changed",
+    ):
+        repository.begin_reclaim_retirement(operation.id)
+
+    assert (
+        repository.get_reclaim_operation(operation.id).state
+        is ReclaimOperationState.PLANNED
+    )
+
+
+def test_retirement_revalidates_minimum_full_chain_floor(tmp_path):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "floor-revalidation.db",
+        minimum_full_chains=1,
+    )
+
+    operation, _, _ = make_planned_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+    )
+
+    survivor = repository.connection.execute(
+        """SELECT bc.id
+           FROM backup_chains bc
+           WHERE bc.vm_id = ?
+             AND bc.status = 'ACTIVE'
+           ORDER BY bc.created_at DESC
+           LIMIT 1""",
+        (vm.id,),
+    ).fetchone()
+
+    assert survivor is not None
+
+    repository.connection.execute(
+        "DELETE FROM restore_points WHERE chain_id = ?",
+        (survivor["id"],),
+    )
+    repository.connection.commit()
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="minimum_full_chains",
+    ):
+        repository.begin_reclaim_retirement(operation.id)
+
+    assert (
+        repository.get_reclaim_operation(operation.id).state
+        is ReclaimOperationState.PLANNED
+    )
+
+
+def test_quarantine_requires_per_chain_physical_totals(tmp_path):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "per-chain-total.db"
+    )
+
+    first, first_points = add_chain(
+        repository,
+        job,
+        vm,
+        "physical-a",
+        status=BackupChainStatus.CLOSED,
+        points=1,
+        created_offset=-30,
+    )
+    second, second_points = add_chain(
+        repository,
+        job,
+        vm,
+        "physical-b",
+        status=BackupChainStatus.CLOSED,
+        points=1,
+        created_offset=-20,
+    )
+    add_chain(
+        repository,
+        job,
+        vm,
+        "physical-survivor",
+        status=BackupChainStatus.ACTIVE,
+        points=1,
+        created_offset=-10,
+    )
+
+    operation = repository.create_reclaim_operation(
+        target_run.id,
+        [
+            (first.id, 40),
+            (second.id, 60),
+        ],
+        required_backup_bytes=100,
+        free_bytes_before=0,
+        reserve_bytes=0,
+    )
+
+    repository.begin_reclaim_retirement(operation.id)
+
+    repository.mark_reclaim_bundle_quarantined(
+        operation.id,
+        first_points[0].id,
+        quarantine_object_id="/reclaim/physical-a",
+        expected_physical_bytes=60,
+        source_device=1,
+        source_inode=101,
+    )
+    repository.mark_reclaim_bundle_quarantined(
+        operation.id,
+        second_points[0].id,
+        quarantine_object_id="/reclaim/physical-b",
+        expected_physical_bytes=40,
+        source_device=1,
+        source_inode=102,
+    )
+
+    # Global total is still exactly 100, but each chain is wrong.
+    with pytest.raises(
+        DomainInvariantError,
+        match="chain snapshot",
+    ):
+        repository.mark_reclaim_quarantined(operation.id)
+
+    assert (
+        repository.get_reclaim_operation(operation.id).state
+        is ReclaimOperationState.RETIRING
+    )
+
+
+def test_recovery_resume_rejects_incompatible_database_evidence(
+    tmp_path,
+):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "recovery-evidence.db"
+    )
+
+    operation, _, points = make_planned_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+    )
+
+    repository.begin_reclaim_retirement(operation.id)
+
+    recovery = repository.require_reclaim_recovery(
+        operation.id,
+        "simulated ambiguous retirement",
+    )
+    assert (
+        recovery.recovery_from_state
+        is ReclaimOperationState.RETIRING
+    )
+
+    # Construct evidence impossible for a RETIRING resume.
+    repository.connection.execute(
+        """UPDATE reclaim_bundles
+           SET state = 'PURGED'
+           WHERE operation_id = ?
+             AND restore_point_id = ?""",
+        (
+            operation.id,
+            points[0].id,
+        ),
+    )
+    repository.connection.commit()
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="PURGED bundle",
+    ):
+        repository.resume_reclaim_recovery(operation.id)
+
+    still_recovery = repository.get_reclaim_operation(operation.id)
+    assert (
+        still_recovery.state
+        is ReclaimOperationState.RECOVERY_REQUIRED
+    )
+    assert (
+        still_recovery.recovery_from_state
+        is ReclaimOperationState.RETIRING
+    )

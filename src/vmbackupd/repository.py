@@ -937,7 +937,25 @@ class SQLiteRepository:
 
     def get_restore_point(self, restore_point_id: str) -> RestorePoint:
         row = self.connection.execute(
-            "SELECT * FROM restore_points WHERE id = ?", (restore_point_id,)
+            """SELECT rp.*
+               FROM restore_points rp
+               WHERE rp.id = ?
+                 AND NOT EXISTS (
+                     SELECT 1
+                     FROM reclaim_bundles rb
+                     JOIN reclaim_operations ro
+                       ON ro.id = rb.operation_id
+                     WHERE rb.restore_point_id = rp.id
+                       AND ro.state IN (
+                           'RETIRING',
+                           'QUARANTINED',
+                           'CATALOG_REMOVED',
+                           'PURGING',
+                           'PURGED',
+                           'RECOVERY_REQUIRED'
+                       )
+                 )""",
+            (restore_point_id,),
         ).fetchone()
         if row is None:
             raise KeyError(restore_point_id)
@@ -1965,6 +1983,1153 @@ class SQLiteRepository:
 
         return self.get_reclaim_operation(operation.id)
 
+    def _validate_reclaim_retirement_snapshot(
+        self,
+        operation: sqlite3.Row,
+    ) -> None:
+        """Revalidate the immutable PLANNED snapshot before RETIRING."""
+
+        context = self.connection.execute(
+            """SELECT
+                   jr.job_id AS run_job_id,
+                   jr.storage_destination_id AS run_destination_id,
+                   jr.state AS run_state,
+                   jr.recovery_required AS run_recovery_required,
+                   bj.vm_id AS job_vm_id,
+                   bj.storage_destination_id AS job_destination_id,
+                   bj.space_reclaim_mode AS space_reclaim_mode,
+                   bj.minimum_full_chains AS minimum_full_chains,
+                   vm.node_id AS vm_node_id,
+                   sd.node_id AS storage_node_id
+               FROM job_runs jr
+               JOIN backup_jobs bj ON bj.id = ?
+               JOIN vms vm ON vm.id = bj.vm_id
+               LEFT JOIN storage_destinations sd
+                 ON sd.id = jr.storage_destination_id
+               WHERE jr.id = ?""",
+            (
+                operation["job_id"],
+                operation["job_run_id"],
+            ),
+        ).fetchone()
+
+        if context is None:
+            raise DomainInvariantError(
+                "reclaim retirement lineage is missing"
+            )
+
+        if (
+            context["run_job_id"] != operation["job_id"]
+            or context["job_vm_id"] != operation["vm_id"]
+            or context["run_destination_id"]
+                != operation["storage_destination_id"]
+            or context["job_destination_id"]
+                != operation["storage_destination_id"]
+            or context["storage_node_id"] is None
+            or context["storage_node_id"] != context["vm_node_id"]
+        ):
+            raise DomainInvariantError(
+                "reclaim retirement lineage changed"
+            )
+
+        if RunState(context["run_state"]) is not RunState.BACKING_UP:
+            raise DomainInvariantError(
+                "reclaim retirement requires BACKING_UP"
+            )
+
+        if bool(context["run_recovery_required"]):
+            raise DomainInvariantError(
+                "reclaim retirement is forbidden during run recovery"
+            )
+
+        if (
+            SpaceReclaimMode(context["space_reclaim_mode"])
+            is not SpaceReclaimMode.SPACE_OPTIMIZED
+        ):
+            raise DomainInvariantError(
+                "reclaim retirement requires SPACE_OPTIMIZED policy"
+            )
+
+        selected = self.connection.execute(
+            """SELECT *
+               FROM reclaim_chains
+               WHERE operation_id = ?
+               ORDER BY ordinal, chain_id""",
+            (operation["id"],),
+        ).fetchall()
+
+        if not selected:
+            raise DomainInvariantError(
+                "reclaim retirement snapshot has no chains"
+            )
+
+        selected_ids = [row["chain_id"] for row in selected]
+        if len(selected_ids) != len(set(selected_ids)):
+            raise DomainInvariantError(
+                "reclaim retirement snapshot has duplicate chains"
+            )
+        selected_set = set(selected_ids)
+
+        chains = self.connection.execute(
+            """SELECT *
+               FROM backup_chains
+               WHERE vm_id = ?
+               ORDER BY created_at, id""",
+            (operation["vm_id"],),
+        ).fetchall()
+        chain_by_id = {row["id"]: row for row in chains}
+
+        restore_points = self.connection.execute(
+            """SELECT rp.*, jr.state AS source_run_state
+               FROM restore_points rp
+               JOIN backup_chains bc ON bc.id = rp.chain_id
+               JOIN job_runs jr ON jr.id = rp.job_run_id
+               WHERE bc.vm_id = ?
+               ORDER BY rp.chain_id, rp.sequence, rp.id""",
+            (operation["vm_id"],),
+        ).fetchall()
+
+        members: dict[str, list[sqlite3.Row]] = {
+            row["id"]: [] for row in chains
+        }
+        for row in restore_points:
+            members[row["chain_id"]].append(row)
+
+        duplicate_bundles = {
+            row["bundle_object_id"]
+            for row in self.connection.execute(
+                """SELECT bundle_object_id
+                   FROM restore_points
+                   WHERE bundle_object_id IS NOT NULL
+                   GROUP BY bundle_object_id
+                   HAVING COUNT(*) > 1"""
+            )
+        }
+
+        valid_full_chain_members: dict[str, list[sqlite3.Row]] = {}
+        for chain in chains:
+            chain_members = sorted(
+                members[chain["id"]],
+                key=lambda value: (
+                    value["sequence"],
+                    value["id"],
+                ),
+            )
+            if self._reclaim_chain_problem(
+                chain_members,
+                duplicate_bundles,
+            ) is None:
+                valid_full_chain_members[chain["id"]] = chain_members
+
+        snapshots = self.connection.execute(
+            """SELECT *
+               FROM reclaim_bundles
+               WHERE operation_id = ?
+               ORDER BY chain_id, restore_point_id""",
+            (operation["id"],),
+        ).fetchall()
+
+        if not snapshots:
+            raise DomainInvariantError(
+                "reclaim retirement snapshot has no bundles"
+            )
+
+        snapshot_by_chain: dict[str, dict[str, str]] = {}
+        for bundle in snapshots:
+            if (
+                ReclaimBundleState(bundle["state"])
+                is not ReclaimBundleState.PLANNED
+                or bundle["quarantine_object_id"] is not None
+                or bundle["expected_physical_bytes"] is not None
+                or bundle["source_device"] is not None
+                or bundle["source_inode"] is not None
+            ):
+                raise DomainInvariantError(
+                    "reclaim retirement snapshot contains "
+                    "destructive bundle evidence"
+                )
+
+            snapshot_by_chain.setdefault(
+                bundle["chain_id"],
+                {},
+            )[bundle["restore_point_id"]] = (
+                bundle["source_bundle_object_id"]
+            )
+
+        if set(snapshot_by_chain) != selected_set:
+            raise DomainInvariantError(
+                "reclaim retirement bundle membership changed"
+            )
+
+        for chain_id in selected_ids:
+            chain = chain_by_id.get(chain_id)
+            if chain is None:
+                raise DomainInvariantError(
+                    "selected reclaim chain disappeared"
+                )
+
+            if (
+                BackupChainStatus(chain["status"])
+                is not BackupChainStatus.CLOSED
+            ):
+                raise DomainInvariantError(
+                    "selected reclaim chain is no longer CLOSED"
+                )
+
+            current_members = valid_full_chain_members.get(chain_id)
+            if current_members is None:
+                raise DomainInvariantError(
+                    "selected reclaim chain is no longer "
+                    "a valid populated FULL chain"
+                )
+
+            current_snapshot = {
+                point["id"]: point["bundle_object_id"]
+                for point in current_members
+            }
+
+            if current_snapshot != snapshot_by_chain[chain_id]:
+                raise DomainInvariantError(
+                    "selected reclaim restore-point snapshot changed"
+                )
+
+        valid_remaining = (
+            len(valid_full_chain_members) - len(selected_set)
+        )
+        if valid_remaining < context["minimum_full_chains"]:
+            raise DomainInvariantError(
+                "reclaim retirement violates minimum_full_chains"
+            )
+
+    def begin_reclaim_retirement(
+        self,
+        operation_id: str,
+    ) -> ReclaimOperation:
+        """Enter the first destructive reclaim stage."""
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._require_reclaim_operation_state(
+                operation_id,
+                ReclaimOperationState.PLANNED,
+            )
+
+            self._validate_reclaim_retirement_snapshot(row)
+
+            bundle_count = self.connection.execute(
+                """SELECT COUNT(*)
+                   FROM reclaim_bundles
+                   WHERE operation_id = ?""",
+                (operation_id,),
+            ).fetchone()[0]
+            planned_count = self.connection.execute(
+                """SELECT COUNT(*)
+                   FROM reclaim_bundles
+                   WHERE operation_id = ?
+                     AND state = 'PLANNED'""",
+                (operation_id,),
+            ).fetchone()[0]
+
+            if bundle_count == 0 or planned_count != bundle_count:
+                raise DomainInvariantError(
+                    "reclaim retirement requires all bundles PLANNED"
+                )
+
+            self._set_reclaim_operation_state(
+                row,
+                ReclaimOperationState.RETIRING,
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+        return self.get_reclaim_operation(operation_id)
+
+    def mark_reclaim_bundle_quarantined(
+        self,
+        operation_id: str,
+        restore_point_id: str,
+        *,
+        quarantine_object_id: str,
+        expected_physical_bytes: int,
+        source_device: int,
+        source_inode: int,
+    ) -> ReclaimBundle:
+        """Persist quarantine evidence after the executor completed a move."""
+
+        if not quarantine_object_id:
+            raise ValueError(
+                "quarantine_object_id must not be empty"
+            )
+        if expected_physical_bytes < 0:
+            raise ValueError(
+                "expected_physical_bytes must be non-negative"
+            )
+        if source_device < 0:
+            raise ValueError("source_device must be non-negative")
+        if source_inode < 0:
+            raise ValueError("source_inode must be non-negative")
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_reclaim_operation_state(
+                operation_id,
+                ReclaimOperationState.RETIRING,
+            )
+
+            row = self.connection.execute(
+                """SELECT *
+                   FROM reclaim_bundles
+                   WHERE operation_id = ?
+                     AND restore_point_id = ?""",
+                (operation_id, restore_point_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(restore_point_id)
+
+            if (
+                ReclaimBundleState(row["state"])
+                is not ReclaimBundleState.PLANNED
+            ):
+                raise DomainInvariantError(
+                    "reclaim bundle quarantine requires PLANNED"
+                )
+
+            if quarantine_object_id == row["source_bundle_object_id"]:
+                raise DomainInvariantError(
+                    "quarantine identity must differ from source bundle"
+                )
+
+            duplicate = self.connection.execute(
+                """SELECT 1
+                   FROM reclaim_bundles
+                   WHERE quarantine_object_id = ?
+                     AND NOT (
+                         operation_id = ?
+                         AND restore_point_id = ?
+                     )
+                   LIMIT 1""",
+                (
+                    quarantine_object_id,
+                    operation_id,
+                    restore_point_id,
+                ),
+            ).fetchone()
+            if duplicate is not None:
+                raise DomainInvariantError(
+                    "quarantine object identity is already in use"
+                )
+
+            cursor = self.connection.execute(
+                """UPDATE reclaim_bundles
+                   SET state = 'QUARANTINED',
+                       quarantine_object_id = ?,
+                       expected_physical_bytes = ?,
+                       source_device = ?,
+                       source_inode = ?
+                   WHERE operation_id = ?
+                     AND restore_point_id = ?
+                     AND state = 'PLANNED'""",
+                (
+                    quarantine_object_id,
+                    expected_physical_bytes,
+                    source_device,
+                    source_inode,
+                    operation_id,
+                    restore_point_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DomainInvariantError(
+                    "reclaim bundle changed concurrently"
+                )
+
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+        bundles = [
+            item
+            for item in self.list_reclaim_bundles(operation_id)
+            if item.restore_point_id == restore_point_id
+        ]
+        if len(bundles) != 1:
+            raise DomainInvariantError(
+                "persisted reclaim bundle disappeared"
+            )
+        return bundles[0]
+
+    def mark_reclaim_quarantined(
+        self,
+        operation_id: str,
+    ) -> ReclaimOperation:
+        """Seal RETIRING only after every bundle has quarantine evidence."""
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._require_reclaim_operation_state(
+                operation_id,
+                ReclaimOperationState.RETIRING,
+            )
+
+            counts = self.connection.execute(
+                """SELECT
+                       COUNT(*) AS total,
+                       SUM(
+                           CASE WHEN state = 'QUARANTINED'
+                               THEN 1 ELSE 0 END
+                       ) AS quarantined,
+                       SUM(
+                           CASE
+                               WHEN quarantine_object_id IS NULL
+                                 OR expected_physical_bytes IS NULL
+                                 OR source_device IS NULL
+                                 OR source_inode IS NULL
+                               THEN 1 ELSE 0
+                           END
+                       ) AS missing_evidence,
+                       COALESCE(
+                           SUM(expected_physical_bytes),
+                           0
+                       ) AS physical_total
+                   FROM reclaim_bundles
+                   WHERE operation_id = ?""",
+                (operation_id,),
+            ).fetchone()
+
+            if (
+                counts["total"] == 0
+                or counts["quarantined"] != counts["total"]
+                or counts["missing_evidence"] != 0
+            ):
+                raise DomainInvariantError(
+                    "reclaim quarantine requires all bundles "
+                    "QUARANTINED with evidence"
+                )
+
+            if (
+                counts["physical_total"]
+                != row["expected_reclaim_bytes"]
+            ):
+                raise DomainInvariantError(
+                    "quarantined bundle physical total differs "
+                    "from reclaim snapshot"
+                )
+
+            invalid_chain_total = self.connection.execute(
+                """SELECT rc.chain_id
+                   FROM reclaim_chains rc
+                   LEFT JOIN reclaim_bundles rb
+                     ON rb.operation_id = rc.operation_id
+                    AND rb.chain_id = rc.chain_id
+                   WHERE rc.operation_id = ?
+                   GROUP BY
+                       rc.operation_id,
+                       rc.chain_id,
+                       rc.expected_physical_bytes
+                   HAVING COUNT(rb.restore_point_id) = 0
+                      OR SUM(
+                           CASE
+                               WHEN rb.state = 'QUARANTINED'
+                               THEN 1 ELSE 0
+                           END
+                         ) != COUNT(rb.restore_point_id)
+                      OR COALESCE(
+                           SUM(rb.expected_physical_bytes),
+                           0
+                         ) != rc.expected_physical_bytes
+                   LIMIT 1""",
+                (operation_id,),
+            ).fetchone()
+
+            if invalid_chain_total is not None:
+                raise DomainInvariantError(
+                    "quarantined bundle physical total differs "
+                    "from reclaim chain snapshot"
+                )
+
+            self._set_reclaim_operation_state(
+                row,
+                ReclaimOperationState.QUARANTINED,
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+        return self.get_reclaim_operation(operation_id)
+
+    def mark_reclaim_catalog_removed(
+        self,
+        operation_id: str,
+    ) -> ReclaimOperation:
+        """Record catalog retirement only after selected catalog rows are gone."""
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._require_reclaim_operation_state(
+                operation_id,
+                ReclaimOperationState.QUARANTINED,
+            )
+
+            remaining_points = self.connection.execute(
+                """SELECT 1
+                   FROM reclaim_bundles rb
+                   JOIN restore_points rp
+                     ON rp.id = rb.restore_point_id
+                   WHERE rb.operation_id = ?
+                   LIMIT 1""",
+                (operation_id,),
+            ).fetchone()
+            if remaining_points is not None:
+                raise DomainInvariantError(
+                    "reclaim restore points remain in catalog"
+                )
+
+            remaining_chains = self.connection.execute(
+                """SELECT 1
+                   FROM reclaim_chains rc
+                   JOIN backup_chains bc
+                     ON bc.id = rc.chain_id
+                   WHERE rc.operation_id = ?
+                   LIMIT 1""",
+                (operation_id,),
+            ).fetchone()
+            if remaining_chains is not None:
+                raise DomainInvariantError(
+                    "reclaim backup chains remain in catalog"
+                )
+
+            self._set_reclaim_operation_state(
+                row,
+                ReclaimOperationState.CATALOG_REMOVED,
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+        return self.get_reclaim_operation(operation_id)
+
+    def begin_reclaim_purge(
+        self,
+        operation_id: str,
+    ) -> ReclaimOperation:
+        """Enter PURGING after catalog retirement."""
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._require_reclaim_operation_state(
+                operation_id,
+                ReclaimOperationState.CATALOG_REMOVED,
+            )
+
+            remaining = self.connection.execute(
+                """SELECT 1
+                   FROM reclaim_bundles
+                   WHERE operation_id = ?
+                     AND state != 'QUARANTINED'
+                   LIMIT 1""",
+                (operation_id,),
+            ).fetchone()
+            if remaining is not None:
+                raise DomainInvariantError(
+                    "reclaim purge requires quarantined bundles"
+                )
+
+            self._set_reclaim_operation_state(
+                row,
+                ReclaimOperationState.PURGING,
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+        return self.get_reclaim_operation(operation_id)
+
+    def mark_reclaim_bundle_purged(
+        self,
+        operation_id: str,
+        restore_point_id: str,
+    ) -> ReclaimBundle:
+        """Persist executor evidence that one quarantined bundle was purged."""
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_reclaim_operation_state(
+                operation_id,
+                ReclaimOperationState.PURGING,
+            )
+
+            row = self.connection.execute(
+                """SELECT *
+                   FROM reclaim_bundles
+                   WHERE operation_id = ?
+                     AND restore_point_id = ?""",
+                (operation_id, restore_point_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(restore_point_id)
+
+            if (
+                ReclaimBundleState(row["state"])
+                is not ReclaimBundleState.QUARANTINED
+            ):
+                raise DomainInvariantError(
+                    "reclaim bundle purge requires QUARANTINED"
+                )
+            if (
+                row["quarantine_object_id"] is None
+                or row["expected_physical_bytes"] is None
+                or row["source_device"] is None
+                or row["source_inode"] is None
+            ):
+                raise DomainInvariantError(
+                    "reclaim bundle purge requires quarantine evidence"
+                )
+
+            cursor = self.connection.execute(
+                """UPDATE reclaim_bundles
+                   SET state = 'PURGED'
+                   WHERE operation_id = ?
+                     AND restore_point_id = ?
+                     AND state = 'QUARANTINED'""",
+                (operation_id, restore_point_id),
+            )
+            if cursor.rowcount != 1:
+                raise DomainInvariantError(
+                    "reclaim bundle changed concurrently"
+                )
+
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+        bundles = [
+            item
+            for item in self.list_reclaim_bundles(operation_id)
+            if item.restore_point_id == restore_point_id
+        ]
+        if len(bundles) != 1:
+            raise DomainInvariantError(
+                "persisted reclaim bundle disappeared"
+            )
+        return bundles[0]
+
+    def mark_reclaim_purged(
+        self,
+        operation_id: str,
+    ) -> ReclaimOperation:
+        """Seal PURGING only after every selected bundle is PURGED."""
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._require_reclaim_operation_state(
+                operation_id,
+                ReclaimOperationState.PURGING,
+            )
+
+            counts = self.connection.execute(
+                """SELECT
+                       COUNT(*) AS total,
+                       SUM(
+                           CASE WHEN state = 'PURGED'
+                               THEN 1 ELSE 0 END
+                       ) AS purged
+                   FROM reclaim_bundles
+                   WHERE operation_id = ?""",
+                (operation_id,),
+            ).fetchone()
+
+            if (
+                counts["total"] == 0
+                or counts["purged"] != counts["total"]
+            ):
+                raise DomainInvariantError(
+                    "reclaim PURGED requires every bundle PURGED"
+                )
+
+            self._set_reclaim_operation_state(
+                row,
+                ReclaimOperationState.PURGED,
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+        return self.get_reclaim_operation(operation_id)
+
+    def complete_reclaim(
+        self,
+        operation_id: str,
+        *,
+        free_bytes_after: int,
+    ) -> ReclaimOperation:
+        """Complete reclaim after the executor re-measured actual free space."""
+
+        if free_bytes_after < 0:
+            raise ValueError(
+                "free_bytes_after must be non-negative"
+            )
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._require_reclaim_operation_state(
+                operation_id,
+                ReclaimOperationState.PURGED,
+            )
+
+            cursor = self.connection.execute(
+                """UPDATE reclaim_operations
+                   SET state = 'COMPLETED',
+                       free_bytes_after = ?,
+                       recovery_from_state = NULL,
+                       updated_at = ?
+                   WHERE id = ?
+                     AND state = 'PURGED'""",
+                (
+                    free_bytes_after,
+                    utcnow().isoformat(),
+                    operation_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DomainInvariantError(
+                    "reclaim operation changed concurrently"
+                )
+
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+        return self.get_reclaim_operation(operation_id)
+
+    def abort_reclaim(
+        self,
+        operation_id: str,
+    ) -> ReclaimOperation:
+        """Abort only before any destructive reclaim stage begins."""
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._require_reclaim_operation_state(
+                operation_id,
+                ReclaimOperationState.PLANNED,
+            )
+
+            changed_bundle = self.connection.execute(
+                """SELECT 1
+                   FROM reclaim_bundles
+                   WHERE operation_id = ?
+                     AND (
+                         state != 'PLANNED'
+                         OR quarantine_object_id IS NOT NULL
+                         OR expected_physical_bytes IS NOT NULL
+                         OR source_device IS NOT NULL
+                         OR source_inode IS NOT NULL
+                     )
+                   LIMIT 1""",
+                (operation_id,),
+            ).fetchone()
+            if changed_bundle is not None:
+                raise DomainInvariantError(
+                    "PLANNED reclaim contains destructive bundle evidence"
+                )
+
+            self._set_reclaim_operation_state(
+                row,
+                ReclaimOperationState.ABORTED,
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+        return self.get_reclaim_operation(operation_id)
+
+    def require_reclaim_recovery(
+        self,
+        operation_id: str,
+        error: str,
+    ) -> ReclaimOperation:
+        """Freeze a destructive reclaim stage for explicit recovery."""
+
+        if not error.strip():
+            raise ValueError("reclaim recovery error must not be empty")
+
+        allowed = {
+            ReclaimOperationState.RETIRING,
+            ReclaimOperationState.QUARANTINED,
+            ReclaimOperationState.CATALOG_REMOVED,
+            ReclaimOperationState.PURGING,
+            ReclaimOperationState.PURGED,
+        }
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT * FROM reclaim_operations WHERE id = ?",
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(operation_id)
+
+            source = ReclaimOperationState(row["state"])
+            if source not in allowed:
+                raise DomainInvariantError(
+                    "reclaim recovery requires a destructive state"
+                )
+            if row["recovery_from_state"] is not None:
+                raise DomainInvariantError(
+                    "reclaim operation already carries recovery provenance"
+                )
+
+            cursor = self.connection.execute(
+                """UPDATE reclaim_operations
+                   SET state = 'RECOVERY_REQUIRED',
+                       recovery_from_state = ?,
+                       error = ?,
+                       updated_at = ?
+                   WHERE id = ?
+                     AND state = ?
+                     AND recovery_from_state IS NULL""",
+                (
+                    source,
+                    error,
+                    utcnow().isoformat(),
+                    operation_id,
+                    source,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DomainInvariantError(
+                    "reclaim operation changed concurrently"
+                )
+
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+        return self.get_reclaim_operation(operation_id)
+
+    def _validate_reclaim_recovery_resume(
+        self,
+        operation_id: str,
+        target: ReclaimOperationState,
+    ) -> None:
+        """Validate durable DB evidence before leaving RECOVERY_REQUIRED."""
+
+        bundles = self.connection.execute(
+            """SELECT *
+               FROM reclaim_bundles
+               WHERE operation_id = ?
+               ORDER BY chain_id, restore_point_id""",
+            (operation_id,),
+        ).fetchall()
+
+        if not bundles:
+            raise DomainInvariantError(
+                "reclaim recovery has no bundle snapshot"
+            )
+
+        def has_evidence(bundle: sqlite3.Row) -> bool:
+            return (
+                bundle["quarantine_object_id"] is not None
+                and bundle["expected_physical_bytes"] is not None
+                and bundle["source_device"] is not None
+                and bundle["source_inode"] is not None
+            )
+
+        def has_no_evidence(bundle: sqlite3.Row) -> bool:
+            return (
+                bundle["quarantine_object_id"] is None
+                and bundle["expected_physical_bytes"] is None
+                and bundle["source_device"] is None
+                and bundle["source_inode"] is None
+            )
+
+        if target is ReclaimOperationState.RETIRING:
+            for bundle in bundles:
+                state = ReclaimBundleState(bundle["state"])
+                if state is ReclaimBundleState.PLANNED:
+                    if not has_no_evidence(bundle):
+                        raise DomainInvariantError(
+                            "RETIRING recovery has invalid PLANNED evidence"
+                        )
+                elif state is ReclaimBundleState.QUARANTINED:
+                    if not has_evidence(bundle):
+                        raise DomainInvariantError(
+                            "RETIRING recovery has incomplete "
+                            "quarantine evidence"
+                        )
+                else:
+                    raise DomainInvariantError(
+                        "RETIRING recovery contains PURGED bundle"
+                    )
+            return
+
+        if target in {
+            ReclaimOperationState.QUARANTINED,
+            ReclaimOperationState.CATALOG_REMOVED,
+            ReclaimOperationState.PURGING,
+            ReclaimOperationState.PURGED,
+        }:
+            if any(not has_evidence(bundle) for bundle in bundles):
+                raise DomainInvariantError(
+                    "reclaim recovery has incomplete quarantine evidence"
+                )
+
+            invalid_chain_total = self.connection.execute(
+                """SELECT rc.chain_id
+                   FROM reclaim_chains rc
+                   LEFT JOIN reclaim_bundles rb
+                     ON rb.operation_id = rc.operation_id
+                    AND rb.chain_id = rc.chain_id
+                   WHERE rc.operation_id = ?
+                   GROUP BY
+                       rc.operation_id,
+                       rc.chain_id,
+                       rc.expected_physical_bytes
+                   HAVING COUNT(rb.restore_point_id) = 0
+                      OR COALESCE(
+                           SUM(rb.expected_physical_bytes),
+                           0
+                         ) != rc.expected_physical_bytes
+                   LIMIT 1""",
+                (operation_id,),
+            ).fetchone()
+            if invalid_chain_total is not None:
+                raise DomainInvariantError(
+                    "reclaim recovery physical total differs "
+                    "from chain snapshot"
+                )
+
+        if target in {
+            ReclaimOperationState.QUARANTINED,
+            ReclaimOperationState.CATALOG_REMOVED,
+        }:
+            if any(
+                ReclaimBundleState(bundle["state"])
+                is not ReclaimBundleState.QUARANTINED
+                for bundle in bundles
+            ):
+                raise DomainInvariantError(
+                    "reclaim recovery requires all bundles QUARANTINED"
+                )
+
+        if target is ReclaimOperationState.PURGING:
+            if any(
+                ReclaimBundleState(bundle["state"])
+                not in {
+                    ReclaimBundleState.QUARANTINED,
+                    ReclaimBundleState.PURGED,
+                }
+                for bundle in bundles
+            ):
+                raise DomainInvariantError(
+                    "PURGING recovery has invalid bundle state"
+                )
+
+        if target is ReclaimOperationState.PURGED:
+            if any(
+                ReclaimBundleState(bundle["state"])
+                is not ReclaimBundleState.PURGED
+                for bundle in bundles
+            ):
+                raise DomainInvariantError(
+                    "PURGED recovery requires every bundle PURGED"
+                )
+
+        if target in {
+            ReclaimOperationState.CATALOG_REMOVED,
+            ReclaimOperationState.PURGING,
+            ReclaimOperationState.PURGED,
+        }:
+            catalog_member = self.connection.execute(
+                """SELECT 1
+                   FROM reclaim_bundles rb
+                   JOIN restore_points rp
+                     ON rp.id = rb.restore_point_id
+                   WHERE rb.operation_id = ?
+                   LIMIT 1""",
+                (operation_id,),
+            ).fetchone()
+
+            if catalog_member is not None:
+                raise DomainInvariantError(
+                    "reclaim recovery restore points remain in catalog"
+                )
+
+            catalog_chain = self.connection.execute(
+                """SELECT 1
+                   FROM reclaim_chains rc
+                   JOIN backup_chains bc
+                     ON bc.id = rc.chain_id
+                   WHERE rc.operation_id = ?
+                   LIMIT 1""",
+                (operation_id,),
+            ).fetchone()
+
+            if catalog_chain is not None:
+                raise DomainInvariantError(
+                    "reclaim recovery chains remain in catalog"
+                )
+
+    def resume_reclaim_recovery(
+        self,
+        operation_id: str,
+    ) -> ReclaimOperation:
+        """Resume exactly the durable state recorded before recovery."""
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._require_reclaim_operation_state(
+                operation_id,
+                ReclaimOperationState.RECOVERY_REQUIRED,
+            )
+
+            if row["recovery_from_state"] is None:
+                raise DomainInvariantError(
+                    "reclaim recovery provenance is missing"
+                )
+
+            target = ReclaimOperationState(
+                row["recovery_from_state"]
+            )
+            allowed = {
+                ReclaimOperationState.RETIRING,
+                ReclaimOperationState.QUARANTINED,
+                ReclaimOperationState.CATALOG_REMOVED,
+                ReclaimOperationState.PURGING,
+                ReclaimOperationState.PURGED,
+            }
+            if target not in allowed:
+                raise DomainInvariantError(
+                    "reclaim recovery provenance is invalid"
+                )
+
+            self._validate_reclaim_recovery_resume(
+                operation_id,
+                target,
+            )
+
+            cursor = self.connection.execute(
+                """UPDATE reclaim_operations
+                   SET state = ?,
+                       recovery_from_state = NULL,
+                       updated_at = ?
+                   WHERE id = ?
+                     AND state = 'RECOVERY_REQUIRED'
+                     AND recovery_from_state = ?""",
+                (
+                    target,
+                    utcnow().isoformat(),
+                    operation_id,
+                    target,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DomainInvariantError(
+                    "reclaim operation changed concurrently"
+                )
+
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
+        return self.get_reclaim_operation(operation_id)
+
+    def list_reclaim_operations_requiring_recovery(
+        self,
+    ) -> list[ReclaimOperation]:
+        rows = self.connection.execute(
+            """SELECT *
+               FROM reclaim_operations
+               WHERE state = 'RECOVERY_REQUIRED'
+               ORDER BY created_at, id"""
+        )
+        return [self._reclaim_operation(row) for row in rows]
+
+    def _require_reclaim_operation_state(
+        self,
+        operation_id: str,
+        expected: ReclaimOperationState,
+    ) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM reclaim_operations WHERE id = ?",
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(operation_id)
+
+        actual = ReclaimOperationState(row["state"])
+        if actual is not expected:
+            raise DomainInvariantError(
+                f"reclaim operation requires {expected}, got {actual}"
+            )
+        return row
+
+    def _set_reclaim_operation_state(
+        self,
+        row: sqlite3.Row,
+        target: ReclaimOperationState,
+    ) -> None:
+        source = ReclaimOperationState(row["state"])
+
+        allowed = {
+            ReclaimOperationState.PLANNED: {
+                ReclaimOperationState.RETIRING,
+                ReclaimOperationState.ABORTED,
+            },
+            ReclaimOperationState.RETIRING: {
+                ReclaimOperationState.QUARANTINED,
+            },
+            ReclaimOperationState.QUARANTINED: {
+                ReclaimOperationState.CATALOG_REMOVED,
+            },
+            ReclaimOperationState.CATALOG_REMOVED: {
+                ReclaimOperationState.PURGING,
+            },
+            ReclaimOperationState.PURGING: {
+                ReclaimOperationState.PURGED,
+            },
+            ReclaimOperationState.PURGED: {
+                ReclaimOperationState.COMPLETED,
+            },
+        }
+
+        if target not in allowed.get(source, set()):
+            raise DomainInvariantError(
+                f"invalid reclaim transition {source} -> {target}"
+            )
+
+        cursor = self.connection.execute(
+            """UPDATE reclaim_operations
+               SET state = ?,
+                   recovery_from_state = NULL,
+                   updated_at = ?
+               WHERE id = ?
+                 AND state = ?""",
+            (
+                target,
+                utcnow().isoformat(),
+                row["id"],
+                source,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise DomainInvariantError(
+                "reclaim operation changed concurrently"
+            )
+
     def get_reclaim_operation(
         self,
         operation_id: str,
@@ -2154,21 +3319,65 @@ class SQLiteRepository:
             raise KeyError(chain_id)
         return self._chain(row)
 
-    def list_restore_points(self, vm_id: str | None = None) -> list[RestorePoint]:
-        sql = "SELECT rp.* FROM restore_points rp JOIN backup_chains bc ON bc.id = rp.chain_id"
+    def list_restore_points(
+        self,
+        vm_id: str | None = None,
+    ) -> list[RestorePoint]:
+        sql = """SELECT rp.*
+                 FROM restore_points rp
+                 JOIN backup_chains bc ON bc.id = rp.chain_id
+                 WHERE NOT EXISTS (
+                     SELECT 1
+                     FROM reclaim_bundles rb
+                     JOIN reclaim_operations ro
+                       ON ro.id = rb.operation_id
+                     WHERE rb.restore_point_id = rp.id
+                       AND ro.state IN (
+                           'RETIRING',
+                           'QUARANTINED',
+                           'CATALOG_REMOVED',
+                           'PURGING',
+                           'PURGED',
+                           'RECOVERY_REQUIRED'
+                       )
+                 )"""
         params: tuple[str, ...] = ()
         if vm_id is not None:
-            sql += " WHERE bc.vm_id = ?"
+            sql += " AND bc.vm_id = ?"
             params = (vm_id,)
         sql += " ORDER BY rp.created_at, rp.sequence"
-        return [self._restore_point(row) for row in self.connection.execute(sql, params)]
+        return [
+            self._restore_point(row)
+            for row in self.connection.execute(sql, params)
+        ]
 
-    def list_restore_points_for_node(self, node_id: str) -> list[RestorePoint]:
+    def list_restore_points_for_node(
+        self,
+        node_id: str,
+    ) -> list[RestorePoint]:
         rows = self.connection.execute(
-            """SELECT rp.* FROM restore_points rp
+            """SELECT rp.*
+               FROM restore_points rp
                JOIN backup_chains bc ON bc.id = rp.chain_id
-               JOIN vms vm ON vm.id = bc.vm_id WHERE vm.node_id = ?
-               ORDER BY rp.created_at, rp.sequence""", (node_id,),
+               JOIN vms vm ON vm.id = bc.vm_id
+               WHERE vm.node_id = ?
+                 AND NOT EXISTS (
+                     SELECT 1
+                     FROM reclaim_bundles rb
+                     JOIN reclaim_operations ro
+                       ON ro.id = rb.operation_id
+                     WHERE rb.restore_point_id = rp.id
+                       AND ro.state IN (
+                           'RETIRING',
+                           'QUARANTINED',
+                           'CATALOG_REMOVED',
+                           'PURGING',
+                           'PURGED',
+                           'RECOVERY_REQUIRED'
+                       )
+                 )
+               ORDER BY rp.created_at, rp.sequence""",
+            (node_id,),
         )
         return [self._restore_point(row) for row in rows]
 
