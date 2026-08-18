@@ -545,23 +545,74 @@ bundle data remains under the controlled .reclaim namespace.
 
 ### 3E.8b.2c — Safe physical purge primitive
 
-Status: IN_PROGRESS
+Status: CLOSED
 
-Target scope:
+Closing commit:
 
-- descriptor-relative traversal of the controlled quarantine namespace;
-- exact quarantine device/inode validation;
-- O_NOFOLLOW containment;
-- controlled leaf-first removal;
-- directory fsync;
-- no naive shutil.rmtree();
-- no traversal outside the quarantine object.
+    d52c27f
+
+Implemented a descriptor-relative, resumable physical purge primitive for
+bundles already moved into the controlled reclaim quarantine namespace.
+
+The purge uses a deterministic staging namespace:
+
+    .reclaim/<operation-id>/.purging/<restore-point-id>
+
+Fresh purge flow:
+
+    quarantine bundle
+        -> validate durable root device/inode identity
+        -> validate complete bundle tree
+        -> validate physical allocation against durable reclaim evidence
+        -> atomically rename into .purging
+        -> fsync source and destination namespaces
+        -> descriptor-relative leaf removal
+        -> remove empty bundle directories
+        -> remove empty purge root
+
+Implemented safety properties:
+
+- exact controlled quarantine-object identity validation;
+- strict operation and restore-point UUID validation;
+- descriptor-relative directory traversal;
+- O_NOFOLLOW directory and file access;
+- exact root device/inode validation against durable reclaim evidence;
+- same-filesystem purge staging;
+- atomic quarantine-to-purging rename;
+- post-rename root identity verification;
+- safe rollback when the claimed root identity changes;
+- complete namespace validation before first destructive leaf removal;
+- regular-file-only deletion;
+- hard-link rejection;
+- cross-filesystem file rejection;
+- non-empty file requirement;
+- descriptor-relative os.unlink for validated leaves;
+- descriptor-relative os.rmdir for validated empty directories;
+- directory fsync after namespace mutations;
+- no shutil.rmtree() or naive recursive deletion.
+
+The initial complete-tree validation also requires physical allocation to equal
+the persisted reclaim bundle expected_physical_bytes.
+
+Crash-resume behavior is explicit.
+
+If deletion was interrupted after the bundle had been atomically claimed into
+.purging, a later invocation detects that the normal quarantine object is
+absent and the deterministic .purging object remains. It then validates the
+remaining partial tree and continues leaf-first deletion without requiring the
+already-removed files to reappear.
+
+A partial purge refuses unexpected entries, symlinks, hard links, invalid file
+types, filesystem identity changes or root identity mismatch.
+
+The primitive does not modify repository state. Physical filesystem completion
+must be followed separately by the durable reclaim bundle/state transitions.
 
 ---
 
 ### 3E.8b.2d — Reclaim executor orchestration and recovery
 
-Status: PLANNED
+Status: IN_PROGRESS
 
 Target scope:
 
