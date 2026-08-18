@@ -459,6 +459,11 @@ class BackupJob:
     created_at: datetime = field(default_factory=utcnow)
 
 
+class StorageType(StrEnum):
+    LOCAL = "LOCAL"
+    SSH = "SSH"
+
+
 @dataclass(frozen=True, slots=True)
 class StorageDestination:
     name: str
@@ -470,6 +475,11 @@ class StorageDestination:
     minimum_free_bytes: int = 0
     minimum_free_percent: float = 5.0
     is_default: bool = False
+    storage_type: StorageType = StorageType.LOCAL
+    ssh_host: str | None = None
+    ssh_port: int | None = None
+    ssh_user: str | None = None
+    ssh_remote_root: str | None = None
     id: str = field(default_factory=new_id)
     created_at: datetime = field(default_factory=utcnow)
 

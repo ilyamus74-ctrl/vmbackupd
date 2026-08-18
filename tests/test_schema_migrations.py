@@ -22,8 +22,55 @@ def drop_v6_reclaim_tables(connection):
     connection.execute("DROP TABLE reclaim_operations")
 
 
+VERSION_9_STORAGE_IDENTITY_TRIGGER_SQL = """CREATE TRIGGER
+        storage_destination_identity_immutable_after_run
+        BEFORE UPDATE OF node_id, backup_data_root, backup_data_mode,
+                         backup_data_uid, backup_data_gid ON storage_destinations
+        WHEN EXISTS (
+            SELECT 1 FROM job_runs WHERE storage_destination_id = OLD.id
+        ) AND (
+            NEW.node_id IS NOT OLD.node_id OR
+            NEW.backup_data_root IS NOT OLD.backup_data_root OR
+            NEW.backup_data_mode IS NOT OLD.backup_data_mode OR
+            NEW.backup_data_uid IS NOT OLD.backup_data_uid OR
+            NEW.backup_data_gid IS NOT OLD.backup_data_gid
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'storage destination physical identity is immutable');
+        END"""
+
+
+def drop_v10_storage_transport(connection):
+    """Restore the exact schema-v9 LOCAL-only storage shape."""
+
+    connection.execute(
+        "DROP TRIGGER storage_destination_transport_contract_insert"
+    )
+    connection.execute(
+        "DROP TRIGGER storage_destination_transport_contract_update"
+    )
+    connection.execute(
+        "DROP TRIGGER storage_destination_identity_immutable_after_run"
+    )
+
+    for column in (
+        "ssh_remote_root",
+        "ssh_user",
+        "ssh_port",
+        "ssh_host",
+        "storage_type",
+    ):
+        connection.execute(
+            f"ALTER TABLE storage_destinations DROP COLUMN {column}"
+        )
+
+    connection.execute(VERSION_9_STORAGE_IDENTITY_TRIGGER_SQL)
+
+
 def drop_v9_schedule_columns(connection):
     """Restore the exact pre-v9 backup_jobs schedule shape."""
+
+    drop_v10_storage_transport(connection)
 
     # Drop schedule_type first because its CHECK references the two
     # DAILY-only columns.
@@ -423,7 +470,7 @@ def test_v5_to_v6_adds_durable_reclaim_journal_without_data_loss(tmp_path):
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 9
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 10
     assert {
         "reclaim_operations",
         "reclaim_chains",
@@ -516,7 +563,7 @@ def test_v6_to_v7_adds_recovery_provenance_without_data_loss(tmp_path):
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 9
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 10
     assert "recovery_from_state" in table_columns(
         migrated.connection,
         "reclaim_operations",
@@ -729,7 +776,7 @@ def test_v7_to_v8_adds_bundle_purging_state_without_data_loss(
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 9
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 10
 
     bundle_sql = migrated.connection.execute(
         """SELECT sql
@@ -895,7 +942,7 @@ def test_v8_to_v9_adds_calendar_schedule_without_changing_interval_cursor(
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 9
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 10
 
     columns = table_columns(
         migrated.connection,
@@ -936,6 +983,83 @@ def test_v8_to_v9_adds_calendar_schedule_without_changing_interval_cursor(
         None,
         preserved_cursor,
     )
+
+    assert list(
+        migrated.connection.execute(
+            "PRAGMA foreign_key_check"
+        )
+    ) == []
+
+    migrated.close()
+
+
+def test_v9_to_v10_adds_ssh_transport_identity_without_changing_existing_storage(
+    tmp_path,
+):
+    path = tmp_path / "v9-to-v10-ssh-storage.db"
+    values = populated_database(path)
+
+    node, destination, vm, job, run, point, artifact_ids = values
+
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA foreign_keys = OFF")
+
+    drop_v10_storage_transport(connection)
+
+    connection.execute(
+        "UPDATE schema_version SET version = 9 WHERE id = 1"
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = SQLiteRepository(path)
+
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 10
+
+    columns = table_columns(
+        migrated.connection,
+        "storage_destinations",
+    )
+
+    assert {
+        "storage_type",
+        "ssh_host",
+        "ssh_port",
+        "ssh_user",
+        "ssh_remote_root",
+    } <= columns
+
+    persisted = migrated.get_storage_destination(
+        node.id,
+        destination.id,
+    )
+
+    assert persisted.storage_type.value == "LOCAL"
+    assert persisted.ssh_host is None
+    assert persisted.ssh_port is None
+    assert persisted.ssh_user is None
+    assert persisted.ssh_remote_root is None
+
+    assert migrated.get_vm(vm.id).id == vm.id
+    assert migrated.get_job(job.id).id == job.id
+    assert migrated.get_run(run.id).id == run.id
+    assert migrated.get_restore_point(point.id).id == point.id
+
+    assert [
+        item.id
+        for item in migrated.list_artifacts_for_run(run.id)
+    ] == artifact_ids
+
+    triggers = {
+        row[0]
+        for row in migrated.connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger'"
+        )
+    }
+
+    assert "storage_destination_transport_contract_insert" in triggers
+    assert "storage_destination_transport_contract_update" in triggers
+    assert "storage_destination_identity_immutable_after_run" in triggers
 
     assert list(
         migrated.connection.execute(

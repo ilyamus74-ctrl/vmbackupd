@@ -77,7 +77,25 @@ def version_one_database(path):
     connection.execute("DROP TRIGGER job_runs_destination_required_insert")
     connection.execute("DROP TRIGGER job_runs_destination_required_update")
     connection.execute("DROP TRIGGER job_runs_destination_immutable")
-    connection.execute("DROP TRIGGER storage_destination_identity_immutable_after_run")
+    connection.execute(
+        "DROP TRIGGER storage_destination_transport_contract_insert"
+    )
+    connection.execute(
+        "DROP TRIGGER storage_destination_transport_contract_update"
+    )
+    connection.execute(
+        "DROP TRIGGER storage_destination_identity_immutable_after_run"
+    )
+    for column in (
+        "ssh_remote_root",
+        "ssh_user",
+        "ssh_port",
+        "ssh_host",
+        "storage_type",
+    ):
+        connection.execute(
+            f"ALTER TABLE storage_destinations DROP COLUMN {column}"
+        )
     connection.execute("ALTER TABLE storage_destinations ADD COLUMN control_root TEXT")
     connection.execute("UPDATE storage_destinations SET control_root = '/control'")
     connection.execute("ALTER TABLE backup_artifacts DROP COLUMN published_object_id")

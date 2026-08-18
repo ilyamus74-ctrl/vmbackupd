@@ -57,6 +57,26 @@ def catalog(repository, tmp_path):
     return node, first, vm
 
 
+def drop_v10_storage_transport(connection):
+    for trigger in (
+        "storage_destination_transport_contract_insert",
+        "storage_destination_transport_contract_update",
+        "storage_destination_identity_immutable_after_run",
+    ):
+        connection.execute(f"DROP TRIGGER {trigger}")
+
+    for column in (
+        "ssh_remote_root",
+        "ssh_user",
+        "ssh_port",
+        "ssh_host",
+        "storage_type",
+    ):
+        connection.execute(
+            f"ALTER TABLE storage_destinations DROP COLUMN {column}"
+        )
+
+
 def version_three_database(path, tmp_path):
     repository = SQLiteRepository(path)
     node, destination, vm = catalog(repository, tmp_path)
@@ -76,7 +96,7 @@ def version_three_database(path, tmp_path):
     connection = sqlite3.connect(path)
     drop_v9_schedule_columns(connection)
     drop_v6_reclaim_tables(connection)
-    connection.execute("DROP TRIGGER storage_destination_identity_immutable_after_run")
+    drop_v10_storage_transport(connection)
     connection.execute("ALTER TABLE storage_destinations ADD COLUMN control_root TEXT")
     connection.execute(
         "UPDATE storage_destinations SET control_root = ?", (str(tmp_path / "control-a"),)
@@ -113,7 +133,7 @@ def published_version_three_database(path, tmp_path):
     connection = sqlite3.connect(path)
     drop_v9_schedule_columns(connection)
     drop_v6_reclaim_tables(connection)
-    connection.execute("DROP TRIGGER storage_destination_identity_immutable_after_run")
+    drop_v10_storage_transport(connection)
     connection.execute("ALTER TABLE storage_destinations ADD COLUMN control_root TEXT")
     connection.execute("UPDATE storage_destinations SET control_root='/legacy/control'")
     connection.execute("ALTER TABLE backup_artifacts DROP COLUMN published_object_id")
