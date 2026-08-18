@@ -422,7 +422,11 @@ The combined 3E.8b.1c durable recovery/transition layer is complete:
 
 ## 3E.8b.2 — Safe filesystem reclaim executor
 
-Status: IN_PROGRESS
+Status: CLOSED
+
+Closing commit:
+
+    a482e5c
 
 The filesystem reclaim executor is split into independently closed safety
 boundaries.
@@ -612,7 +616,11 @@ must be followed separately by the durable reclaim bundle/state transitions.
 
 ### 3E.8b.2d — Reclaim executor orchestration and recovery
 
-Status: IN_PROGRESS
+Status: CLOSED
+
+Closing commit:
+
+    a482e5c
 
 The orchestration layer is split so that destructive per-bundle intent is
 durable before the filesystem executor is allowed to remove data.
@@ -689,29 +697,93 @@ This phase performs no filesystem mutation and no catalog deletion.
 
 #### 3E.8b.2d.2 — Reclaim executor orchestration and recovery
 
-Status: IN_PROGRESS
+Status: CLOSED
 
-Target scope:
+Closing commit:
 
-- execute the durable reclaim operation state machine;
-- connect BundleQuarantiner to RETIRING;
-- reconcile a completed quarantine rename before its DB bundle transition;
-- atomically retire catalog metadata after all bundles are QUARANTINED;
-- enter operation PURGING;
-- persist per-bundle PURGING before invoking BundlePurger;
-- resume partially completed .purging trees;
-- reconcile physical deletion completed before bundle PURGED persistence;
-- mark every bundle PURGED and seal operation PURGED;
-- re-read actual filesystem free space after physical purge;
-- complete the reclaim operation with measured free_bytes_after;
-- refuse backup continuation when measured free space is still insufficient;
-- move ambiguous destructive states to RECOVERY_REQUIRED.
+    a482e5c
+
+Implemented ReclaimExecutor as the orchestration boundary over the already
+closed durable repository and filesystem primitives.
+
+The executor drives the durable operation state machine:
+
+    PLANNED
+        -> RETIRING
+        -> QUARANTINED
+        -> CATALOG_REMOVED
+        -> PURGING
+        -> PURGED
+        -> COMPLETED
+
+RETIRING behavior:
+
+- begins durable reclaim retirement before filesystem mutation;
+- quarantines each PLANNED bundle through BundleQuarantiner;
+- persists quarantine evidence after successful rename;
+- reconciles a crash where the source bundle is absent but the deterministic
+  quarantine object already exists;
+- reconstructs and validates physical bytes, device and inode before sealing
+  bundle QUARANTINED;
+- refuses ambiguous source + quarantine coexistence;
+- refuses absence of both source and quarantine objects;
+- seals operation QUARANTINED only after all bundles are durably reconciled.
+
+QUARANTINED / CATALOG_REMOVED behavior:
+
+- revalidates durable quarantine filesystem evidence;
+- atomically retires selected catalog metadata;
+- enters operation PURGING only after catalog retirement.
+
+PURGING behavior:
+
+- requires durable bundle QUARANTINED evidence before starting a bundle;
+- persists per-bundle PURGING before invoking BundlePurger;
+- resumes deterministic .purging trees after interrupted physical deletion;
+- reconciles complete physical absence when durable bundle PURGING intent
+  already exists but the process crashed before persisting PURGED;
+- marks each bundle PURGED only after physical completion;
+- seals operation PURGED only after every bundle is PURGED.
+
+PURGED / COMPLETED behavior:
+
+- verifies that source, quarantine and .purging objects are absent;
+- re-reads actual filesystem free space after physical reclaim;
+- stores measured free_bytes_after in the durable reclaim operation;
+- allows continuation only when:
+
+      free_bytes_after >= required_backup_bytes + reserve_bytes
+
+- projected or expected reclaim bytes are never used as authorization to
+  continue the backup.
+
+Recovery behavior:
+
+- destructive execution failures transition the reclaim operation to
+  RECOVERY_REQUIRED with durable recovery provenance;
+- explicit recovery resumes only the previously persisted destructive state;
+- RETIRING quarantine-rename crashes are reconciled from deterministic
+  filesystem identity;
+- PURGING partial physical deletion is resumed through BundlePurger;
+- PURGING with both deterministic filesystem objects absent is accepted only
+  because durable per-bundle PURGING intent was committed before physical
+  deletion was authorized;
+- PURGED with a remaining physical reclaim object is refused and moved to
+  RECOVERY_REQUIRED.
+
+Filesystem reconciliation helpers remain descriptor-safe and do not introduce
+a second deletion implementation.
+
+ReclaimExecutor itself performs no raw unlink, rmdir, recursive deletion,
+catalog DELETE or schema mutation. Destructive filesystem work remains inside
+BundleQuarantiner / BundlePurger and catalog retirement remains inside the
+repository boundary.
 
 ---
 
 ## 3E.8b.3 — Backup preflight reclaim execution integration
 
-Status: PLANNED
+Status: IN_PROGRESS
 
 SPACE_OPTIMIZED execution will be allowed only after 3E.8b.1 and 3E.8b.2
 are complete.
