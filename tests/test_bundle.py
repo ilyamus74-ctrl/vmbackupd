@@ -882,3 +882,82 @@ def test_physical_purge_refuses_arbitrary_quarantine_identity(
     assert Path(
         quarantine.quarantine_object_id
     ).is_dir()
+
+
+def test_quarantine_recovery_inspection_reconstructs_evidence(
+    tmp_path,
+):
+    planner, _, quarantine = quarantined_bundle(tmp_path)
+
+    inspected = BundleQuarantiner(
+        planner
+    ).inspect_quarantine(
+        source_bundle_object_id=(
+            quarantine.source_bundle_object_id
+        ),
+        operation_id=OPERATION_ID,
+        restore_point_id=RESTORE_POINT_ID,
+    )
+
+    assert (
+        inspected.quarantine_object_id
+        == quarantine.quarantine_object_id
+    )
+    assert (
+        inspected.expected_physical_bytes
+        == quarantine.expected_physical_bytes
+    )
+    assert inspected.source_device == quarantine.source_device
+    assert inspected.source_inode == quarantine.source_inode
+
+
+def test_source_presence_is_false_after_quarantine_rename(
+    tmp_path,
+):
+    planner, final = published_bundle(tmp_path)
+    quarantiner = BundleQuarantiner(planner)
+
+    assert quarantiner.source_present(final) is True
+
+    quarantiner.quarantine(
+        source_bundle_object_id=final,
+        operation_id=OPERATION_ID,
+        restore_point_id=RESTORE_POINT_ID,
+    )
+
+    assert quarantiner.source_present(final) is False
+
+
+def test_reclaim_presence_distinguishes_quarantine_and_purging(
+    tmp_path,
+):
+    planner, _, quarantine = quarantined_bundle(tmp_path)
+
+    purger = BundlePurger(planner)
+
+    presence = purger.inspect_reclaim_presence(
+        operation_id=OPERATION_ID,
+        restore_point_id=RESTORE_POINT_ID,
+    )
+
+    assert presence.quarantine_exists is True
+    assert presence.purging_exists is False
+
+    quarantine_path = Path(
+        quarantine.quarantine_object_id
+    )
+    purging_path = planner.reclaim_purging(
+        OPERATION_ID,
+        RESTORE_POINT_ID,
+    )
+
+    purging_path.parent.mkdir(mode=0o700)
+    quarantine_path.rename(purging_path)
+
+    presence = purger.inspect_reclaim_presence(
+        operation_id=OPERATION_ID,
+        restore_point_id=RESTORE_POINT_ID,
+    )
+
+    assert presence.quarantine_exists is False
+    assert presence.purging_exists is True

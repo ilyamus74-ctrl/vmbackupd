@@ -872,8 +872,196 @@ class BundleQuarantiner:
             os.close(source_parent_fd)
 
 
+    def source_present(
+        self,
+        source_bundle_object_id: str | Path,
+    ) -> bool:
+        """Safely test exact source bundle presence without following symlinks."""
+
+        source = Path(source_bundle_object_id)
+
+        try:
+            relative = source.relative_to(self.planner.root)
+        except ValueError as exc:
+            raise BundleQuarantineError(
+                "source bundle is outside backup root"
+            ) from exc
+
+        parts = relative.parts
+
+        if (
+            not parts
+            or any(
+                part in {"", ".", ".."}
+                or "/" in part
+                or "\0" in part
+                for part in parts
+            )
+        ):
+            raise BundleQuarantineError(
+                "source bundle path is not safely traversable"
+            )
+
+        try:
+            BundlePublisher._reject_symlinks(
+                self.planner.root
+            )
+        except BundlePublicationError as exc:
+            raise BundleQuarantineError(
+                "backup root contains a symbolic link"
+            ) from exc
+
+        descriptors: list[int] = []
+
+        try:
+            try:
+                root_fd = os.open(
+                    self.planner.root,
+                    BundlePublisher._directory_flags(),
+                )
+            except OSError as exc:
+                raise BundleQuarantineError(
+                    "backup root is not a safe directory"
+                ) from exc
+
+            descriptors.append(root_fd)
+            current_fd = root_fd
+
+            for part in parts[:-1]:
+                try:
+                    next_fd = os.open(
+                        part,
+                        BundlePublisher._directory_flags(),
+                        dir_fd=current_fd,
+                    )
+                except FileNotFoundError:
+                    return False
+                except OSError as exc:
+                    raise BundleQuarantineError(
+                        "source bundle parent is unsafe"
+                    ) from exc
+
+                descriptors.append(next_fd)
+                current_fd = next_fd
+
+            try:
+                info = os.stat(
+                    parts[-1],
+                    dir_fd=current_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return False
+            except OSError as exc:
+                raise BundleQuarantineError(
+                    "cannot safely inspect source bundle"
+                ) from exc
+
+            if not stat.S_ISDIR(info.st_mode):
+                raise BundleQuarantineError(
+                    "source bundle object is not a directory"
+                )
+
+            return True
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    def inspect_quarantine(
+        self,
+        *,
+        source_bundle_object_id: str | Path,
+        operation_id: str,
+        restore_point_id: str,
+    ) -> BundleQuarantineResult:
+        """Reconstruct durable evidence after rename completed before DB update."""
+
+        quarantine = self.planner.reclaim(
+            operation_id,
+            restore_point_id,
+        )
+
+        purger = BundlePurger(self.planner)
+
+        operation_fd = purger._open_operation_directory(
+            operation_id
+        )
+        bundle_fd = None
+
+        try:
+            restore_point_name = (
+                BundlePathPlanner._uuid_component(
+                    restore_point_id,
+                    "restore point ID",
+                )
+            )
+
+            info = purger._entry_info(
+                operation_fd,
+                restore_point_name,
+            )
+
+            if info is None:
+                raise BundleQuarantineError(
+                    "deterministic quarantine bundle is missing"
+                )
+
+            if not stat.S_ISDIR(info.st_mode):
+                raise BundleQuarantineError(
+                    "deterministic quarantine object is not a directory"
+                )
+
+            try:
+                bundle_fd = os.open(
+                    restore_point_name,
+                    BundlePublisher._directory_flags(),
+                    dir_fd=operation_fd,
+                )
+            except OSError as exc:
+                raise BundleQuarantineError(
+                    "cannot safely open deterministic quarantine bundle"
+                ) from exc
+
+            opened = os.fstat(bundle_fd)
+
+            if (
+                opened.st_dev != info.st_dev
+                or opened.st_ino != info.st_ino
+                or not stat.S_ISDIR(opened.st_mode)
+            ):
+                raise BundleQuarantineError(
+                    "quarantine root identity changed during inspection"
+                )
+
+            physical_bytes = purger._validate_complete_tree(
+                bundle_fd,
+                root_device=opened.st_dev,
+                expected_physical_bytes=None,
+            )
+
+            return BundleQuarantineResult(
+                source_bundle_object_id=str(
+                    source_bundle_object_id
+                ),
+                quarantine_object_id=str(quarantine),
+                expected_physical_bytes=physical_bytes,
+                source_device=opened.st_dev,
+                source_inode=opened.st_ino,
+            )
+        finally:
+            if bundle_fd is not None:
+                os.close(bundle_fd)
+            os.close(operation_fd)
+
+
 class BundlePurgeError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class BundleReclaimPresence:
+    quarantine_exists: bool
+    purging_exists: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -1141,7 +1329,7 @@ class BundlePurger:
         bundle_fd: int,
         *,
         root_device: int,
-        expected_physical_bytes: int,
+        expected_physical_bytes: int | None,
     ) -> int:
         try:
             top = set(os.listdir(bundle_fd))
@@ -1221,7 +1409,10 @@ class BundlePurger:
         finally:
             os.close(metadata_fd)
 
-        if physical_bytes != expected_physical_bytes:
+        if (
+            expected_physical_bytes is not None
+            and physical_bytes != expected_physical_bytes
+        ):
             raise BundlePurgeError(
                 "quarantine physical allocation differs from "
                 "durable reclaim evidence"
@@ -1425,6 +1616,54 @@ class BundlePurger:
             raise BundlePurgeError(
                 "purge root contains unexpected remaining entries"
             )
+
+    def inspect_reclaim_presence(
+        self,
+        *,
+        operation_id: str,
+        restore_point_id: str,
+    ) -> BundleReclaimPresence:
+        """Inspect deterministic quarantine/purge names without following links."""
+
+        operation_fd = self._open_operation_directory(
+            operation_id
+        )
+        purging_fd = None
+
+        try:
+            restore_point_name = (
+                BundlePathPlanner._uuid_component(
+                    restore_point_id,
+                    "restore point ID",
+                )
+            )
+
+            quarantine = self._entry_info(
+                operation_fd,
+                restore_point_name,
+            )
+
+            purging_fd = self._open_optional_child_directory(
+                operation_fd,
+                ".purging",
+                label="purging namespace",
+            )
+
+            staged = None
+            if purging_fd is not None:
+                staged = self._entry_info(
+                    purging_fd,
+                    restore_point_name,
+                )
+
+            return BundleReclaimPresence(
+                quarantine_exists=quarantine is not None,
+                purging_exists=staged is not None,
+            )
+        finally:
+            if purging_fd is not None:
+                os.close(purging_fd)
+            os.close(operation_fd)
 
     def purge(
         self,
