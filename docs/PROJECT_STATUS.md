@@ -332,9 +332,15 @@ mutation.
 
 ## 3E.8b.1c.2 — Reclaim state transition/recovery API
 
-Status: IN_PROGRESS
+Status: CLOSED
 
-Target state flow:
+Closing commit:
+
+    a9cbe27
+
+Implemented a strict repository-level durable reclaim state machine.
+
+Operation state flow:
 
     PLANNED -> RETIRING
     RETIRING -> QUARANTINED
@@ -343,25 +349,74 @@ Target state flow:
     PURGING -> PURGED
     PURGED -> COMPLETED
 
-Safe pre-mutation abort:
+Safe pre-destructive abort:
 
     PLANNED -> ABORTED
 
-Ambiguous destructive state:
+Recovery entry is allowed only from destructive states:
 
-    RETIRING / QUARANTINED / CATALOG_REMOVED / PURGING / PURGED
-        -> RECOVERY_REQUIRED
+    RETIRING
+    QUARANTINED
+    CATALOG_REMOVED
+    PURGING
+    PURGED
 
-Recovery must preserve and use `recovery_from_state`.
+Recovery records the exact prior state in `recovery_from_state` and resumes
+only after persisted database evidence is compatible with that state.
 
-Target scope:
+Implemented bundle-level transitions:
 
-- strict repository transition API;
-- atomic state changes;
-- bundle-level quarantine/purge state transitions;
-- state-dependent invariant validation;
-- durable recovery entry and recovery resume semantics;
-- no filesystem operations.
+    PLANNED -> QUARANTINED -> PURGED
+
+Quarantine state requires durable evidence:
+
+- quarantine object identity;
+- expected physical bytes;
+- source device;
+- source inode.
+
+Before entering RETIRING, the repository revalidates:
+
+- job/run/VM/storage lineage;
+- BACKING_UP run state;
+- absence of run recovery requirements;
+- SPACE_OPTIMIZED policy;
+- selected CLOSED-chain ownership;
+- complete FULL restore-point dependency sequences;
+- AVAILABLE restore points backed by SUCCESS runs;
+- immutable restore-point/bundle snapshot identity;
+- protected `minimum_full_chains` floor.
+
+An empty or malformed chain cannot satisfy the protected FULL-chain floor.
+
+Once an operation enters RETIRING, selected restore points become effectively
+unavailable through repository restore-point read APIs. PLANNED and ABORTED
+operations do not hide their restore points.
+
+Before sealing QUARANTINED, physical accounting must match:
+
+- the complete operation reclaim total;
+- each individual reclaim-chain snapshot total.
+
+CATALOG_REMOVED cannot be recorded while selected restore points or backup
+chains still exist in the catalog.
+
+PURGED cannot be recorded until every selected bundle has durable PURGED
+state.
+
+COMPLETED records the actual re-measured `free_bytes_after`.
+
+Recovery resume validates bundle state, quarantine evidence, chain physical
+totals and catalog presence before returning from RECOVERY_REQUIRED to the
+durable source state.
+
+This phase performs no filesystem mutation and does not itself delete catalog
+objects.
+
+The combined 3E.8b.1c durable recovery/transition layer is complete:
+
+- 3E.8b.1c.1 recovery provenance: CLOSED;
+- 3E.8b.1c.2 state transition/recovery API: CLOSED.
 
 ---
 
