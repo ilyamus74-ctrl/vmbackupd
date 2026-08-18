@@ -229,34 +229,81 @@ def test_cockpit_job_management_is_full_only_and_refreshes_authoritative_data():
     assert 'await refresh();' in javascript
 
 
-def test_cockpit_local_storage_management_is_explicit_and_non_destructive():
+def test_cockpit_storage_management_is_explicit_and_non_destructive():
     html = source("index.html")
     javascript = source("vmbackupd.js")
+
     assert all(value in html for value in (
-        "Add destination", "Type", 'value="Local" readonly', "Backup location",
-        "Stores the complete VM backup bundle", "Minimum free space", "Minimum free percent",
+        "Add destination",
+        "Type",
+        '<option value="LOCAL">Local</option>',
+        '<option value="SSH">SSH</option>',
+        "Destination path",
+        "Minimum free space",
+        "Minimum free percent",
         "Make default",
     ))
+
     assert "Control root" not in html
     assert "storage-control-root" not in javascript
+
     assert all(value in javascript for value in (
-        'actionButton("Edit"', 'actionButton("Test"', 'actionButton("Set default"',
-        'api.request("storage.create"', 'api.request("storage.update"',
-        'api.request("storage.set_default"', 'api.request("storage.test"',
+        'actionButton("Edit"',
+        'actionButton("Test"',
+        'actionButton("Set default"',
+        'api.request("storage.create"',
+        'api.request("storage.update"',
+        'api.request("storage.set_default"',
+        '"storage.test",',
         "destination.identity_locked",
     ))
-    assert "Create a new destination to move future backups" in html
-    assert "This is the current default. Set another destination as default to change it." in html
-    assert "defaultCheckbox.disabled = Boolean(destination && destination.is_default)" in javascript
-    assert "defaultCheckbox.checked = destination ? destination.is_default : false" in javascript
+
+    # Physical destination identity remains immutable after history exists.
+    assert (
+        "Its physical storage identity is locked; "
+        "create a new destination to move future backups."
+    ) in html
+
+    assert (
+        "Destination type cannot be changed after creation. "
+        "Create a new destination to switch between Local and SSH."
+    ) in html
+
+    assert (
+        "This is the current default. Set another destination as default "
+        "to change it."
+    ) in html
+
+    assert "defaultCheckbox.checked =" in javascript
+    assert "destination ? destination.is_default : false" in javascript
+
+    # Current default stays protected and SSH cannot become the default
+    # through Cockpit until SSH transport exists.
+    assert "defaultCheckbox.disabled =" in javascript
+    assert (
+        "isSSH || Boolean(existingDestination && "
+        "existingDestination.is_default)"
+    ) in javascript
+    assert "if (!isSSH && !destination.is_default)" in javascript
+
+    # No destructive storage lifecycle is exposed.
     assert "storage.delete" not in javascript
+
     assert 'await refresh();' in javascript
     assert "currentModel.storage.map" in javascript
-    assert "exactByteParts" in javascript and "minimumFreeBytes" in javascript
-    assert 'className = `probe-result ${result && result.ok ? "success" : "error"}`' in javascript
-    assert 'document.getElementById("storage-test-result")' in javascript
-    assert 'document.getElementById("storage-dialog-test-result")' in javascript
+    assert "exactByteParts" in javascript
+    assert "minimumFreeBytes" in javascript
 
+    assert (
+        'className = `probe-result '
+        '${result && result.ok ? "success" : "error"}`'
+    ) in javascript
+
+    assert 'document.getElementById("storage-test-result")' in javascript
+    assert (
+        'document.getElementById("storage-dialog-test-result")'
+        in javascript
+    )
 
 def test_cockpit_registration_flow_and_run_now_safety_are_explicit():
     html = source("index.html")

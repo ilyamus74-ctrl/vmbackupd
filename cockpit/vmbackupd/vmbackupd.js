@@ -357,30 +357,94 @@
         replaceRows("jobs", rows, 9, "No backup jobs configured");
     }
 
+    function storageType(destination) {
+        if (destination && destination.storage_type)
+            return destination.storage_type;
+        return destination && destination.type === "SSH" ? "SSH" : "LOCAL";
+    }
+
+    function sshTarget(destination) {
+        const host = text(destination.ssh_host);
+        const port = Number(destination.ssh_port);
+        if (!destination.ssh_host || !Number.isInteger(port))
+            return "Incomplete endpoint";
+        const displayedHost = destination.ssh_host.includes(":") &&
+            !destination.ssh_host.startsWith("[") ?
+            `[${destination.ssh_host}]` : destination.ssh_host;
+        return `${displayedHost}:${port}`;
+    }
+
+    function storageDestinationCell(destination) {
+        const container = document.createElement("div");
+        const primary = element(
+            "div",
+            storageType(destination) === "SSH" ?
+                destination.ssh_remote_root : destination.backup_data_root,
+            "storage-primary-path",
+        );
+        container.append(primary);
+
+        if (storageType(destination) === "SSH") {
+            container.append(element(
+                "div",
+                `Local staging: ${text(destination.backup_data_root)}`,
+                "storage-secondary",
+            ));
+        }
+
+        return container;
+    }
+
     function renderStorage(model) {
         const rows = model.storage.map(destination => {
-            const usable = destination.free_bytes === null || destination.free_bytes === undefined ?
-                null : Math.max(0, destination.free_bytes - destination.minimum_free_bytes);
+            const type = storageType(destination);
+            const isSSH = type === "SSH";
+
             const actions = document.createElement("div");
             actions.className = "row-actions";
             actions.append(
                 actionButton("Edit", () => openStorageDialog(destination), false),
-                actionButton("Test", () => testStoredDestination(destination), false),
             );
-            if (!destination.is_default)
-                actions.append(actionButton("Set default", () => setDefaultStorage(destination), false));
+
+            if (!isSSH)
+                actions.append(
+                    actionButton("Test", () => testStoredDestination(destination), false),
+                );
+
+            if (!isSSH && !destination.is_default)
+                actions.append(
+                    actionButton("Set default", () => setDefaultStorage(destination), false),
+                );
+
+            const target = isSSH ?
+                sshTarget(destination) :
+                text(model.status.node_name);
+
+            const reserve = isSSH ?
+                `Local staging: ${bytes(destination.minimum_free_bytes)} / ${text(destination.minimum_free_percent)}%` :
+                `${bytes(destination.minimum_free_bytes)} / ${text(destination.minimum_free_percent)}%`;
+
             return tableRow([
                 destination.name,
-                ["Local", "nowrap"],
+                badge(
+                    isSSH ? "SSH" : "Local",
+                    isSSH ? "status-active" : "status-neutral",
+                ),
+                [target, "nowrap"],
+                storageDestinationCell(destination),
                 [destination.is_default ? "Yes" : "No", "nowrap"],
-                [bytes(destination.free_bytes), "nowrap"],
-                [`${bytes(destination.minimum_free_bytes)} / ${text(destination.minimum_free_percent)}%`, "nowrap"],
-                [bytes(usable), "nowrap"],
-                [destination.backup_data_root, "path-cell"],
+                [isSSH ? "Not checked" : bytes(destination.free_bytes), "nowrap"],
+                [reserve, "nowrap"],
                 actions,
             ]);
         });
-        replaceRows("storage", rows, 8, "No storage destinations configured");
+
+        replaceRows(
+            "storage",
+            rows,
+            8,
+            "No storage destinations configured",
+        );
     }
 
     function exactByteParts(value) {
@@ -409,38 +473,179 @@
             "Daemon-side Backup-location filesystem test only; no VM backup was run.";
     }
 
+    function updateStorageTransportFields() {
+        const type = document.getElementById("storage-type").value;
+        const isSSH = type === "SSH";
+
+        const sshFields = document.getElementById("storage-ssh-fields");
+        sshFields.hidden = !isSSH;
+
+        for (const id of [
+            "storage-ssh-host",
+            "storage-ssh-port",
+            "storage-ssh-user",
+            "storage-ssh-remote-root",
+        ]) {
+            const field = document.getElementById(id);
+            field.required = isSSH;
+        }
+
+        document.getElementById("storage-data-root-title").textContent =
+            isSSH ? "Local staging path" : "Destination path";
+
+        document.getElementById("storage-data-root-help").textContent =
+            isSSH ?
+                "Local controlled staging area used before future SSH transfer." :
+                "Stores the complete VM backup bundle on this node.";
+
+        document.getElementById("storage-reserve-note").textContent =
+            isSSH ?
+                "Reserve currently applies to local staging. Remote capacity checking is introduced with SSH connection preflight." :
+                "Reserve applies to the local destination filesystem.";
+
+        const testButton = document.getElementById("storage-test-candidate");
+        testButton.hidden = isSSH;
+
+        const defaultCheckbox = document.getElementById("storage-default");
+        const existingDestination = currentModel && editingStorageId ?
+            currentModel.storage.find(value => value.id === editingStorageId) : null;
+
+        defaultCheckbox.disabled =
+            isSSH || Boolean(existingDestination && existingDestination.is_default);
+
+        if (isSSH && !existingDestination)
+            defaultCheckbox.checked = false;
+
+        const resultNode = document.getElementById(
+            "storage-dialog-test-result"
+        );
+
+        if (isSSH) {
+            resultNode.hidden = false;
+            resultNode.className = "probe-result";
+            resultNode.textContent =
+                "SSH connection is not tested in this phase. Identity and host trust are configured separately; network preflight is introduced in SSH.4.";
+        } else {
+            resultNode.hidden = true;
+        }
+    }
+
     function openStorageDialog(destination = null) {
         editingStorageId = destination ? destination.id : null;
+
         document.getElementById("storage-dialog-title").textContent =
             destination ? "Edit destination" : "Add destination";
-        document.getElementById("storage-name").value = destination ? destination.name : "";
-        document.getElementById("storage-data-root").value = destination ? destination.backup_data_root : "";
-        const reserve = exactByteParts(destination ? destination.minimum_free_bytes : 0);
-        document.getElementById("storage-minimum-value").value = reserve.value;
-        document.getElementById("storage-minimum-unit").value = String(reserve.unit);
+
+        document.getElementById("storage-name").value =
+            destination ? destination.name : "";
+
+        const type = destination ? storageType(destination) : "LOCAL";
+        const typeSelect = document.getElementById("storage-type");
+        typeSelect.value = type;
+        typeSelect.disabled = Boolean(destination);
+
+        document.getElementById("storage-type-note").hidden =
+            !Boolean(destination);
+
+        document.getElementById("storage-data-root").value =
+            destination ? destination.backup_data_root : "";
+
+        document.getElementById("storage-ssh-host").value =
+            destination && destination.ssh_host ?
+                destination.ssh_host : "";
+
+        document.getElementById("storage-ssh-port").value =
+            destination && destination.ssh_port ?
+                destination.ssh_port : 22;
+
+        document.getElementById("storage-ssh-user").value =
+            destination && destination.ssh_user ?
+                destination.ssh_user : "vmbackupd-transfer";
+
+        document.getElementById("storage-ssh-remote-root").value =
+            destination && destination.ssh_remote_root ?
+                destination.ssh_remote_root : "";
+
+        const reserve = exactByteParts(
+            destination ? destination.minimum_free_bytes : 0
+        );
+
+        document.getElementById("storage-minimum-value").value =
+            reserve.value;
+
+        document.getElementById("storage-minimum-unit").value =
+            String(reserve.unit);
+
         document.getElementById("storage-minimum-percent").value =
             destination ? destination.minimum_free_percent : 5;
-        const defaultCheckbox = document.getElementById("storage-default");
-        defaultCheckbox.checked = destination ? destination.is_default : false;
-        defaultCheckbox.disabled = Boolean(destination && destination.is_default);
+
+        const defaultCheckbox =
+            document.getElementById("storage-default");
+
+        defaultCheckbox.checked =
+            destination ? destination.is_default : false;
+
+        defaultCheckbox.disabled =
+            Boolean(destination && destination.is_default);
+
         document.getElementById("storage-default-note").hidden =
             !Boolean(destination && destination.is_default);
-        const locked = Boolean(destination && destination.identity_locked);
+
+        const locked = Boolean(
+            destination && destination.identity_locked
+        );
+
         document.getElementById("storage-data-root").disabled = locked;
-        document.getElementById("storage-identity-note").hidden = !locked;
+
+        for (const id of [
+            "storage-ssh-host",
+            "storage-ssh-port",
+            "storage-ssh-user",
+            "storage-ssh-remote-root",
+        ])
+            document.getElementById(id).disabled = locked;
+
+        document.getElementById("storage-identity-note").hidden =
+            !locked;
+
         document.getElementById("storage-form-error").textContent = "";
-        document.getElementById("storage-dialog-test-result").hidden = true;
+
+        updateStorageTransportFields();
+
         storageDialog.showModal();
     }
 
     function storageFormParams() {
-        return {
+        const type = document.getElementById("storage-type").value;
+
+        const params = {
             name: document.getElementById("storage-name").value.trim(),
-            backup_data_root: document.getElementById("storage-data-root").value,
+            backup_data_root:
+                document.getElementById("storage-data-root").value,
             minimum_free_bytes: minimumFreeBytes(),
-            minimum_free_percent: Number(document.getElementById("storage-minimum-percent").value),
-            make_default: document.getElementById("storage-default").checked,
+            minimum_free_percent:
+                Number(document.getElementById("storage-minimum-percent").value),
+            make_default:
+                document.getElementById("storage-default").checked,
         };
+
+        if (!editingStorageId)
+            params.storage_type = type;
+
+        if (type === "SSH") {
+            params.ssh_host =
+                document.getElementById("storage-ssh-host").value.trim();
+            params.ssh_port =
+                Number(document.getElementById("storage-ssh-port").value);
+            params.ssh_user =
+                document.getElementById("storage-ssh-user").value.trim();
+            params.ssh_remote_root =
+                document.getElementById(
+                    "storage-ssh-remote-root"
+                ).value;
+        }
+
+        return params;
     }
 
     async function saveStorage(event) {
@@ -463,28 +668,66 @@
 
     async function testStoredDestination(destination) {
         const resultNode = document.getElementById("storage-test-result");
+
+        if (storageType(destination) === "SSH") {
+            resultNode.hidden = false;
+            resultNode.className = "probe-result";
+            resultNode.textContent =
+                "SSH connection testing is not available until SSH.4.";
+            return;
+        }
+
         try {
             resultNode.hidden = false;
             resultNode.className = "probe-result";
-            resultNode.textContent = `Testing Local destination ${destination.name}…`;
-            const result = await api.request("storage.test", { id: destination.id });
+            resultNode.textContent =
+                `Testing Local destination ${destination.name}…`;
+            const result = await api.request(
+                "storage.test",
+                { id: destination.id },
+            );
             showProbeResult(resultNode, result);
         } catch (error) {
-            showProbeResult(resultNode, null, failureMessage(error));
+            showProbeResult(
+                resultNode,
+                null,
+                failureMessage(error),
+            );
         }
     }
 
     async function testStorageCandidate() {
-        const resultNode = document.getElementById("storage-dialog-test-result");
+        const resultNode =
+            document.getElementById("storage-dialog-test-result");
+
+        if (document.getElementById("storage-type").value === "SSH") {
+            resultNode.hidden = false;
+            resultNode.className = "probe-result";
+            resultNode.textContent =
+                "SSH connection testing is not available until SSH.4.";
+            return;
+        }
+
         resultNode.hidden = true;
+
         try {
             const params = storageFormParams();
             delete params.name;
             delete params.make_default;
-            const result = await api.request("storage.test", params);
+            delete params.storage_type;
+
+            const result = await api.request(
+                "storage.test",
+                params,
+            );
+
             showProbeResult(resultNode, result);
         } catch (error) {
-            showProbeResult(resultNode, null, failureMessage(error));
+            showProbeResult(
+                resultNode,
+                null,
+                failureMessage(error),
+            );
         }
     }
 
@@ -555,8 +798,15 @@
             return option;
         }));
         storageSelect.replaceChildren(...currentModel.storage.map(destination => {
-            const option = element("option", destination.name);
+            const isSSH = storageType(destination) === "SSH";
+            const option = element(
+                "option",
+                isSSH ?
+                    `${destination.name} (SSH transport not enabled yet)` :
+                    destination.name,
+            );
             option.value = destination.id;
+            option.disabled = isSSH;
             return option;
         }));
         if (editingJob) {
@@ -815,6 +1065,10 @@
     jobForm.addEventListener("submit", saveJob);
     document.getElementById("storage-cancel").addEventListener("click", () => storageDialog.close());
     document.getElementById("storage-test-candidate").addEventListener("click", testStorageCandidate);
+    document.getElementById("storage-type").addEventListener(
+        "change",
+        updateStorageTransportFields,
+    );
     storageForm.addEventListener("submit", saveStorage);
     window.addEventListener("beforeunload", () => {
         pageUnloading = true;

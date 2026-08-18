@@ -155,3 +155,32 @@ summary { cursor: pointer; font-size: 1.1rem; font-weight: 700; }
 @media (max-width: 26rem) {
     .summary-grid { grid-template-columns: 1fr; }
 }
+
+/* SSH.3a storage destination presentation */
+.storage-transport-fields {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(8rem, 11rem);
+    gap: 0.9rem 0.75rem;
+}
+
+.storage-transport-fields[hidden] {
+    display: none;
+}
+
+.storage-primary-path {
+    overflow-wrap: anywhere;
+    font-family: monospace;
+}
+
+.storage-secondary {
+    margin-top: 0.2rem;
+    color: #6a6e73;
+    font-size: 0.85rem;
+    overflow-wrap: anywhere;
+}
+
+@media (max-width: 42rem) {
+    .storage-transport-fields {
+        grid-template-columns: 1fr;
+    }
+}
