@@ -928,16 +928,78 @@ Acceptance coverage proves:
 - full project regression suite passes.
 
 
+# Remote backup transport decision
+
+Status: ARCHITECTURE DECIDED
+
+The preferred transport for backups to a remote backup server is SSH-based
+transfer. A remotely mounted filesystem such as NFS remains supported as an
+operator-provided StorageDestination, but is not the primary remote transport
+architecture.
+
+Target remote path:
+
+    QEMU/libvirt backup
+        ->
+    local controlled .incoming
+        ->
+    TRANSFERRING
+        ->
+    SSH transport
+        ->
+    remote controlled .incoming
+        ->
+    verification
+        ->
+    atomic promotion
+        ->
+    AVAILABLE restore point
+
+Required remote-transport invariants:
+
+- dedicated SSH credentials/keys;
+- SSH host identity verification;
+- interrupted transfer never creates an AVAILABLE restore point;
+- incomplete remote data remains in a controlled temporary namespace;
+- verification completes before final promotion;
+- existing restore points are never overwritten;
+- cleanup is safe and resumable;
+- local source remains recoverable until remote verification succeeds.
+
+The existing TRANSFERRING state is the architectural integration point.
+Currently TRANSFERRING does not perform real network transfer, so SSH remote
+backup remains NOT IMPLEMENTED.
+
+Normal INCREMENTAL backups should obtain WAN savings primarily from the
+QEMU/libvirt incremental backup chain.
+
+A future FULL-transfer optimization may use rsync delta against an existing
+remote FULL. Where the backup-server filesystem supports safe reflink/CoW
+cloning, the previous FULL may be cloned locally on the backup server and used
+as the basis for the new FULL candidate before applying the network delta.
+
+This optimization is optional and is not required for the first production
+SSH transport implementation.
+
+---
+
 # Current position
 
 Current implementation milestone:
 
-    3E.8b.1b — Durable reclaim snapshot repository API
+    3E.8c — Smart backup size estimator CLOSED
 
 Current safety boundary:
 
-    capacity planning      YES
-    reclaim selection      YES
-    durable reclaim schema YES
-    filesystem reclaim     NO
-    catalog deletion       NO
+    capacity planning             YES
+    reclaim selection             YES
+    durable reclaim schema        YES
+    filesystem reclaim            YES
+    atomic catalog retirement     YES
+    physical reclaim purge        YES
+    reclaim crash recovery        YES
+    backup preflight reclaim      YES
+    smart backup size estimator   YES
+    interval scheduler            YES
+    calendar DAILY scheduler      NO
+    remote SSH transfer           NO
