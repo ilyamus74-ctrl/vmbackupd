@@ -783,15 +783,91 @@ repository boundary.
 
 ## 3E.8b.3 — Backup preflight reclaim execution integration
 
-Status: IN_PROGRESS
+Status: CLOSED
 
-SPACE_OPTIMIZED execution will be allowed only after 3E.8b.1 and 3E.8b.2
-are complete.
+Closing commit:
 
-After physical reclaim the executor must re-read actual free space before
-starting a backup.
+    aace651
 
----
+Integrated durable SPACE_OPTIMIZED reclaim execution into the final
+BACKING_UP preflight before any new backup staging or libvirt mutation.
+
+Normal capacity path:
+
+- measures current free and total bytes on the configured backup data root;
+- computes the persisted destination reserve;
+- executes the existing CapacityPlanningService decision;
+- continues directly when current measured capacity is already sufficient;
+- preserves SAFE mode as a non-destructive fail-safe policy.
+
+SPACE_OPTIMIZED path:
+
+- requires a complete reclaim plan with selected CLOSED FULL chains;
+- creates one durable reclaim operation for the current backup run;
+- executes it through ReclaimExecutor;
+- does not create backup staging before reclaim completion;
+- does not invoke libvirt backup-begin before reclaim completion;
+- re-reads actual filesystem free space after physical purge;
+- refuses backup continuation if measured free space is still insufficient.
+
+Crash/retry behavior:
+
+- checks get_reclaim_operation_for_run() before creating a new operation;
+- reuses an existing durable reclaim transaction instead of replanning;
+- validates run, job, VM, destination, backup estimate and reserve identity;
+- resumes non-terminal durable reclaim states through ReclaimExecutor;
+- propagates RECOVERY_REQUIRED reclaim state to the backup run;
+- does not create a second reclaim operation for the same run;
+- requires current measured free space even after a COMPLETED reclaim;
+- does not recreate an ABORTED reclaim operation for the same backup run.
+
+Capacity authorization invariant:
+
+    projected reclaim bytes
+        !=
+    permission to start backup
+
+Backup start is authorized only by current measured free capacity after any
+required physical reclaim.
+
+The previous diagnostic:
+
+    reclaim_execution=NOT_IMPLEMENTED
+
+has been removed.
+
+SAFE insufficient-capacity diagnostics report:
+
+    reclaim_execution=NOT_ALLOWED_BY_POLICY
+
+An incomplete SPACE_OPTIMIZED reclaim plan reports:
+
+    reclaim_execution=NO_COMPLETE_PLAN
+
+Read-only reclaim presence inspection treats a missing fresh .reclaim
+namespace as normal absence while continuing to reject symlinks and unsafe
+namespace substitutions.
+
+The strict BundlePurger destructive path remains unchanged and still requires
+an existing safe reclaim operation namespace.
+
+LibvirtBackupExecutor introduces no raw unlink, rmdir, recursive deletion,
+catalog DELETE or schema mutation.
+
+Acceptance coverage includes:
+
+- normal backup start without reclaim;
+- SAFE insufficient-space refusal;
+- reserve mismatch fail-closed behavior;
+- SPACE_OPTIMIZED physical reclaim before backup start;
+- refusal when measured free space remains insufficient after reclaim;
+- reclaim RECOVERY_REQUIRED propagation;
+- reuse of an existing reclaim operation after retry;
+- safe fresh reclaim namespace handling;
+- rejection of unsafe reclaim namespaces;
+- full libvirt execution regression coverage;
+- full project test suite.
+
 
 ## 3E.8c — Smart backup size estimator
 
