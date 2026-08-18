@@ -12,9 +12,13 @@
     const storageForm = document.getElementById("storage-form");
     const TERMINAL_STATES = new Set(["SUCCESS", "FAILED"]);
     const RECENT_RUN_LIMIT = 20;
+    const LIVE_REFRESH_INTERVAL_MS = 2000;
     let currentModel = null;
     let editingJobId = null;
     let editingStorageId = null;
+    let refreshTimer = null;
+    let refreshInFlight = null;
+    let pageUnloading = false;
 
     function text(value) {
         if (value === null || value === undefined || value === "")
@@ -634,42 +638,99 @@
         return "Daemon unavailable or permission denied. The logged-in session must belong to vmbackupd-admin; after enrollment, start a fresh Cockpit login session.";
     }
 
-    async function refresh() {
-        refreshButton.disabled = true;
-        clearViews();
-        setNotice("Loading complete backup status…", "loading");
-        try {
-            const [status, discoveredVms, registeredVms, storage, jobs, runs,
-                restorePoints, recovery] = await Promise.all([
-                api.request("daemon.status"),
-                api.request("vm.discover"),
-                api.request("vm.list"),
-                api.request("storage.list"),
-                api.request("job.list"),
-                api.request("run.list"),
-                api.request("restore_point.list"),
-                api.request("recovery.list"),
-            ]);
-            const model = deriveModel({
-                status: status,
-                discoveredVms: discoveredVms,
-                registeredVms: registeredVms,
-                storage: storage,
-                jobs: jobs,
-                runs: runs,
-                restorePoints: restorePoints,
-                recovery: recovery,
-            }, new Date());
-            renderModel(model);
-            if (status.runtime_state === "RUNNING")
-                setNotice("Operational data loaded", "success");
-            else
-                setNotice(`Daemon runtime is ${text(status.runtime_state)}`, "error");
-        } catch (error) {
-            setNotice(failureMessage(error), "error");
-        } finally {
-            refreshButton.disabled = false;
+    function hasActiveRuns() {
+        return Boolean(
+            currentModel &&
+            currentModel.runs.some(run => !TERMINAL_STATES.has(run.state))
+        );
+    }
+
+    function stopLiveRefresh() {
+        if (refreshTimer === null)
+            return;
+        window.clearTimeout(refreshTimer);
+        refreshTimer = null;
+    }
+
+    function scheduleLiveRefresh() {
+        stopLiveRefresh();
+        if (pageUnloading || !hasActiveRuns())
+            return;
+
+        refreshTimer = window.setTimeout(() => {
+            refreshTimer = null;
+            void refresh({ background: true });
+        }, LIVE_REFRESH_INTERVAL_MS);
+    }
+
+    async function refresh(options) {
+        const background = Boolean(options && options.background);
+
+        if (refreshInFlight) {
+            if (background)
+                return refreshInFlight;
+            await refreshInFlight;
         }
+
+        stopLiveRefresh();
+        refreshButton.disabled = true;
+
+        if (!background) {
+            clearViews();
+            setNotice("Loading complete backup status…", "loading");
+        }
+
+        const operation = (async () => {
+            try {
+                const [status, discoveredVms, registeredVms, storage, jobs, runs,
+                    restorePoints, recovery] = await Promise.all([
+                    api.request("daemon.status"),
+                    api.request("vm.discover"),
+                    api.request("vm.list"),
+                    api.request("storage.list"),
+                    api.request("job.list"),
+                    api.request("run.list"),
+                    api.request("restore_point.list"),
+                    api.request("recovery.list"),
+                ]);
+
+                const model = deriveModel({
+                    status: status,
+                    discoveredVms: discoveredVms,
+                    registeredVms: registeredVms,
+                    storage: storage,
+                    jobs: jobs,
+                    runs: runs,
+                    restorePoints: restorePoints,
+                    recovery: recovery,
+                }, new Date());
+
+                renderModel(model);
+
+                if (status.runtime_state === "RUNNING")
+                    setNotice("Operational data loaded", "success");
+                else
+                    setNotice(`Daemon runtime is ${text(status.runtime_state)}`, "error");
+
+                return true;
+            } catch (error) {
+                setNotice(failureMessage(error), "error");
+                return false;
+            } finally {
+                refreshButton.disabled = false;
+            }
+        })();
+
+        refreshInFlight = operation;
+        const succeeded = await operation;
+
+        if (refreshInFlight === operation)
+            refreshInFlight = null;
+
+        if (succeeded)
+            scheduleLiveRefresh();
+
+        return succeeded;
     }
 
     refreshButton.addEventListener("click", refresh);
@@ -684,5 +745,9 @@
     document.getElementById("storage-cancel").addEventListener("click", () => storageDialog.close());
     document.getElementById("storage-test-candidate").addEventListener("click", testStorageCandidate);
     storageForm.addEventListener("submit", saveStorage);
+    window.addEventListener("beforeunload", () => {
+        pageUnloading = true;
+        stopLiveRefresh();
+    });
     refresh();
 }());

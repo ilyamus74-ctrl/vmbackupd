@@ -269,3 +269,77 @@ def test_cockpit_interval_editor_round_trips_without_truncation():
     assert "return { amount: seconds, unit: 1 };" in javascript
     assert "Number(document.getElementById(\"job-interval\").value) *" in javascript
     assert "Number(document.getElementById(\"job-interval-unit\").value)" in javascript
+
+def test_cockpit_live_refresh_uses_one_shot_polling():
+    javascript = source("vmbackupd.js")
+    assert "const LIVE_REFRESH_INTERVAL_MS = 2000;" in javascript
+    assert "window.setTimeout" in javascript
+    assert "window.clearTimeout" in javascript
+    assert "setInterval" not in javascript
+
+
+def test_cockpit_live_refresh_only_exists_while_work_is_active():
+    javascript = source("vmbackupd.js")
+    assert "function hasActiveRuns()" in javascript
+    assert "currentModel.runs.some(run => !TERMINAL_STATES.has(run.state))" in javascript
+    assert "if (pageUnloading || !hasActiveRuns())" in javascript
+
+
+def test_cockpit_live_refresh_is_non_overlapping():
+    javascript = source("vmbackupd.js")
+    assert "let refreshInFlight = null;" in javascript
+
+    refresh_body = javascript.split("async function refresh(options)", 1)[1].split(
+        'refreshButton.addEventListener("click"', 1
+    )[0]
+
+    assert "if (refreshInFlight)" in refresh_body
+    assert "if (background)" in refresh_body
+    assert "return refreshInFlight;" in refresh_body
+    assert "await refreshInFlight;" in refresh_body
+    assert "refreshInFlight = operation;" in refresh_body
+
+
+def test_cockpit_background_refresh_preserves_rendered_dashboard():
+    javascript = source("vmbackupd.js")
+
+    refresh_body = javascript.split("async function refresh(options)", 1)[1].split(
+        'refreshButton.addEventListener("click"', 1
+    )[0]
+
+    assert "const background = Boolean(options && options.background);" in refresh_body
+    assert "if (!background) {" in refresh_body
+    assert "clearViews();" in refresh_body
+    assert "void refresh({ background: true });" in javascript
+
+
+def test_cockpit_polling_stops_on_failure_terminal_state_and_unload():
+    javascript = source("vmbackupd.js")
+
+    refresh_body = javascript.split("async function refresh(options)", 1)[1].split(
+        'refreshButton.addEventListener("click"', 1
+    )[0]
+
+    assert "return false;" in refresh_body
+    assert "if (succeeded)" in refresh_body
+    assert "scheduleLiveRefresh();" in refresh_body
+    assert 'window.addEventListener("beforeunload"' in javascript
+    assert "pageUnloading = true;" in javascript
+    assert "stopLiveRefresh();" in javascript
+
+
+def test_cockpit_run_now_refreshes_authoritative_data_for_live_polling():
+    javascript = source("vmbackupd.js")
+
+    run_now = javascript.split("async function runNow(job)", 1)[1].split(
+        "async function saveJob", 1
+    )[0]
+
+    assert run_now.index('api.request("backup.run"') < run_now.index("await refresh();")
+    assert "function scheduleLiveRefresh()" in javascript
+
+
+def test_cockpit_live_refresh_does_not_invent_byte_progress():
+    javascript = source("vmbackupd.js")
+    assert "bytes_processed" not in javascript
+    assert "bytes_total" not in javascript
