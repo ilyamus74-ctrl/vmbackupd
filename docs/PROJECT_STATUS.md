@@ -871,19 +871,62 @@ Acceptance coverage includes:
 
 ## 3E.8c — Smart backup size estimator
 
-Status: PLANNED
+Status: CLOSED
 
-Target estimate:
+Closing commit:
 
-    max(
-        current source allocated bytes,
-        previous successful FULL physical bytes
-    )
-    * configured margin
+    db138b1
 
-Virtual disk capacity remains a conservative fallback.
+Implemented per-disk smart backup-size estimation.
 
----
+For each backup-enabled disk the estimator uses:
+
+    current_used =
+        libvirt Allocation when positive
+        else libvirt Physical when positive
+
+    historical =
+        physical st_blocks * 512 allocation
+        of the corresponding disk in the latest
+        AVAILABLE successful FULL restore point
+
+    base =
+        max(current_used, historical)
+        when both are available
+
+If only one trustworthy value is available, that value is used.
+
+If neither current allocated/physical data nor trustworthy FULL history is
+available, virtual disk Capacity is used as the conservative fallback.
+
+The configured backup_size_margin_percent is applied to the selected base.
+
+Historical sizing is advisory:
+
+- malformed or unavailable historical bundle data does not block a new backup;
+- unsafe historical bundle paths are not trusted;
+- published artifact identity must match the expected bundle disk path;
+- historical disk allocation is measured through the existing descriptor-safe
+  BundlePhysicalInspector boundary.
+
+Virtual capacity remains independently preserved as the planned output image
+capacity and is not replaced by the smart free-space estimate.
+
+Acceptance coverage proves:
+
+- previous FULL larger than current allocation;
+- current allocation larger than previous FULL;
+- Allocation preferred over Physical;
+- Physical fallback when Allocation is unavailable;
+- virtual Capacity fallback when no used-size facts exist;
+- configured margin application;
+- latest valid successful FULL physical disk sizing;
+- historical inspection failure is advisory;
+- SPACE_OPTIMIZED reclaim success uses the same estimator contract;
+- durable reclaim retry validates the same required backup estimate;
+- insufficient measured post-reclaim capacity remains fail-closed;
+- full project regression suite passes.
+
 
 # Current position
 
