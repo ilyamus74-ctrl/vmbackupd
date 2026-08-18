@@ -243,26 +243,50 @@ No reclaim filesystem mutation exists in this phase.
 
 ## 3E.8b.1b — Durable reclaim snapshot repository API
 
-Status: IN_PROGRESS
+Status: CLOSED
 
-Target scope:
+Closing commit:
 
-- atomically create immutable PLANNED reclaim snapshots;
-- validate run/job/VM/destination lineage;
-- validate selected CLOSED chains;
-- validate complete restore-point membership;
-- snapshot bundle identities;
-- persist expected physical bytes;
-- provide read APIs for operation/chains/bundles;
-- rollback completely on any invariant violation.
+    a7597d1
 
-Explicitly out of scope:
+Implemented an atomic durable PLANNED reclaim snapshot repository API.
 
-- filesystem rename;
-- unlink/rmtree;
-- catalog deletion;
+Implemented APIs:
+
+- `create_reclaim_operation()`;
+- `get_reclaim_operation()`;
+- `get_reclaim_operation_for_run()`;
+- `list_reclaim_chains()`;
+- `list_reclaim_bundles()`.
+
+Creation is performed as one database transaction and validates:
+
+- run/job/VM/storage-destination lineage;
+- BACKING_UP run state;
+- absence of run recovery requirements;
+- SPACE_OPTIMIZED policy;
+- absence of another non-terminal reclaim operation for the VM;
+- selected chain ownership and CLOSED state;
+- complete populated FULL-chain restore-point dependency sequence;
+- AVAILABLE restore points backed by SUCCESS runs;
+- unique non-null published bundle identities;
+- non-negative and sufficient projected reclaim capacity;
+- `minimum_full_chains` using valid populated FULL chains only.
+
+An empty or malformed ACTIVE chain cannot artificially satisfy the protected
+FULL-chain floor.
+
+Any invariant failure rolls back the complete reclaim journal creation.
+
+Explicitly not implemented in this phase:
+
 - reclaim state transitions;
-- integration with backup executor.
+- filesystem rename or quarantine;
+- unlink/rmtree or physical purge;
+- restore-point/catalog retirement;
+- backup-executor reclaim execution.
+
+No backup files or catalog objects are deleted by this phase.
 
 ---
 
