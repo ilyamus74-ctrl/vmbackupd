@@ -10,12 +10,14 @@
     const jobForm = document.getElementById("job-form");
     const storageDialog = document.getElementById("storage-dialog");
     const storageForm = document.getElementById("storage-form");
+    const sshDialog = document.getElementById("ssh-dialog");
     const TERMINAL_STATES = new Set(["SUCCESS", "FAILED"]);
     const RECENT_RUN_LIMIT = 20;
     const LIVE_REFRESH_INTERVAL_MS = 2000;
     let currentModel = null;
     let editingJobId = null;
     let editingStorageId = null;
+    let sshSetupDestination = null;
     let refreshTimer = null;
     let refreshInFlight = null;
     let pageUnloading = false;
@@ -406,9 +408,21 @@
                 actionButton("Edit", () => openStorageDialog(destination), false),
             );
 
-            if (!isSSH)
+            if (isSSH)
                 actions.append(
-                    actionButton("Test", () => testStoredDestination(destination), false),
+                    actionButton(
+                        "SSH setup",
+                        () => openSSHSetup(destination),
+                        false,
+                    ),
+                );
+            else
+                actions.append(
+                    actionButton(
+                        "Test",
+                        () => testStoredDestination(destination),
+                        false,
+                    ),
                 );
 
             if (!isSSH && !destination.is_default)
@@ -728,6 +742,242 @@
                 null,
                 failureMessage(error),
             );
+        }
+    }
+
+    function setSSHSetupError(message) {
+        document.getElementById("ssh-setup-error").textContent =
+            message || "";
+    }
+
+    function renderSSHIdentity(result) {
+        const exists = Boolean(result && result.exists);
+
+        document.getElementById("ssh-identity-status").replaceChildren(
+            badge(
+                exists ? "Generated" : "Not generated",
+                exists ? "status-success" : "status-warning",
+            ),
+        );
+
+        document.getElementById("ssh-identity-fingerprint").textContent =
+            exists ? text(result.fingerprint) : "—";
+
+        document.getElementById("ssh-identity-public-key").value =
+            exists ? text(result.public_key) : "";
+
+        document.getElementById("ssh-identity-generate").hidden = exists;
+        document.getElementById("ssh-identity-rotate").hidden = !exists;
+    }
+
+    function renderSSHHostKey(result) {
+        const trusted = Boolean(result && result.trusted);
+
+        document.getElementById("ssh-hostkey-status").replaceChildren(
+            badge(
+                trusted ? "Trusted" : "Not trusted",
+                trusted ? "status-success" : "status-warning",
+            ),
+        );
+
+        document.getElementById("ssh-hostkey-endpoint").textContent =
+            result ? text(result.host_token) : "—";
+
+        document.getElementById("ssh-hostkey-type").textContent =
+            trusted ? text(result.key_type) : "—";
+
+        document.getElementById("ssh-hostkey-fingerprint").textContent =
+            trusted ? text(result.fingerprint) : "—";
+
+        document.getElementById("ssh-hostkey-public-key").value =
+            trusted ? text(result.public_key) : "";
+
+        document.getElementById("ssh-hostkey-input-label").hidden =
+            trusted;
+
+        document.getElementById("ssh-hostkey-add").hidden =
+            trusted;
+
+        document.getElementById("ssh-hostkey-revoke").hidden =
+            !trusted;
+    }
+
+    async function refreshSSHSetup() {
+        if (!sshSetupDestination)
+            return;
+
+        setSSHSetupError("");
+
+        try {
+            const [identity, hostkey] = await Promise.all([
+                api.request(
+                    "ssh.identity.show",
+                    { destination_id: sshSetupDestination.id },
+                ),
+                api.request(
+                    "ssh.hostkey.show",
+                    { destination_id: sshSetupDestination.id },
+                ),
+            ]);
+
+            renderSSHIdentity(identity);
+            renderSSHHostKey(hostkey);
+        } catch (error) {
+            setSSHSetupError(failureMessage(error));
+        }
+    }
+
+    async function openSSHSetup(destination) {
+        if (storageType(destination) !== "SSH") {
+            setNotice(
+                "SSH setup is available only for SSH destinations.",
+                "error",
+            );
+            return;
+        }
+
+        sshSetupDestination = destination;
+
+        document.getElementById("ssh-dialog-title").textContent =
+            `SSH setup — ${destination.name}`;
+
+        document.getElementById("ssh-destination-summary").textContent =
+            `${sshTarget(destination)} → ${text(destination.ssh_remote_root)}`;
+
+        document.getElementById("ssh-hostkey-input").value = "";
+        setSSHSetupError("");
+
+        renderSSHIdentity({
+            exists: false,
+            public_key: null,
+            fingerprint: null,
+        });
+
+        renderSSHHostKey({
+            host_token: sshTarget(destination),
+            trusted: false,
+            key_type: null,
+            public_key: null,
+            fingerprint: null,
+        });
+
+        sshDialog.showModal();
+        await refreshSSHSetup();
+    }
+
+    async function generateSSHIdentity() {
+        if (!sshSetupDestination)
+            return;
+
+        setSSHSetupError("");
+
+        try {
+            await api.request(
+                "ssh.identity.generate",
+                { destination_id: sshSetupDestination.id },
+            );
+
+            await refreshSSHSetup();
+
+            setNotice(
+                `SSH identity generated for ${sshSetupDestination.name}`,
+                "success",
+            );
+        } catch (error) {
+            setSSHSetupError(failureMessage(error));
+        }
+    }
+
+    async function rotateSSHIdentity() {
+        if (!sshSetupDestination)
+            return;
+
+        if (!window.confirm(
+            "Rotate this SSH client identity? The old public key will stop authenticating after receiver authorization is updated."
+        ))
+            return;
+
+        setSSHSetupError("");
+
+        try {
+            await api.request(
+                "ssh.identity.rotate",
+                { destination_id: sshSetupDestination.id },
+            );
+
+            await refreshSSHSetup();
+
+            setNotice(
+                `SSH identity rotated for ${sshSetupDestination.name}`,
+                "success",
+            );
+        } catch (error) {
+            setSSHSetupError(failureMessage(error));
+        }
+    }
+
+    async function addSSHHostKey() {
+        if (!sshSetupDestination)
+            return;
+
+        const key =
+            document.getElementById("ssh-hostkey-input").value.trim();
+
+        if (!key) {
+            setSSHSetupError(
+                "Paste the server host public key before trusting it."
+            );
+            return;
+        }
+
+        setSSHSetupError("");
+
+        try {
+            await api.request(
+                "ssh.hostkey.add",
+                {
+                    destination_id: sshSetupDestination.id,
+                    key: key,
+                },
+            );
+
+            document.getElementById("ssh-hostkey-input").value = "";
+            await refreshSSHSetup();
+
+            setNotice(
+                `SSH server host key trusted for ${sshSetupDestination.name}`,
+                "success",
+            );
+        } catch (error) {
+            setSSHSetupError(failureMessage(error));
+        }
+    }
+
+    async function revokeSSHHostKey() {
+        if (!sshSetupDestination)
+            return;
+
+        if (!window.confirm(
+            "Revoke trust for this SSH server host key? SSH connections will fail closed until a host key is explicitly trusted again."
+        ))
+            return;
+
+        setSSHSetupError("");
+
+        try {
+            await api.request(
+                "ssh.hostkey.revoke",
+                { destination_id: sshSetupDestination.id },
+            );
+
+            await refreshSSHSetup();
+
+            setNotice(
+                `SSH server host trust revoked for ${sshSetupDestination.name}`,
+                "success",
+            );
+        } catch (error) {
+            setSSHSetupError(failureMessage(error));
         }
     }
 
@@ -1070,6 +1320,39 @@
         updateStorageTransportFields,
     );
     storageForm.addEventListener("submit", saveStorage);
+
+    document.getElementById("ssh-close").addEventListener(
+        "click",
+        () => sshDialog.close(),
+    );
+
+    sshDialog.addEventListener(
+        "close",
+        () => {
+            sshSetupDestination = null;
+            setSSHSetupError("");
+        },
+    );
+
+    document.getElementById("ssh-identity-generate").addEventListener(
+        "click",
+        generateSSHIdentity,
+    );
+
+    document.getElementById("ssh-identity-rotate").addEventListener(
+        "click",
+        rotateSSHIdentity,
+    );
+
+    document.getElementById("ssh-hostkey-add").addEventListener(
+        "click",
+        addSSHHostKey,
+    );
+
+    document.getElementById("ssh-hostkey-revoke").addEventListener(
+        "click",
+        revokeSSHHostKey,
+    );
     window.addEventListener("beforeunload", () => {
         pageUnloading = true;
         stopLiveRefresh();

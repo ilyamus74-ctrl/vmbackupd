@@ -201,5 +201,93 @@
       </div>
     </form>
   </dialog>
+
+  <dialog id="ssh-dialog" aria-labelledby="ssh-dialog-title">
+    <div id="ssh-setup">
+      <h2 id="ssh-dialog-title">SSH setup</h2>
+
+      <p id="ssh-destination-summary" class="form-note"></p>
+
+      <section class="ssh-setup-section" aria-labelledby="ssh-identity-title">
+        <h3 id="ssh-identity-title">Client identity</h3>
+
+        <dl class="details-grid">
+          <dt>Status</dt>
+          <dd id="ssh-identity-status">—</dd>
+
+          <dt>Fingerprint</dt>
+          <dd id="ssh-identity-fingerprint">—</dd>
+
+          <dt>Public key</dt>
+          <dd>
+            <textarea id="ssh-identity-public-key"
+                      class="key-material"
+                      readonly
+                      rows="4"
+                      aria-label="SSH client public key"></textarea>
+          </dd>
+        </dl>
+
+        <div class="ssh-section-actions">
+          <button id="ssh-identity-generate" type="button">Generate key</button>
+          <button id="ssh-identity-rotate" type="button">Rotate key</button>
+        </div>
+
+        <p class="table-note">
+          The private key remains daemon-owned and is never exposed through Cockpit.
+        </p>
+      </section>
+
+      <section class="ssh-setup-section" aria-labelledby="ssh-hostkey-title">
+        <h3 id="ssh-hostkey-title">Server host trust</h3>
+
+        <dl class="details-grid">
+          <dt>Status</dt>
+          <dd id="ssh-hostkey-status">—</dd>
+
+          <dt>Endpoint</dt>
+          <dd id="ssh-hostkey-endpoint">—</dd>
+
+          <dt>Key type</dt>
+          <dd id="ssh-hostkey-type">—</dd>
+
+          <dt>Fingerprint</dt>
+          <dd id="ssh-hostkey-fingerprint">—</dd>
+
+          <dt>Trusted host key</dt>
+          <dd>
+            <textarea id="ssh-hostkey-public-key"
+                      class="key-material"
+                      readonly
+                      rows="4"
+                      aria-label="Trusted SSH server host key"></textarea>
+          </dd>
+        </dl>
+
+        <label id="ssh-hostkey-input-label">
+          Host public key
+          <textarea id="ssh-hostkey-input"
+                    class="key-material"
+                    rows="4"
+                    placeholder="ssh-ed25519 AAAAC3..."></textarea>
+          <small>
+            Paste the server host public key obtained through a trusted
+            administrative channel. vmbackupd does not use TOFU or ssh-keyscan.
+          </small>
+        </label>
+
+        <div class="ssh-section-actions">
+          <button id="ssh-hostkey-add" type="button">Trust host key</button>
+          <button id="ssh-hostkey-revoke" type="button">Revoke trust</button>
+        </div>
+      </section>
+
+      <p id="ssh-setup-error" class="form-error" role="alert"></p>
+
+      <div class="dialog-actions">
+        <button id="ssh-close" type="button">Close</button>
+      </div>
+    </div>
+  </dialog>
 </body>
 </html>

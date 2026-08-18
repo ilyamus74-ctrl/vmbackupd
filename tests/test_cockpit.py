@@ -94,6 +94,12 @@ def test_cockpit_method_allow_list_is_exactly_phase3e6_boundary():
         "storage.update",
         "storage.set_default",
         "storage.test",
+        "ssh.identity.show",
+        "ssh.identity.generate",
+        "ssh.identity.rotate",
+        "ssh.hostkey.show",
+        "ssh.hostkey.add",
+        "ssh.hostkey.revoke",
         "job.list",
         "run.list",
         "restore_point.list",
@@ -193,7 +199,18 @@ def test_cockpit_has_timestamp_duration_and_atomic_refresh_helpers():
     assert 'api.request("run.list")' in javascript
     assert 'api.request("restore_point.list")' in javascript
     assert 'api.request("recovery.list")' in javascript
-    assert javascript.index("clearViews();") < javascript.index("Promise.all([")
+    refresh_start = javascript.index(
+        "    async function refresh(options) {"
+    )
+    clear_views = javascript.index(
+        "clearViews();",
+        refresh_start,
+    )
+    main_refresh_requests = javascript.index(
+        'api.request("daemon.status")',
+        refresh_start,
+    )
+    assert clear_views < main_refresh_requests
 
 
 def test_cockpit_job_management_is_full_only_and_refreshes_authoritative_data():
@@ -249,7 +266,7 @@ def test_cockpit_storage_management_is_explicit_and_non_destructive():
 
     assert all(value in javascript for value in (
         'actionButton("Edit"',
-        'actionButton("Test"',
+        "testStoredDestination(destination)",
         'actionButton("Set default"',
         'api.request("storage.create"',
         'api.request("storage.update"',

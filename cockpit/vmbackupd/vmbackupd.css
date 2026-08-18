@@ -184,3 +184,47 @@ summary { cursor: pointer; font-size: 1.1rem; font-weight: 700; }
         grid-template-columns: 1fr;
     }
 }
+
+/* SSH.3b identity and server trust */
+#ssh-setup {
+    display: grid;
+    gap: 1rem;
+}
+
+.ssh-setup-section {
+    padding: 0.9rem;
+    border: 1px solid color-mix(in srgb, CanvasText 16%, Canvas);
+    border-radius: 0.35rem;
+}
+
+.ssh-setup-section h3 {
+    margin-top: 0;
+}
+
+.ssh-section-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 0.75rem;
+}
+
+.key-material {
+    box-sizing: border-box;
+    width: 100%;
+    padding: 0.5rem;
+    font: 0.85rem monospace;
+    overflow-wrap: anywhere;
+    resize: vertical;
+}
+
+#ssh-hostkey-input-label {
+    display: grid;
+    gap: 0.3rem;
+    margin-top: 0.9rem;
+    font-weight: 600;
+}
+
+#ssh-hostkey-input-label small {
+    font-weight: 400;
+    color: #6a6e73;
+}

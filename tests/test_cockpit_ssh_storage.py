@@ -126,11 +126,11 @@ def test_ssh_destination_cannot_be_made_default_from_cockpit_yet():
             isSSH || Boolean(existingDestination && existingDestination.is_default);''' in javascript
 
 
-def test_ssh3a_does_not_enable_ssh_security_or_transport_api_methods():
+def test_ssh_storage_ui_allows_security_setup_without_claiming_transport():
     api = source("api.js")
 
-    # SSH.3a is destination presentation/configuration only.
-    # Identity/trust controls arrive in SSH.3b.
+    # SSH.3b deliberately adds local identity and strict host-trust
+    # management. These operations do not perform a network connection.
     for method in (
         "ssh.identity.show",
         "ssh.identity.generate",
@@ -139,7 +139,10 @@ def test_ssh3a_does_not_enable_ssh_security_or_transport_api_methods():
         "ssh.hostkey.add",
         "ssh.hostkey.revoke",
     ):
-        assert method not in api
+        assert method in api
+
+    assert "ssh.preflight" not in api
+    assert "ssh.transfer" not in api
 
 
 def test_ssh3a_does_not_claim_remote_connection_or_capacity_success():
