@@ -31,7 +31,7 @@ def test_spec_has_expected_identity_and_modern_python_build_macros():
 
 def test_spec_declares_runtime_dependencies_and_noreplace_config():
     spec = text("vmbackupd.spec")
-    for dependency in ("python3", "libvirt-client", "qemu-img",
+    for dependency in ("python3", "openssh-clients", "libvirt-client", "qemu-img",
                        "libvirt-daemon-driver-qemu", "systemd"):
         assert f"Requires:       {dependency}" in spec
     for dependency in ("systemd", "shadow-utils", "glibc-common", "util-linux"):

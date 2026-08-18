@@ -14,6 +14,7 @@ from .models import (
     StorageType,
 )
 from .repository import DomainInvariantError, SQLiteRepository
+from .ssh_identity import SSHIdentityError
 from .storage import LocalStorageTester, lexical_storage_path, storage_path_has_symlink
 
 
@@ -28,10 +29,11 @@ class ApplicationError(RuntimeError):
 
 class VmbackupApplication:
     def __init__(self, repository: SQLiteRepository, runtime, driver, config, node, clock: Clock,
-                 version: str, storage_tester=None) -> None:
+                 version: str, storage_tester=None, ssh_identity_manager=None) -> None:
         self.repository, self.runtime, self.driver = repository, runtime, driver
         self.config, self.node, self.clock, self.version = config, node, clock, version
         self.storage_tester = storage_tester or LocalStorageTester()
+        self.ssh_identity_manager = ssh_identity_manager
 
     def dispatch(self, method: str, params: dict) -> object:
         handlers = {
@@ -40,6 +42,9 @@ class VmbackupApplication:
             "storage.create": self.storage_create, "storage.update": self.storage_update,
             "storage.set_default": self.storage_set_default,
             "storage.test": self.storage_test,
+            "ssh.identity.show": self.ssh_identity_show,
+            "ssh.identity.generate": self.ssh_identity_generate,
+            "ssh.identity.rotate": self.ssh_identity_rotate,
             "vm.discover": self.vm_discover, "vm.list": self.vm_list,
             "vm.show": self.vm_show, "vm.register": self.vm_register,
             "job.list": self.job_list, "job.show": self.job_show,
@@ -63,6 +68,8 @@ class VmbackupApplication:
         except DomainInvariantError as exc:
             code = str(exc) if str(exc).isupper() else "DOMAIN_ERROR"
             raise ApplicationError(code, str(exc)) from None
+        except SSHIdentityError as exc:
+            raise ApplicationError(exc.code, str(exc)) from None
         except TypeError as exc:
             raise ApplicationError("INVALID_PARAMS", str(exc)) from None
         except ValueError as exc:
@@ -307,6 +314,34 @@ class VmbackupApplication:
         return self.storage_tester.test(
             backup_data_root, free_bytes, free_percent,
         )
+    def _require_ssh_identity_destination(self, destination_id):
+        destination = self.repository.get_storage_destination(
+            self.node.id, destination_id
+        )
+        if destination.storage_type is not StorageType.SSH:
+            raise ApplicationError(
+                "SSH_DESTINATION_REQUIRED",
+                "SSH identity operations require an SSH storage destination",
+            )
+        if self.ssh_identity_manager is None:
+            raise ApplicationError(
+                "SSH_IDENTITY_UNAVAILABLE",
+                "SSH identity manager is not configured",
+            )
+        return destination
+
+    def ssh_identity_show(self, destination_id):
+        self._require_ssh_identity_destination(destination_id)
+        return self.ssh_identity_manager.show(destination_id)
+
+    def ssh_identity_generate(self, destination_id):
+        self._require_ssh_identity_destination(destination_id)
+        return self.ssh_identity_manager.generate(destination_id)
+
+    def ssh_identity_rotate(self, destination_id):
+        self._require_ssh_identity_destination(destination_id)
+        return self.ssh_identity_manager.rotate(destination_id)
+
     def vm_discover(self): return list(self.driver.discover_domains())
     def vm_list(self): return [serialization.vm(x) for x in self.repository.list_vms(self.node.id)]
     def vm_show(self, id):

@@ -19,6 +19,7 @@ def _parser():
     top = parser.add_subparsers(dest="group", required=True)
     simple = {"daemon": ["status"], "node": ["list"],
               "storage": ["list", "show", "create", "update", "set-default", "test"],
+              "ssh": ["identity-show", "identity-generate", "identity-rotate"],
               "vm": ["discover", "list", "show", "register"],
               "job": ["list", "show", "create", "update"], "backup": ["run"],
               "run": ["list", "show"], "restore-point": ["list", "show"],
@@ -60,6 +61,8 @@ def _parser():
                 item.add_argument("--default", action="store_true")
             if group == "storage" and command in {"set-default", "test"}:
                 item.add_argument("id")
+            if group == "ssh":
+                item.add_argument("destination_id")
             if group == "vm" and command == "register":
                 item.add_argument("domain"); item.add_argument("--name")
             if group == "job" and command == "create":
@@ -123,7 +126,11 @@ def _parser():
 def _request(args):
     method = f"{args.group.replace('-', '_')}.{args.command.replace('-', '_')}"
     params = {}
-    if args.command == "show":
+    if args.group == "ssh":
+        action = args.command.removeprefix("identity-")
+        method = f"ssh.identity.{action}"
+        params = {"destination_id": args.destination_id}
+    elif args.command == "show":
         params["run_id" if args.group == "recovery" else "id"] = args.id
     elif args.group == "storage" and args.command == "create":
         params = {"name": args.name, "backup_data_root": args.backup_data_root,

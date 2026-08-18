@@ -16,6 +16,7 @@ BuildRequires:  python3-devel
 BuildRequires:  pyproject-rpm-macros
 BuildRequires:  systemd-rpm-macros
 Requires:       python3
+Requires:       openssh-clients
 Requires:       libvirt-client
 Requires:       qemu-img
 Requires:       libvirt-daemon-driver-qemu
