@@ -983,11 +983,87 @@ SSH transport implementation.
 
 ---
 
+# Calendar DAILY backup scheduling
+
+Status: CLOSED
+
+Implementation commit:
+
+    3b4946f — Add daily calendar backup scheduling
+
+The scheduler now supports both persisted interval and calendar DAILY
+schedules.
+
+Supported scheduling modes:
+
+    INTERVAL
+        fixed interval_seconds scheduling
+
+    DAILY
+        daily_time = HH:MM
+        schedule_timezone = IANA timezone
+
+DAILY schedules are calculated as calendar wall-clock schedules rather than
+24-hour elapsed intervals. This keeps jobs at the configured local time across
+timezone offset and daylight-saving-time changes.
+
+Calendar scheduling behavior:
+
+- the first future DAILY slot is calculated in the configured IANA timezone;
+- normal DAILY execution advances to the next calendar day at the configured
+  wall-clock time;
+- RUN_ONCE coalesces missed DAILY slots after daemon downtime;
+- SKIP_IF_BUSY advances the persisted cursor without creating parallel work;
+- spring-forward nonexistent wall-clock times resolve to the first valid local
+  time after the requested time;
+- fall-back ambiguous wall-clock times use the first real occurrence;
+- next_run_at remains the authoritative persisted scheduler cursor.
+
+Schema version 9 persists:
+
+    schedule_type
+    daily_time
+    schedule_timezone
+
+Migration 8 -> 9 preserves existing jobs as INTERVAL schedules and does not
+change their existing next_run_at cursor.
+
+Application API and CLI support creating and updating DAILY schedules.
+
+Cockpit Backup Job settings support:
+
+    Manual
+    Interval
+    Daily
+
+For DAILY jobs Cockpit exposes a native time picker and IANA timezone field.
+The frontend displays the backend-provided next_run_at value and does not
+duplicate calendar or DST calculations in JavaScript.
+
+Acceptance coverage proves:
+
+- DAILY 01:00 Europe/Berlin calendar advancement;
+- persisted DAILY schedules survive repository restart;
+- RUN_ONCE correctly coalesces missed calendar days;
+- SKIP_IF_BUSY preserves calendar cursor semantics;
+- spring-forward DST gap handling;
+- fall-back ambiguous-time handling;
+- schema v8 -> v9 preserves existing INTERVAL jobs and cursor;
+- API and CLI DAILY create/update behavior;
+- invalid wall-clock time and timezone rejection;
+- Cockpit Manual / Interval / Daily controls;
+- Cockpit time, timezone, and authoritative next-run display;
+- historical schema migration fixtures remain valid;
+- full project regression suite passes;
+- Python compilation, JavaScript syntax checks, and git diff checks pass.
+
+---
+
 # Current position
 
 Current implementation milestone:
 
-    3E.8c — Smart backup size estimator CLOSED
+    Calendar DAILY backup scheduling — CLOSED
 
 Current safety boundary:
 
@@ -1001,5 +1077,8 @@ Current safety boundary:
     backup preflight reclaim      YES
     smart backup size estimator   YES
     interval scheduler            YES
-    calendar DAILY scheduler      NO
+    calendar DAILY scheduler      YES
+    DAILY IANA timezone           YES
+    DAILY DST-safe scheduling     YES
+    Cockpit DAILY controls        YES
     remote SSH transfer           NO
