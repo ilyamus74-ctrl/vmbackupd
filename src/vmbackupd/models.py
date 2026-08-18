@@ -91,16 +91,35 @@ class BackupPolicy:
             raise ValueError("max_incrementals_per_chain must be non-negative")
 
 
+class SpaceReclaimMode(StrEnum):
+    SAFE = "SAFE"
+    SPACE_OPTIMIZED = "SPACE_OPTIMIZED"
+
+
 @dataclass(frozen=True, slots=True)
 class RetentionPolicy:
     restore_points_to_retain: int = 7
     minimum_full_chains: int = 1
+    full_chains_to_retain: int = 2
+    space_reclaim_mode: SpaceReclaimMode = SpaceReclaimMode.SAFE
+    backup_size_margin_percent: float = 20.0
 
     def __post_init__(self) -> None:
         if self.restore_points_to_retain < 0:
             raise ValueError("restore_points_to_retain must be non-negative")
         if self.minimum_full_chains < 1:
             raise ValueError("minimum_full_chains must be at least 1")
+        if self.full_chains_to_retain < self.minimum_full_chains:
+            raise ValueError(
+                "full_chains_to_retain must be at least minimum_full_chains"
+            )
+        try:
+            mode = SpaceReclaimMode(self.space_reclaim_mode)
+        except ValueError as exc:
+            raise ValueError("invalid space_reclaim_mode") from exc
+        object.__setattr__(self, "space_reclaim_mode", mode)
+        if not 0 <= self.backup_size_margin_percent <= 100:
+            raise ValueError("backup_size_margin_percent must be between 0 and 100")
 
 
 @dataclass(frozen=True, slots=True)

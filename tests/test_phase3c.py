@@ -354,7 +354,10 @@ def test_api_lists_status_and_objects(app, tmp_path):
                 ).encode() + b"\n")
                 assert response["ok"] is True
                 if method == "daemon.status":
-                    assert response["result"]["database_schema_version"] == 4
+                    assert (
+                        response["result"]["database_schema_version"]
+                        == app.repository.schema_version
+                    )
             assert (await exchange(server.socket_path, json.dumps(
                 {"version": 1, "id": "show", "method": "vm.show", "params": {"id": vm["id"]}}
             ).encode() + b"\n"))["result"]["id"] == vm["id"]

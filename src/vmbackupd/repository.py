@@ -362,12 +362,22 @@ class SQLiteRepository:
         except KeyError as exc:
             raise DomainInvariantError("STORAGE_DESTINATION_NOT_LOCAL") from exc
         self.connection.execute(
-            "INSERT INTO backup_jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """INSERT INTO backup_jobs (
+                   id, vm_id, name, storage_destination_id, enabled,
+                   max_incrementals_per_chain, restore_points_to_retain,
+                   full_chains_to_retain, minimum_full_chains,
+                   space_reclaim_mode, backup_size_margin_percent,
+                   interval_seconds, misfire_grace_seconds,
+                   catch_up_mode, overlap_policy, next_run_at, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (value.id, value.vm_id, value.name, value.storage_destination_id,
              int(value.enabled),
              value.backup_policy.max_incrementals_per_chain,
              value.retention_policy.restore_points_to_retain,
+             value.retention_policy.full_chains_to_retain,
              value.retention_policy.minimum_full_chains,
+             value.retention_policy.space_reclaim_mode,
+             value.retention_policy.backup_size_margin_percent,
              value.schedule_policy.interval_seconds,
              value.schedule_policy.misfire_grace_seconds,
              value.schedule_policy.catch_up_mode,
@@ -381,6 +391,8 @@ class SQLiteRepository:
         self, job_id: str, local_node_id: str, now: datetime, *, name=None,
         enabled=None, storage_destination_id=None, storage_destination=None,
         restore_points_to_retain=None, minimum_full_chains=None,
+        full_chains_to_retain=None, space_reclaim_mode=None,
+        backup_size_margin_percent=None,
         interval_seconds=None, misfire_grace_seconds=None, schedule_enabled=None,
     ) -> BackupJob:
         """Read, derive, and write a mutable job patch under one write lock."""
@@ -415,6 +427,12 @@ class SQLiteRepository:
                 if restore_points_to_retain is None else restore_points_to_retain,
                 current.retention_policy.minimum_full_chains
                 if minimum_full_chains is None else minimum_full_chains,
+                current.retention_policy.full_chains_to_retain
+                if full_chains_to_retain is None else full_chains_to_retain,
+                current.retention_policy.space_reclaim_mode
+                if space_reclaim_mode is None else space_reclaim_mode,
+                current.retention_policy.backup_size_margin_percent
+                if backup_size_margin_percent is None else backup_size_margin_percent,
             )
             new_enabled = current.enabled if enabled is None else enabled
             was_scheduled = current.next_run_at is not None
@@ -429,11 +447,15 @@ class SQLiteRepository:
             self.connection.execute(
                 """UPDATE backup_jobs SET name = ?, storage_destination_id = ?, enabled = ?,
                    max_incrementals_per_chain = ?, restore_points_to_retain = ?,
-                   minimum_full_chains = ?, interval_seconds = ?, misfire_grace_seconds = ?,
+                   full_chains_to_retain = ?, minimum_full_chains = ?,
+                   space_reclaim_mode = ?, backup_size_margin_percent = ?,
+                   interval_seconds = ?, misfire_grace_seconds = ?,
                    catch_up_mode = ?, overlap_policy = ?, next_run_at = ? WHERE id = ?""",
                 (current.name if name is None else name, destination_id, int(new_enabled),
                  current.backup_policy.max_incrementals_per_chain,
-                 retention.restore_points_to_retain, retention.minimum_full_chains,
+                 retention.restore_points_to_retain,
+                 retention.full_chains_to_retain, retention.minimum_full_chains,
+                 retention.space_reclaim_mode, retention.backup_size_margin_percent,
                  schedule.interval_seconds, schedule.misfire_grace_seconds,
                  schedule.catch_up_mode, schedule.overlap_policy,
                  next_run_at.isoformat() if next_run_at else None, current.id),
@@ -1689,8 +1711,13 @@ class SQLiteRepository:
             storage_destination_id=row["storage_destination_id"],
             enabled=bool(row["enabled"]),
             backup_policy=BackupPolicy(row["max_incrementals_per_chain"]),
-            retention_policy=RetentionPolicy(row["restore_points_to_retain"],
-                                             row["minimum_full_chains"]),
+            retention_policy=RetentionPolicy(
+                row["restore_points_to_retain"],
+                row["minimum_full_chains"],
+                row["full_chains_to_retain"],
+                row["space_reclaim_mode"],
+                row["backup_size_margin_percent"],
+            ),
             schedule_policy=SchedulePolicy(row["interval_seconds"],
                                            row["misfire_grace_seconds"],
                                            CatchUpMode(row["catch_up_mode"]),

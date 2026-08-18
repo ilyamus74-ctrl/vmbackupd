@@ -60,6 +60,15 @@ def version_one_database(path):
     connection.execute("ALTER TABLE backup_artifacts DROP COLUMN published_object_id")
     connection.execute("ALTER TABLE restore_points DROP COLUMN bundle_object_id")
     connection.execute("ALTER TABLE job_runs DROP COLUMN storage_destination_id")
+    connection.execute(
+        "ALTER TABLE backup_jobs DROP COLUMN backup_size_margin_percent"
+    )
+    connection.execute(
+        "ALTER TABLE backup_jobs DROP COLUMN space_reclaim_mode"
+    )
+    connection.execute(
+        "ALTER TABLE backup_jobs DROP COLUMN full_chains_to_retain"
+    )
     connection.execute("UPDATE schema_version SET version = 1 WHERE id = 1")
     connection.commit()
     connection.close()
@@ -68,7 +77,7 @@ def version_one_database(path):
 
 def test_schema_v2_fresh_and_v1_migration_backfills_run_destination(tmp_path):
     fresh = SQLiteRepository(tmp_path / "fresh.db")
-    assert fresh.schema_version == CURRENT_SCHEMA_VERSION == 4
+    assert fresh.schema_version == CURRENT_SCHEMA_VERSION
     assert "storage_destination_id" in {
         row[1] for row in fresh.connection.execute("PRAGMA table_info(job_runs)")
     }
@@ -84,7 +93,7 @@ def test_schema_v2_fresh_and_v1_migration_backfills_run_destination(tmp_path):
     path = tmp_path / "v1.db"
     _, destination, _, _, run = version_one_database(path)
     migrated = SQLiteRepository(path)
-    assert migrated.schema_version == 4
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION
     assert migrated.get_run(run.id).storage_destination_id == destination.id
     assert list(migrated.connection.execute("PRAGMA foreign_key_check")) == []
     assert [row[1] for row in migrated.connection.execute(
@@ -113,7 +122,7 @@ def test_v1_migration_rolls_back_and_rejects_missing_destination(tmp_path):
     }
     assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 1
     connection.close()
-    assert SQLiteRepository(path).schema_version == 4
+    assert SQLiteRepository(path).schema_version == CURRENT_SCHEMA_VERSION
 
     malformed = tmp_path / "malformed.db"
     version_one_database(malformed)
@@ -319,15 +328,26 @@ def test_job_update_policies_and_schedule_cursor_semantics():
         "vm_id": vm.id, "name": "manual", "storage_destination_id": first.id,
     })
     assert created["next_run_at"] is None
+    assert created["full_chains_to_retain"] == 2
+    assert created["minimum_full_chains"] == 1
+    assert created["space_reclaim_mode"] == "SAFE"
+    assert created["backup_size_margin_percent"] == 20.0
     scheduled = app.dispatch("job.update", {
         "id": created["id"], "name": "renamed", "storage_destination": second.name,
         "restore_points_to_retain": 10, "minimum_full_chains": 2,
+        "full_chains_to_retain": 4,
+        "space_reclaim_mode": "SPACE_OPTIMIZED",
+        "backup_size_margin_percent": 30,
         "interval_seconds": 600, "schedule_enabled": True,
     })
     assert scheduled["name"] == "renamed"
     assert scheduled["storage_destination_id"] == second.id
     assert scheduled["next_run_at"] == (NOW + timedelta(minutes=10)).isoformat()
     assert scheduled["restore_points_to_retain"] == 10
+    assert scheduled["full_chains_to_retain"] == 4
+    assert scheduled["minimum_full_chains"] == 2
+    assert scheduled["space_reclaim_mode"] == "SPACE_OPTIMIZED"
+    assert scheduled["backup_size_margin_percent"] == 30.0
     disabled = app.dispatch("job.update", {"id": created["id"], "enabled": False})
     assert not disabled["enabled"]
     with pytest.raises(DomainInvariantError, match="JOB_DISABLED"):
@@ -388,16 +408,27 @@ def test_cli_job_create_and_update_map_schedule_enable_and_destination_options()
     assert params["storage_destination"] == "local"
     assert params["schedule_enabled"] is True
     assert params["enabled"] is False
+    assert params["full_chains_to_retain"] == 2
+    assert params["minimum_full_chains"] == 1
+    assert params["space_reclaim_mode"] == "SAFE"
+    assert params["backup_size_margin_percent"] == 20.0
 
     method, params = _request(parser.parse_args([
         "job", "update", "job-id", "--storage", "storage-id", "--enable",
         "--manual", "--retain", "9",
+        "--full-chains-to-retain", "3",
+        "--minimum-full-chains", "2",
+        "--space-reclaim-mode", "SPACE_OPTIMIZED",
+        "--backup-size-margin-percent", "25.5",
     ]))
     assert method == "job.update"
     assert params == {
         "id": "job-id", "name": None, "storage_destination_id": "storage-id",
         "storage_destination": None, "restore_points_to_retain": 9,
-        "minimum_full_chains": None, "interval_seconds": None,
+        "full_chains_to_retain": 3, "minimum_full_chains": 2,
+        "space_reclaim_mode": "SPACE_OPTIMIZED",
+        "backup_size_margin_percent": 25.5,
+        "interval_seconds": None,
         "misfire_grace_seconds": None, "enabled": True, "schedule_enabled": False,
     }
     with pytest.raises(SystemExit):

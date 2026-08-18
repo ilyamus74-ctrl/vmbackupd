@@ -21,7 +21,11 @@ def job(value: BackupJob) -> dict:
             "enabled": value.enabled,
             "max_incrementals_per_chain": value.backup_policy.max_incrementals_per_chain,
             "restore_points_to_retain": value.retention_policy.restore_points_to_retain,
+            "full_chains_to_retain": value.retention_policy.full_chains_to_retain,
             "minimum_full_chains": value.retention_policy.minimum_full_chains,
+            "space_reclaim_mode": value.retention_policy.space_reclaim_mode.value,
+            "backup_size_margin_percent":
+                value.retention_policy.backup_size_margin_percent,
             "interval_seconds": value.schedule_policy.interval_seconds,
             "misfire_grace_seconds": value.schedule_policy.misfire_grace_seconds,
             "next_run_at": value.next_run_at.isoformat() if value.next_run_at else None,

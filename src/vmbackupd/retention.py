@@ -55,7 +55,9 @@ class RetentionPlanner:
             if chain.status is BackupChainStatus.ACTIVE:
                 retained.update(point.id for point in members_by_chain[chain.id])
 
-        # Protect the newest requested number of valid/populated full chains.
+        # Normal retention protects the desired number of newest valid/populated
+        # full chains. minimum_full_chains is the lower floor reserved for a future
+        # capacity-aware pre-backup reclaim planner.
         populated = [
             chain for chain in chains
             if members_by_chain[chain.id] and members_by_chain[chain.id][0].kind is BackupKind.FULL
@@ -65,7 +67,7 @@ class RetentionPlanner:
             key=lambda chain: max(p.created_at for p in members_by_chain[chain.id]),
             reverse=True,
         )
-        for chain in newest_chains[: policy.minimum_full_chains]:
+        for chain in newest_chains[: policy.full_chains_to_retain]:
             retained.update(point.id for point in members_by_chain[chain.id])
 
         # Retaining any incremental retains its complete dependency prefix.

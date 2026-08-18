@@ -251,6 +251,8 @@ class VmbackupApplication:
 
     def job_create(self, vm_id, name, max_incrementals_per_chain=0,
                    restore_points_to_retain=7, minimum_full_chains=1,
+                   full_chains_to_retain=2, space_reclaim_mode="SAFE",
+                   backup_size_margin_percent=20.0,
                    interval_seconds=3600, misfire_grace_seconds=0,
                    storage_destination_id=None, storage_destination=None,
                    schedule_enabled=False, enabled=True):
@@ -274,8 +276,13 @@ class VmbackupApplication:
         value = BackupJob(
             vm_id=vm_id, name=name, storage_destination_id=destination.id,
             backup_policy=BackupPolicy(int(max_incrementals_per_chain)),
-            retention_policy=RetentionPolicy(int(restore_points_to_retain),
-                                             int(minimum_full_chains)),
+            retention_policy=RetentionPolicy(
+                int(restore_points_to_retain),
+                int(minimum_full_chains),
+                int(full_chains_to_retain),
+                space_reclaim_mode,
+                float(backup_size_margin_percent),
+            ),
             schedule_policy=SchedulePolicy(int(interval_seconds), int(misfire_grace_seconds)),
             next_run_at=(self.clock.now() + timedelta(seconds=int(interval_seconds))
                          if schedule_enabled else None),
@@ -287,6 +294,8 @@ class VmbackupApplication:
     def job_update(self, id, name=None, enabled=None,
                    storage_destination_id=None, storage_destination=None,
                    restore_points_to_retain=None, minimum_full_chains=None,
+                   full_chains_to_retain=None, space_reclaim_mode=None,
+                   backup_size_margin_percent=None,
                    interval_seconds=None, misfire_grace_seconds=None,
                    schedule_enabled=None):
         if enabled is not None and not isinstance(enabled, bool):
@@ -305,6 +314,13 @@ class VmbackupApplication:
                                       else int(restore_points_to_retain)),
             minimum_full_chains=(None if minimum_full_chains is None
                                  else int(minimum_full_chains)),
+            full_chains_to_retain=(None if full_chains_to_retain is None
+                                  else int(full_chains_to_retain)),
+            space_reclaim_mode=space_reclaim_mode,
+            backup_size_margin_percent=(
+                None if backup_size_margin_percent is None
+                else float(backup_size_margin_percent)
+            ),
             interval_seconds=(None if interval_seconds is None else int(interval_seconds)),
             misfire_grace_seconds=(None if misfire_grace_seconds is None
                                    else int(misfire_grace_seconds)),

@@ -51,7 +51,16 @@ def _parser():
                 destination.add_argument("--storage"); destination.add_argument("--storage-name")
                 item.add_argument("--max-incrementals", type=int, default=0)
                 item.add_argument("--retain", type=int, default=7)
+                item.add_argument("--full-chains-to-retain", type=int, default=2)
                 item.add_argument("--minimum-full-chains", type=int, default=1)
+                item.add_argument(
+                    "--space-reclaim-mode",
+                    choices=("SAFE", "SPACE_OPTIMIZED"),
+                    default="SAFE",
+                )
+                item.add_argument(
+                    "--backup-size-margin-percent", type=float, default=20.0
+                )
                 item.add_argument("--interval", type=int, default=3600)
                 item.add_argument("--misfire-grace", type=int, default=0)
                 item.add_argument("--schedule", action="store_true")
@@ -61,7 +70,13 @@ def _parser():
                 destination = item.add_mutually_exclusive_group()
                 destination.add_argument("--storage"); destination.add_argument("--storage-name")
                 item.add_argument("--retain", type=int)
+                item.add_argument("--full-chains-to-retain", type=int)
                 item.add_argument("--minimum-full-chains", type=int)
+                item.add_argument(
+                    "--space-reclaim-mode",
+                    choices=("SAFE", "SPACE_OPTIMIZED"),
+                )
+                item.add_argument("--backup-size-margin-percent", type=float)
                 item.add_argument("--interval", type=int)
                 item.add_argument("--misfire-grace", type=int)
                 enabled = item.add_mutually_exclusive_group()
@@ -101,7 +116,10 @@ def _request(args):
                   "storage_destination": args.storage_name,
                   "max_incrementals_per_chain": args.max_incrementals,
                   "restore_points_to_retain": args.retain,
+                  "full_chains_to_retain": args.full_chains_to_retain,
                   "minimum_full_chains": args.minimum_full_chains,
+                  "space_reclaim_mode": args.space_reclaim_mode,
+                  "backup_size_margin_percent": args.backup_size_margin_percent,
                   "interval_seconds": args.interval,
                   "misfire_grace_seconds": args.misfire_grace,
                   "schedule_enabled": args.schedule,
@@ -111,7 +129,10 @@ def _request(args):
                   "storage_destination_id": args.storage,
                   "storage_destination": args.storage_name,
                   "restore_points_to_retain": args.retain,
+                  "full_chains_to_retain": args.full_chains_to_retain,
                   "minimum_full_chains": args.minimum_full_chains,
+                  "space_reclaim_mode": args.space_reclaim_mode,
+                  "backup_size_margin_percent": args.backup_size_margin_percent,
                   "interval_seconds": args.interval,
                   "misfire_grace_seconds": args.misfire_grace,
                   "enabled": True if args.enable else False if args.disable else None,

@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import Callable, Mapping
 
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 
 class SchemaError(RuntimeError):
@@ -70,7 +70,12 @@ CURRENT_SCHEMA_STATEMENTS = (
         enabled INTEGER NOT NULL,
         max_incrementals_per_chain INTEGER NOT NULL CHECK(max_incrementals_per_chain >= 0),
         restore_points_to_retain INTEGER NOT NULL CHECK(restore_points_to_retain >= 0),
+        full_chains_to_retain INTEGER NOT NULL DEFAULT 2 CHECK(full_chains_to_retain >= 1),
         minimum_full_chains INTEGER NOT NULL CHECK(minimum_full_chains >= 1),
+        space_reclaim_mode TEXT NOT NULL DEFAULT 'SAFE'
+            CHECK(space_reclaim_mode IN ('SAFE', 'SPACE_OPTIMIZED')),
+        backup_size_margin_percent REAL NOT NULL DEFAULT 20.0
+            CHECK(backup_size_margin_percent >= 0 AND backup_size_margin_percent <= 100),
         interval_seconds INTEGER NOT NULL CHECK(interval_seconds >= 60),
         misfire_grace_seconds INTEGER NOT NULL CHECK(misfire_grace_seconds >= 0),
         catch_up_mode TEXT NOT NULL CHECK(catch_up_mode = 'RUN_ONCE'),
@@ -197,7 +202,9 @@ CURRENT_COLUMNS = {
                              "created_at"},
     "backup_jobs": {"id", "vm_id", "name", "storage_destination_id", "enabled",
                     "max_incrementals_per_chain", "restore_points_to_retain",
-                    "minimum_full_chains", "interval_seconds", "misfire_grace_seconds",
+                    "full_chains_to_retain", "minimum_full_chains",
+                    "space_reclaim_mode", "backup_size_margin_percent",
+                    "interval_seconds", "misfire_grace_seconds",
                     "catch_up_mode", "overlap_policy", "next_run_at", "created_at"},
     "job_runs": {"id", "job_id", "storage_destination_id", "state", "planned_kind", "planned_chain_id",
                  "planned_sequence", "parent_restore_point_id", "error", "cleanup_error",
@@ -230,7 +237,11 @@ CURRENT_COLUMNS = {
                                "heartbeat_at", "expires_at"},
 }
 
-VERSION_3_COLUMNS = {name: set(columns) for name, columns in CURRENT_COLUMNS.items()}
+VERSION_4_COLUMNS = {name: set(columns) for name, columns in CURRENT_COLUMNS.items()}
+VERSION_4_COLUMNS["backup_jobs"] -= {
+    "full_chains_to_retain", "space_reclaim_mode", "backup_size_margin_percent",
+}
+VERSION_3_COLUMNS = {name: set(columns) for name, columns in VERSION_4_COLUMNS.items()}
 VERSION_3_COLUMNS["storage_destinations"].add("control_root")
 VERSION_3_COLUMNS["backup_artifacts"].remove("published_object_id")
 VERSION_3_COLUMNS["restore_points"].remove("bundle_object_id")
@@ -426,6 +437,32 @@ def _validate_version_two_schema(connection: sqlite3.Connection) -> None:
     _validate_version_two_data(connection)
 
 
+def _validate_version_four_schema(connection: sqlite3.Connection) -> None:
+    _validate_fingerprint(connection, VERSION_4_COLUMNS)
+    _validate_version_two_data(connection)
+    triggers = {row[0] for row in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+    )}
+    if not REQUIRED_TRIGGERS <= triggers:
+        raise UnsupportedSchemaError("schema storage-identity trigger is missing")
+    invalid_default = connection.execute(
+        """SELECT node_id FROM storage_destinations
+           GROUP BY node_id
+           HAVING COUNT(*) > 0
+              AND SUM(CASE WHEN is_default = 1 THEN 1 ELSE 0 END) != 1
+           LIMIT 1"""
+    ).fetchone()
+    if invalid_default:
+        raise UnsupportedSchemaError(
+            "non-empty node storage catalog must contain exactly one default"
+        )
+    if connection.execute(
+        """SELECT 1 FROM backup_artifacts
+           WHERE state = 'PUBLISHED' AND published_object_id IS NULL LIMIT 1"""
+    ).fetchone():
+        raise UnsupportedSchemaError("published artifact has no durable object identity")
+
+
 def validate_current_schema(connection: sqlite3.Connection) -> None:
     _validate_fingerprint(connection, CURRENT_COLUMNS)
     _validate_version_two_data(connection)
@@ -450,6 +487,16 @@ def validate_current_schema(connection: sqlite3.Connection) -> None:
            WHERE state = 'PUBLISHED' AND published_object_id IS NULL LIMIT 1"""
     ).fetchone():
         raise UnsupportedSchemaError("published artifact has no durable object identity")
+
+    if connection.execute(
+        """SELECT 1 FROM backup_jobs
+           WHERE full_chains_to_retain < minimum_full_chains
+              OR space_reclaim_mode NOT IN ('SAFE', 'SPACE_OPTIMIZED')
+              OR backup_size_margin_percent < 0
+              OR backup_size_margin_percent > 100
+           LIMIT 1"""
+    ).fetchone():
+        raise UnsupportedSchemaError("backup job retention policy is invalid")
 
 
 def _validate_version_three_schema(connection: sqlite3.Connection) -> None:
@@ -547,11 +594,39 @@ def migrate_3_to_4(connection: sqlite3.Connection) -> None:
     connection.execute(STORAGE_IDENTITY_TRIGGER_SQL)
 
 
+def migrate_4_to_5(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """ALTER TABLE backup_jobs
+           ADD COLUMN full_chains_to_retain INTEGER NOT NULL DEFAULT 2
+           CHECK(full_chains_to_retain >= 1)"""
+    )
+    connection.execute(
+        """UPDATE backup_jobs
+           SET full_chains_to_retain =
+               CASE
+                   WHEN minimum_full_chains > 2 THEN minimum_full_chains
+                   ELSE 2
+               END"""
+    )
+    connection.execute(
+        """ALTER TABLE backup_jobs
+           ADD COLUMN space_reclaim_mode TEXT NOT NULL DEFAULT 'SAFE'
+           CHECK(space_reclaim_mode IN ('SAFE', 'SPACE_OPTIMIZED'))"""
+    )
+    connection.execute(
+        """ALTER TABLE backup_jobs
+           ADD COLUMN backup_size_margin_percent REAL NOT NULL DEFAULT 20.0
+           CHECK(backup_size_margin_percent >= 0
+                 AND backup_size_margin_percent <= 100)"""
+    )
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: migrate_0_to_1,
     1: migrate_1_to_2,
     2: migrate_2_to_3,
     3: migrate_3_to_4,
+    4: migrate_4_to_5,
 }
 
 
@@ -683,6 +758,8 @@ def ensure_current_schema(
             _validate_version_two_schema(connection)
         elif version == 3:
             _validate_version_three_schema(connection)
+        elif version == 4:
+            _validate_version_four_schema(connection)
         current = version
         while current < CURRENT_SCHEMA_VERSION:
             step = migration_steps.get(current)
@@ -695,6 +772,8 @@ def ensure_current_schema(
                 step(connection)
                 if current + 1 == CURRENT_SCHEMA_VERSION:
                     validate_current_schema(connection)
+                elif current + 1 == 4:
+                    _validate_version_four_schema(connection)
                 elif current + 1 == 3:
                     _validate_version_three_schema(connection)
                 elif current + 1 == 2:

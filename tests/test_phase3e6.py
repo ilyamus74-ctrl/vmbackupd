@@ -61,6 +61,15 @@ def version_three_database(path, tmp_path):
     )
     connection.execute("ALTER TABLE backup_artifacts DROP COLUMN published_object_id")
     connection.execute("ALTER TABLE restore_points DROP COLUMN bundle_object_id")
+    connection.execute(
+        "ALTER TABLE backup_jobs DROP COLUMN backup_size_margin_percent"
+    )
+    connection.execute(
+        "ALTER TABLE backup_jobs DROP COLUMN space_reclaim_mode"
+    )
+    connection.execute(
+        "ALTER TABLE backup_jobs DROP COLUMN full_chains_to_retain"
+    )
     connection.execute(VERSION_3_STORAGE_IDENTITY_TRIGGER_SQL)
     connection.execute("UPDATE schema_version SET version = 3")
     connection.commit()
@@ -85,6 +94,15 @@ def published_version_three_database(path, tmp_path):
     connection.execute("UPDATE storage_destinations SET control_root='/legacy/control'")
     connection.execute("ALTER TABLE backup_artifacts DROP COLUMN published_object_id")
     connection.execute("ALTER TABLE restore_points DROP COLUMN bundle_object_id")
+    connection.execute(
+        "ALTER TABLE backup_jobs DROP COLUMN backup_size_margin_percent"
+    )
+    connection.execute(
+        "ALTER TABLE backup_jobs DROP COLUMN space_reclaim_mode"
+    )
+    connection.execute(
+        "ALTER TABLE backup_jobs DROP COLUMN full_chains_to_retain"
+    )
     connection.execute(VERSION_3_STORAGE_IDENTITY_TRIGGER_SQL)
     connection.execute("UPDATE schema_version SET version=3")
     connection.commit()
@@ -109,9 +127,9 @@ def app_for(repository, node, storage_tester=None):
     )
 
 
-def test_schema_v4_fresh_and_v3_migration_preserve_rows(tmp_path):
+def test_schema_current_fresh_and_v3_migration_preserve_rows(tmp_path):
     fresh = SQLiteRepository(tmp_path / "fresh.db")
-    assert fresh.schema_version == CURRENT_SCHEMA_VERSION == 4
+    assert fresh.schema_version == CURRENT_SCHEMA_VERSION
     assert "control_root" not in {row[1] for row in fresh.connection.execute(
         "PRAGMA table_info(storage_destinations)"
     )}
@@ -143,7 +161,7 @@ def test_schema_v4_fresh_and_v3_migration_preserve_rows(tmp_path):
     path = tmp_path / "v3.db"
     node, destination, vm, job, run = version_three_database(path, tmp_path)
     migrated = SQLiteRepository(path)
-    assert migrated.schema_version == 4
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION
     assert migrated.get_node(node.id).id == node.id
     assert migrated.get_storage_destination(node.id, destination.id).id == destination.id
     assert migrated.get_vm(vm.id).id == vm.id
@@ -206,7 +224,7 @@ def test_v3_to_v4_rollback_and_target_validation(tmp_path):
     with pytest.raises(SchemaMigrationError, match="3 -> 4"):
         ensure_current_schema(connection, migrations={3: lambda value: None})
     assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 3
-    assert SQLiteRepository(path).schema_version == 4
+    assert SQLiteRepository(path).schema_version == CURRENT_SCHEMA_VERSION
 
 
 def test_storage_physical_identity_locks_only_after_run(tmp_path):

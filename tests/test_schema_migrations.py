@@ -59,6 +59,15 @@ def make_unversioned(path, *, legacy=False):
     connection.execute("ALTER TABLE backup_artifacts DROP COLUMN published_object_id")
     connection.execute("ALTER TABLE restore_points DROP COLUMN bundle_object_id")
     connection.execute("ALTER TABLE job_runs DROP COLUMN storage_destination_id")
+    connection.execute(
+        "ALTER TABLE backup_jobs DROP COLUMN backup_size_margin_percent"
+    )
+    connection.execute(
+        "ALTER TABLE backup_jobs DROP COLUMN space_reclaim_mode"
+    )
+    connection.execute(
+        "ALTER TABLE backup_jobs DROP COLUMN full_chains_to_retain"
+    )
     if legacy:
         connection.execute("ALTER TABLE backup_artifacts DROP COLUMN planned_capacity")
         connection.execute("ALTER TABLE backup_artifacts DROP COLUMN prepared_device")
@@ -309,3 +318,57 @@ def test_sqlite_write_lock_prevents_racing_legacy_migration(tmp_path):
         ensure_current_schema(contender)
     assert "planned_capacity" not in table_columns(contender, "backup_artifacts")
     owner.rollback(); owner.close(); contender.close()
+
+def test_v4_to_v5_backfills_capacity_retention_policy(tmp_path):
+    path = tmp_path / "v4-to-v5.db"
+    repository = SQLiteRepository(path)
+    repository.close()
+
+    connection = sqlite3.connect(path)
+    connection.execute("ALTER TABLE backup_jobs DROP COLUMN backup_size_margin_percent")
+    connection.execute("ALTER TABLE backup_jobs DROP COLUMN space_reclaim_mode")
+    connection.execute("ALTER TABLE backup_jobs DROP COLUMN full_chains_to_retain")
+    connection.execute("UPDATE schema_version SET version = 4 WHERE id = 1")
+
+    created = "2026-01-01T00:00:00+00:00"
+    connection.execute(
+        "INSERT INTO nodes(id, name, created_at) VALUES ('node', 'node', ?)",
+        (created,),
+    )
+    connection.execute(
+        """INSERT INTO vms(
+               id, node_id, name, external_id, libvirt_domain_uuid, created_at
+           ) VALUES ('vm', 'node', 'vm', 'vm', NULL, ?)""",
+        (created,),
+    )
+    connection.execute(
+        """INSERT INTO storage_destinations(
+               id, node_id, name, backup_data_root, backup_data_mode,
+               backup_data_uid, backup_data_gid, minimum_free_bytes,
+               minimum_free_percent, is_default, created_at
+           ) VALUES ('storage', 'node', 'local', '/backup', 488,
+                     NULL, NULL, 0, 5, 1, ?)""",
+        (created,),
+    )
+    connection.execute(
+        """INSERT INTO backup_jobs(
+               id, vm_id, name, storage_destination_id, enabled,
+               max_incrementals_per_chain, restore_points_to_retain,
+               minimum_full_chains, interval_seconds, misfire_grace_seconds,
+               catch_up_mode, overlap_policy, next_run_at, created_at
+           ) VALUES ('job', 'vm', 'job', 'storage', 1,
+                     0, 7, 3, 3600, 0, 'RUN_ONCE', 'SKIP_IF_BUSY', NULL, ?)""",
+        (created,),
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = SQLiteRepository(path)
+    assert migrated.schema_version == 5
+    job = migrated.get_job("job")
+    assert job.retention_policy.restore_points_to_retain == 7
+    assert job.retention_policy.minimum_full_chains == 3
+    assert job.retention_policy.full_chains_to_retain == 3
+    assert job.retention_policy.space_reclaim_mode.value == "SAFE"
+    assert job.retention_policy.backup_size_margin_percent == 20.0
+    migrated.close()
