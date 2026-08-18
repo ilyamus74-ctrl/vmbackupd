@@ -7,7 +7,14 @@ from datetime import datetime, timezone
 
 import pytest
 
-from vmbackupd.bundle import BundlePathPlanner, BundlePublicationError, BundlePublisher
+from vmbackupd.bundle import (
+    BundlePathPlanner,
+    BundlePhysicalInspector,
+    BundlePublicationError,
+    BundlePublisher,
+    BundleQuarantineError,
+    BundleQuarantiner,
+)
 
 
 CREATED = datetime(2026, 8, 17, 12, 34, 56, tzinfo=timezone.utc)
@@ -147,3 +154,392 @@ def test_rename_fsyncs_source_and_destination_namespaces(tmp_path, monkeypatch):
     )
     assert str(final.parent) in synced
     assert str(tmp_path / ".incoming") in synced
+
+
+OPERATION_ID = "44444444-4444-4444-8444-444444444444"
+RESTORE_POINT_ID = "55555555-5555-4555-8555-555555555555"
+
+
+def published_bundle(tmp_path):
+    planner, _, identity, domain = prepared_bundle(tmp_path)
+    final, _ = BundlePublisher(planner).publish(
+        run_id=RUN_ID,
+        vm_id=VM_ID,
+        created_at=CREATED,
+        domain_xml=domain,
+        manifest=b'{"disks":[{"artifact_path":"disks/vda.qcow2"}]}\n',
+        restore_point=(
+            json.dumps(
+                {"bundle_id": RUN_ID},
+                sort_keys=True,
+            ) + "\n"
+        ).encode(),
+        disks=[
+            (
+                "vda",
+                identity.st_dev,
+                identity.st_ino,
+            )
+        ],
+    )
+    return planner, final
+
+
+def test_reclaim_path_is_deterministic_and_rejects_unsafe_ids(tmp_path):
+    planner = BundlePathPlanner(tmp_path)
+
+    expected = (
+        tmp_path
+        / ".reclaim"
+        / OPERATION_ID
+        / RESTORE_POINT_ID
+    )
+
+    assert planner.reclaim(
+        OPERATION_ID,
+        RESTORE_POINT_ID,
+    ) == expected
+
+    with pytest.raises(ValueError, match="unsafe"):
+        planner.reclaim("../escape", RESTORE_POINT_ID)
+
+    with pytest.raises(ValueError, match="unsafe"):
+        planner.reclaim(OPERATION_ID, "../escape")
+
+
+def test_quarantine_atomically_moves_valid_bundle_without_deleting_files(
+    tmp_path,
+):
+    planner, final = published_bundle(tmp_path)
+
+    usage = BundlePhysicalInspector(planner).inspect(final)
+    source_info = final.stat()
+
+    files_before = {
+        path.relative_to(final)
+        for path in final.rglob("*")
+        if path.is_file()
+    }
+
+    result = BundleQuarantiner(planner).quarantine(
+        source_bundle_object_id=final,
+        operation_id=OPERATION_ID,
+        restore_point_id=RESTORE_POINT_ID,
+    )
+
+    quarantine = planner.reclaim(
+        OPERATION_ID,
+        RESTORE_POINT_ID,
+    )
+
+    assert not final.exists()
+    assert quarantine.is_dir()
+
+    quarantined_info = quarantine.stat()
+    assert (
+        quarantined_info.st_dev,
+        quarantined_info.st_ino,
+    ) == (
+        source_info.st_dev,
+        source_info.st_ino,
+    )
+
+    files_after = {
+        path.relative_to(quarantine)
+        for path in quarantine.rglob("*")
+        if path.is_file()
+    }
+
+    assert files_after == files_before
+    assert result.source_bundle_object_id == str(final)
+    assert result.quarantine_object_id == str(quarantine)
+    assert result.expected_physical_bytes == usage.physical_bytes
+    assert result.source_device == source_info.st_dev
+    assert result.source_inode == source_info.st_ino
+
+
+def test_quarantine_rejects_destination_collision_without_moving_source(
+    tmp_path,
+):
+    planner, final = published_bundle(tmp_path)
+
+    destination = planner.reclaim(
+        OPERATION_ID,
+        RESTORE_POINT_ID,
+    )
+    destination.mkdir(parents=True)
+
+    with pytest.raises(
+        BundleQuarantineError,
+        match="already exists",
+    ):
+        BundleQuarantiner(planner).quarantine(
+            source_bundle_object_id=final,
+            operation_id=OPERATION_ID,
+            restore_point_id=RESTORE_POINT_ID,
+        )
+
+    assert final.is_dir()
+    assert destination.is_dir()
+
+
+def test_quarantine_rejects_unsafe_source_tree_before_namespace_creation(
+    tmp_path,
+):
+    planner, final = published_bundle(tmp_path)
+
+    outside = tmp_path / "outside-disk"
+    outside.write_bytes(b"outside")
+
+    disk = final / "disks" / "vda.qcow2"
+    disk.unlink()
+    disk.symlink_to(outside)
+
+    with pytest.raises(
+        BundleQuarantineError,
+        match="physical validation",
+    ):
+        BundleQuarantiner(planner).quarantine(
+            source_bundle_object_id=final,
+            operation_id=OPERATION_ID,
+            restore_point_id=RESTORE_POINT_ID,
+        )
+
+    assert final.is_dir()
+    assert outside.read_bytes() == b"outside"
+    assert not (tmp_path / ".reclaim").exists()
+
+
+def test_quarantine_rejects_hardlinked_bundle_before_namespace_creation(
+    tmp_path,
+):
+    planner, final = published_bundle(tmp_path)
+
+    manifest = final / "metadata" / "manifest.json"
+    outside = tmp_path / "manifest-hardlink"
+    outside.hardlink_to(manifest)
+
+    with pytest.raises(
+        BundleQuarantineError,
+        match="physical validation",
+    ):
+        BundleQuarantiner(planner).quarantine(
+            source_bundle_object_id=final,
+            operation_id=OPERATION_ID,
+            restore_point_id=RESTORE_POINT_ID,
+        )
+
+    assert final.is_dir()
+    assert outside.is_file()
+    assert not (tmp_path / ".reclaim").exists()
+
+
+def test_quarantine_rejects_symlink_reclaim_namespace_without_outside_mutation(
+    tmp_path,
+):
+    planner, final = published_bundle(tmp_path)
+
+    outside = tmp_path / "outside-reclaim"
+    outside.mkdir()
+
+    reclaim = tmp_path / ".reclaim"
+    reclaim.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(
+        BundleQuarantineError,
+        match="symlink|hierarchy",
+    ):
+        BundleQuarantiner(planner).quarantine(
+            source_bundle_object_id=final,
+            operation_id=OPERATION_ID,
+            restore_point_id=RESTORE_POINT_ID,
+        )
+
+    assert final.is_dir()
+    assert list(outside.iterdir()) == []
+
+
+def test_quarantine_refuses_cross_filesystem_rename_and_preserves_source(
+    tmp_path,
+    monkeypatch,
+):
+    planner, final = published_bundle(tmp_path)
+
+    def exdev(*args, **kwargs):
+        raise OSError(errno.EXDEV, "cross-device link")
+
+    monkeypatch.setattr(
+        "vmbackupd.bundle.os.rename",
+        exdev,
+    )
+
+    with pytest.raises(
+        BundleQuarantineError,
+        match="cross-filesystem",
+    ):
+        BundleQuarantiner(planner).quarantine(
+            source_bundle_object_id=final,
+            operation_id=OPERATION_ID,
+            restore_point_id=RESTORE_POINT_ID,
+        )
+
+    assert final.is_dir()
+    assert not planner.reclaim(
+        OPERATION_ID,
+        RESTORE_POINT_ID,
+    ).exists()
+
+
+def test_quarantine_fsyncs_source_and_destination_namespaces(
+    tmp_path,
+    monkeypatch,
+):
+    planner, final = published_bundle(tmp_path)
+
+    synced = []
+    real_fsync = os.fsync
+
+    def recording_fsync(descriptor):
+        try:
+            synced.append(
+                os.readlink(f"/proc/self/fd/{descriptor}")
+            )
+        except OSError:
+            pass
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(
+        "vmbackupd.bundle.os.fsync",
+        recording_fsync,
+    )
+
+    BundleQuarantiner(planner).quarantine(
+        source_bundle_object_id=final,
+        operation_id=OPERATION_ID,
+        restore_point_id=RESTORE_POINT_ID,
+    )
+
+    quarantine_parent = (
+        tmp_path / ".reclaim" / OPERATION_ID
+    )
+    source_parent = final.parent
+
+    assert str(quarantine_parent) in synced
+    assert str(source_parent) in synced
+
+
+def test_quarantine_detects_source_directory_replacement_before_rename(
+    tmp_path,
+    monkeypatch,
+):
+    planner, final = published_bundle(tmp_path)
+
+    real_inspect = BundlePhysicalInspector.inspect
+    displaced = final.with_name(final.name + ".displaced")
+
+    def replacing_inspect(inspector, bundle):
+        result = real_inspect(inspector, bundle)
+        final.rename(displaced)
+        final.mkdir()
+        return result
+
+    monkeypatch.setattr(
+        "vmbackupd.bundle.BundlePhysicalInspector.inspect",
+        replacing_inspect,
+    )
+
+    with pytest.raises(
+        BundleQuarantineError,
+        match="identity changed",
+    ):
+        BundleQuarantiner(planner).quarantine(
+            source_bundle_object_id=final,
+            operation_id=OPERATION_ID,
+            restore_point_id=RESTORE_POINT_ID,
+        )
+
+    assert displaced.is_dir()
+    assert final.is_dir()
+    assert not planner.reclaim(
+        OPERATION_ID,
+        RESTORE_POINT_ID,
+    ).exists()
+
+
+def test_quarantine_rolls_back_source_replacement_race_at_rename(
+    tmp_path,
+    monkeypatch,
+):
+    planner, final = published_bundle(tmp_path)
+
+    displaced = final.with_name(final.name + ".original")
+    real_rename = os.rename
+    attacked = False
+
+    def racing_rename(
+        src,
+        dst,
+        *,
+        src_dir_fd=None,
+        dst_dir_fd=None,
+    ):
+        nonlocal attacked
+
+        if (
+            not attacked
+            and src == final.name
+            and dst == RESTORE_POINT_ID
+        ):
+            attacked = True
+
+            # Replace the checked source directory after the final stat()
+            # but immediately before the actual rename.
+            real_rename(
+                final.name,
+                displaced.name,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=src_dir_fd,
+            )
+
+            os.mkdir(
+                final.name,
+                mode=0o700,
+                dir_fd=src_dir_fd,
+            )
+
+        return real_rename(
+            src,
+            dst,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(
+        "vmbackupd.bundle.os.rename",
+        racing_rename,
+    )
+
+    with pytest.raises(
+        BundleQuarantineError,
+        match="identity changed",
+    ):
+        BundleQuarantiner(planner).quarantine(
+            source_bundle_object_id=final,
+            operation_id=OPERATION_ID,
+            restore_point_id=RESTORE_POINT_ID,
+        )
+
+    quarantine = planner.reclaim(
+        OPERATION_ID,
+        RESTORE_POINT_ID,
+    )
+
+    # The replacement directory must not remain falsely quarantined.
+    assert not quarantine.exists()
+
+    # The object moved by the raced rename is restored to the source name.
+    assert final.is_dir()
+
+    # The originally validated bundle was displaced by the simulated
+    # concurrent attacker and is deliberately not guessed/moved by recovery.
+    assert displaced.is_dir()

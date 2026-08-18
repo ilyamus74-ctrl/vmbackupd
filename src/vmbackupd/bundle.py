@@ -50,6 +50,22 @@ class BundlePathPlanner:
             self._component(target, "disk target") + ".qcow2"
         )
 
+    def reclaim(
+        self,
+        operation_id: str,
+        restore_point_id: str,
+    ) -> Path:
+        """Deterministic controlled quarantine identity."""
+        operation = self._uuid_component(
+            operation_id,
+            "reclaim operation ID",
+        )
+        restore_point = self._uuid_component(
+            restore_point_id,
+            "restore point ID",
+        )
+        return self.root / ".reclaim" / operation / restore_point
+
     def final(self, vm_id: str, run_id: str, created_at: datetime) -> Path:
         vm = self._uuid_component(vm_id, "VM ID")
         run = self._uuid_component(run_id, "run ID")
@@ -476,3 +492,359 @@ class BundlePhysicalInspector:
 
         # POSIX st_blocks is expressed in 512-byte units.
         return int(blocks) * 512
+
+
+class BundleQuarantineError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class BundleQuarantineResult:
+    source_bundle_object_id: str
+    quarantine_object_id: str
+    expected_physical_bytes: int
+    source_device: int
+    source_inode: int
+
+
+class BundleQuarantiner:
+    """Atomically move one validated published bundle into controlled quarantine."""
+
+    def __init__(self, planner: BundlePathPlanner) -> None:
+        self.planner = planner
+        self.inspector = BundlePhysicalInspector(planner)
+
+    @staticmethod
+    def _open_existing_relative_directory(
+        root: Path,
+        relative: PurePosixPath,
+    ) -> int:
+        try:
+            descriptor = os.open(
+                root,
+                BundlePublisher._directory_flags(),
+            )
+        except OSError as exc:
+            raise BundleQuarantineError(
+                "backup root is not a safe directory"
+            ) from exc
+
+        try:
+            for component in relative.parts:
+                try:
+                    child = os.open(
+                        component,
+                        BundlePublisher._directory_flags(),
+                        dir_fd=descriptor,
+                    )
+                except OSError as exc:
+                    raise BundleQuarantineError(
+                        "published bundle parent hierarchy is unsafe or missing"
+                    ) from exc
+
+                os.close(descriptor)
+                descriptor = child
+
+            return descriptor
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    @staticmethod
+    def _open_or_create_child_directory(
+        parent_fd: int,
+        name: str,
+    ) -> int:
+        try:
+            return os.open(
+                name,
+                BundlePublisher._directory_flags(),
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            try:
+                os.mkdir(
+                    name,
+                    mode=0o700,
+                    dir_fd=parent_fd,
+                )
+            except FileExistsError:
+                # A concurrent creator is acceptable only if the resulting
+                # object can still be opened as an O_NOFOLLOW directory.
+                pass
+            except OSError as exc:
+                raise BundleQuarantineError(
+                    "cannot safely create reclaim hierarchy"
+                ) from exc
+            else:
+                os.fsync(parent_fd)
+
+            try:
+                return os.open(
+                    name,
+                    BundlePublisher._directory_flags(),
+                    dir_fd=parent_fd,
+                )
+            except OSError as exc:
+                raise BundleQuarantineError(
+                    "reclaim hierarchy is unsafe"
+                ) from exc
+        except OSError as exc:
+            raise BundleQuarantineError(
+                "reclaim hierarchy contains a symlink or non-directory"
+            ) from exc
+
+    def _open_quarantine_parent(
+        self,
+        operation_id: str,
+    ) -> int:
+        operation = BundlePathPlanner._uuid_component(
+            operation_id,
+            "reclaim operation ID",
+        )
+
+        try:
+            BundlePublisher._reject_symlinks(self.planner.root)
+        except BundlePublicationError as exc:
+            raise BundleQuarantineError(
+                "backup root contains a symbolic link"
+            ) from exc
+
+        try:
+            root_fd = os.open(
+                self.planner.root,
+                BundlePublisher._directory_flags(),
+            )
+        except OSError as exc:
+            raise BundleQuarantineError(
+                "backup root is not a safe directory"
+            ) from exc
+
+        reclaim_fd = None
+        operation_fd = None
+        try:
+            reclaim_fd = self._open_or_create_child_directory(
+                root_fd,
+                ".reclaim",
+            )
+            operation_fd = self._open_or_create_child_directory(
+                reclaim_fd,
+                operation,
+            )
+            return operation_fd
+        except Exception:
+            if operation_fd is not None:
+                os.close(operation_fd)
+            raise
+        finally:
+            if reclaim_fd is not None:
+                os.close(reclaim_fd)
+            os.close(root_fd)
+
+    def quarantine(
+        self,
+        *,
+        source_bundle_object_id: str | Path,
+        operation_id: str,
+        restore_point_id: str,
+    ) -> BundleQuarantineResult:
+        source = Path(source_bundle_object_id)
+        quarantine = self.planner.reclaim(
+            operation_id,
+            restore_point_id,
+        )
+
+        try:
+            relative = self.inspector._validated_relative(source)
+        except BundleInspectionError as exc:
+            raise BundleQuarantineError(
+                "source bundle is outside the valid published namespace"
+            ) from exc
+
+        source_parent_fd = self._open_existing_relative_directory(
+            self.planner.root,
+            relative.parent,
+        )
+        source_fd = None
+        destination_fd = None
+
+        try:
+            try:
+                source_fd = os.open(
+                    relative.name,
+                    BundlePublisher._directory_flags(),
+                    dir_fd=source_parent_fd,
+                )
+            except OSError as exc:
+                raise BundleQuarantineError(
+                    "source bundle is unsafe or missing"
+                ) from exc
+
+            source_info = os.fstat(source_fd)
+            if not stat.S_ISDIR(source_info.st_mode):
+                raise BundleQuarantineError(
+                    "source bundle is not a directory"
+                )
+
+            # Hold the exact source directory open while the existing physical
+            # inspector validates every supported child without following
+            # links and rejects hard-linked files.
+            try:
+                usage = self.inspector.inspect(source)
+            except (
+                BundleInspectionError,
+                BundlePublicationError,
+            ) as exc:
+                raise BundleQuarantineError(
+                    "source bundle failed physical validation"
+                ) from exc
+
+            # Protect the rename boundary against replacement of the published
+            # directory entry after inspection.
+            try:
+                current = os.stat(
+                    relative.name,
+                    dir_fd=source_parent_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise BundleQuarantineError(
+                    "source bundle identity disappeared"
+                ) from exc
+
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or current.st_dev != source_info.st_dev
+                or current.st_ino != source_info.st_ino
+            ):
+                raise BundleQuarantineError(
+                    "source bundle identity changed during validation"
+                )
+
+            destination_fd = self._open_quarantine_parent(
+                operation_id
+            )
+            destination_name = quarantine.name
+
+            try:
+                os.stat(
+                    destination_name,
+                    dir_fd=destination_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise BundleQuarantineError(
+                    "cannot inspect quarantine destination"
+                ) from exc
+            else:
+                raise BundleQuarantineError(
+                    "quarantine destination already exists"
+                )
+
+            if (
+                os.fstat(source_parent_fd).st_dev
+                != os.fstat(destination_fd).st_dev
+            ):
+                raise BundleQuarantineError(
+                    "bundle quarantine requires one filesystem"
+                )
+
+            try:
+                os.rename(
+                    relative.name,
+                    destination_name,
+                    src_dir_fd=source_parent_fd,
+                    dst_dir_fd=destination_fd,
+                )
+            except OSError as exc:
+                if exc.errno == errno.EXDEV:
+                    raise BundleQuarantineError(
+                        "cross-filesystem bundle quarantine refused"
+                    ) from exc
+                raise BundleQuarantineError(
+                    "cannot atomically quarantine bundle"
+                ) from exc
+
+            # Both namespace changes must be durable before the caller is
+            # allowed to persist QUARANTINED in the reclaim journal.
+            try:
+                os.fsync(destination_fd)
+                os.fsync(source_parent_fd)
+            except OSError as exc:
+                # The rename may already have happened. Do not attempt an
+                # automatic rollback: recovery must reconcile the deterministic
+                # source/quarantine identities.
+                raise BundleQuarantineError(
+                    "bundle quarantine rename is not durably synced"
+                ) from exc
+
+            try:
+                quarantined_info = os.stat(
+                    destination_name,
+                    dir_fd=destination_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise BundleQuarantineError(
+                    "quarantined bundle identity cannot be verified"
+                ) from exc
+
+            if (
+                not stat.S_ISDIR(quarantined_info.st_mode)
+                or quarantined_info.st_dev != source_info.st_dev
+                or quarantined_info.st_ino != source_info.st_ino
+            ):
+                # The directory entry may have been replaced after the
+                # pre-rename identity check. We must not leave an unrelated
+                # object quarantined under the restore point identity.
+                try:
+                    os.stat(
+                        relative.name,
+                        dir_fd=source_parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    try:
+                        os.rename(
+                            destination_name,
+                            relative.name,
+                            src_dir_fd=destination_fd,
+                            dst_dir_fd=source_parent_fd,
+                        )
+                        os.fsync(source_parent_fd)
+                        os.fsync(destination_fd)
+                    except OSError as exc:
+                        raise BundleQuarantineError(
+                            "quarantined bundle identity changed and "
+                            "safe rollback failed"
+                        ) from exc
+                except OSError as exc:
+                    raise BundleQuarantineError(
+                        "quarantined bundle identity changed and "
+                        "source namespace cannot be inspected"
+                    ) from exc
+                else:
+                    raise BundleQuarantineError(
+                        "quarantined bundle identity changed and "
+                        "source path is occupied; rollback refused"
+                    )
+
+                raise BundleQuarantineError(
+                    "quarantined bundle identity changed; rename rolled back"
+                )
+
+            return BundleQuarantineResult(
+                source_bundle_object_id=str(source),
+                quarantine_object_id=str(quarantine),
+                expected_physical_bytes=usage.physical_bytes,
+                source_device=source_info.st_dev,
+                source_inode=source_info.st_ino,
+            )
+        finally:
+            if destination_fd is not None:
+                os.close(destination_fd)
+            if source_fd is not None:
+                os.close(source_fd)
+            os.close(source_parent_fd)
