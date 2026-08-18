@@ -1298,4 +1298,4 @@ Current safety boundary:
     SSH persistent state dirs     YES
     SSH key management            NO
     SSH connection preflight      NO
-    remote SSH transfer           NO\n
+    remote SSH transfer           NO
