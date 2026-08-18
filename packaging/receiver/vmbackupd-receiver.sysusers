@@ -1,0 +1,1 @@
+u vmbackupd-transfer - "vmbackupd restricted SSH receiver" /srv/vmbackupd /usr/libexec/vmbackupd-transfer-shell

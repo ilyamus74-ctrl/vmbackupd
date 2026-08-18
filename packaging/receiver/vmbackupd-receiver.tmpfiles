@@ -1,0 +1,2 @@
+d /srv/vmbackupd 0750 vmbackupd-transfer vmbackupd-transfer -
+d /var/lib/vmbackupd/receiver-host 0700 root root -

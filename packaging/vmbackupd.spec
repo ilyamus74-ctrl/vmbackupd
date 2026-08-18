@@ -45,6 +45,23 @@ cockpit-vmbackupd provides the read-only Cockpit frontend for the vmbackupd
 local control API. The vmbackupd daemon package remains independently
 installable for headless operation.
 
+%package -n vmbackupd-receiver
+Summary:        Restricted OpenSSH receiver for vmbackupd
+Requires:       vmbackupd = %{version}-%{release}
+Requires:       openssh-server
+Requires:       openssh-clients
+Requires:       systemd
+Requires(pre):  systemd
+Requires(pre):  shadow-utils
+Requires(post): systemd
+Requires(preun): systemd
+Requires(postun): systemd
+
+%description -n vmbackupd-receiver
+vmbackupd-receiver provides a dedicated restricted OpenSSH endpoint for
+receiving vmbackupd traffic. It does not modify or reuse the host's normal
+sshd service configuration.
+
 %prep
 %autosetup -p1
 
@@ -65,6 +82,24 @@ install -d -m 0755 %{buildroot}%{_datadir}/cockpit/vmbackupd
 install -pm 0644 cockpit/vmbackupd/{manifest.json,index.html,api.js,vmbackupd.js,vmbackupd.css} \
     %{buildroot}%{_datadir}/cockpit/vmbackupd/
 
+install -Dpm 0755 packaging/receiver/vmbackupd-authorized-keys \
+    %{buildroot}%{_libexecdir}/vmbackupd-authorized-keys
+install -Dpm 0755 packaging/receiver/vmbackupd-transfer-shell \
+    %{buildroot}%{_libexecdir}/vmbackupd-transfer-shell
+install -Dpm 0755 packaging/receiver/vmbackupd-receiver-session \
+    %{buildroot}%{_libexecdir}/vmbackupd-receiver-session
+install -Dpm 0755 packaging/receiver/vmbackupd-receiver-hostkey \
+    %{buildroot}%{_libexecdir}/vmbackupd-receiver-hostkey
+
+install -Dpm 0644 packaging/receiver/vmbackupd-receiver.sysusers \
+    %{buildroot}%{_sysusersdir}/vmbackupd-receiver.conf
+install -Dpm 0644 packaging/receiver/vmbackupd-receiver.tmpfiles \
+    %{buildroot}%{_tmpfilesdir}/vmbackupd-receiver.conf
+install -Dpm 0644 packaging/receiver/receiver_sshd_config \
+    %{buildroot}%{_sysconfdir}/vmbackupd/receiver_sshd_config
+install -Dpm 0644 packaging/receiver/vmbackupd-receiver-sshd.service \
+    %{buildroot}%{_unitdir}/vmbackupd-receiver-sshd.service
+
 %pre
 %sysusers_create_compat %{SOURCE2}
 
@@ -78,6 +113,19 @@ install -pm 0644 cockpit/vmbackupd/{manifest.json,index.html,api.js,vmbackupd.js
 %postun
 %systemd_postun vmbackupd.service
 
+%pre -n vmbackupd-receiver
+%sysusers_create_compat packaging/receiver/vmbackupd-receiver.sysusers
+
+%post -n vmbackupd-receiver
+%systemd_post vmbackupd-receiver-sshd.service
+%tmpfiles_create %{_tmpfilesdir}/vmbackupd-receiver.conf
+
+%preun -n vmbackupd-receiver
+%systemd_preun vmbackupd-receiver-sshd.service
+
+%postun -n vmbackupd-receiver
+%systemd_postun vmbackupd-receiver-sshd.service
+
 %files -f %{pyproject_files}
 %doc docs/*.md
 %{_bindir}/vmbackupd
@@ -89,6 +137,16 @@ install -pm 0644 cockpit/vmbackupd/{manifest.json,index.html,api.js,vmbackupd.js
 
 %files -n cockpit-vmbackupd
 %{_datadir}/cockpit/vmbackupd/
+
+%files -n vmbackupd-receiver
+%{_libexecdir}/vmbackupd-authorized-keys
+%{_libexecdir}/vmbackupd-transfer-shell
+%{_libexecdir}/vmbackupd-receiver-session
+%{_libexecdir}/vmbackupd-receiver-hostkey
+%{_sysusersdir}/vmbackupd-receiver.conf
+%{_tmpfilesdir}/vmbackupd-receiver.conf
+%config(noreplace) %{_sysconfdir}/vmbackupd/receiver_sshd_config
+%{_unitdir}/vmbackupd-receiver-sshd.service
 
 %changelog
 * Mon Aug 17 2026 vmbackupd packagers <packagers@example.invalid> - 0.1.0-1

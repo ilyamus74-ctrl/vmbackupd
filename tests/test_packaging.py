@@ -66,9 +66,18 @@ def test_cockpit_subpackage_installs_and_owns_only_static_frontend_tree():
     assert "install -pm 0644 cockpit/vmbackupd/" in install_section
     assert "%{buildroot}%{_datadir}/cockpit/vmbackupd/" in install_section
 
-    main_files, cockpit_files = spec.split("%files -f %{pyproject_files}", 1)[1].split(
-        "%files -n cockpit-vmbackupd", 1,
+    main_files, remaining_files = spec.split(
+        "%files -f %{pyproject_files}",
+        1,
+    )[1].split(
+        "%files -n cockpit-vmbackupd",
+        1,
     )
+    cockpit_files, _receiver_files = remaining_files.split(
+        "%files -n vmbackupd-receiver",
+        1,
+    )
+
     assert "%{_datadir}/cockpit/vmbackupd/" not in main_files
     assert "%{_datadir}/cockpit/vmbackupd/" in cockpit_files
     for forbidden in (

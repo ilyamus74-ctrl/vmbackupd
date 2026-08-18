@@ -1,0 +1,22 @@
+[Unit]
+Description=vmbackupd restricted SSH receiver
+Documentation=file:///usr/share/doc/vmbackupd/packaging.md
+After=network.target
+ConditionPathExists=/etc/vmbackupd/receiver_sshd_config
+
+[Service]
+Type=simple
+
+ExecStartPre=/usr/libexec/vmbackupd-receiver-hostkey
+ExecStartPre=/usr/sbin/sshd -t -f /etc/vmbackupd/receiver_sshd_config
+ExecStart=/usr/sbin/sshd -D -e -f /etc/vmbackupd/receiver_sshd_config
+
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+
+RuntimeDirectory=vmbackupd-receiver
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target

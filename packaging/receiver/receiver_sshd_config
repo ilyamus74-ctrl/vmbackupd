@@ -1,0 +1,48 @@
+# Dedicated OpenSSH instance for vmbackupd receiver traffic.
+#
+# This configuration is independent from the host's normal sshd_config.
+
+Port 22022
+AddressFamily any
+ListenAddress 0.0.0.0
+ListenAddress ::
+
+HostKey /var/lib/vmbackupd/receiver-host/ssh_host_ed25519_key
+PidFile /run/vmbackupd-receiver/sshd.pid
+
+UsePAM yes
+
+PermitRootLogin no
+AllowUsers vmbackupd-transfer
+
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+GSSAPIAuthentication no
+HostbasedAuthentication no
+PermitEmptyPasswords no
+
+AuthorizedKeysFile none
+AuthorizedKeysCommand /usr/libexec/vmbackupd-authorized-keys %u
+AuthorizedKeysCommandUser vmbackupd
+
+ForceCommand /usr/libexec/vmbackupd-receiver-session
+
+DisableForwarding yes
+AllowAgentForwarding no
+AllowTcpForwarding no
+AllowStreamLocalForwarding no
+X11Forwarding no
+PermitTunnel no
+PermitTTY no
+PermitUserRC no
+PermitUserEnvironment no
+GatewayPorts no
+
+MaxSessions 1
+MaxAuthTries 3
+
+UseDNS no
+LogLevel VERBOSE

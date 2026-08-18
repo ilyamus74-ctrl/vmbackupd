@@ -1,0 +1,49 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+root=/var/lib/vmbackupd/receiver-host
+private="$root/ssh_host_ed25519_key"
+public="$private.pub"
+
+install -d -m 0700 -o root -g root "$root"
+
+if [[ -e "$private" || -e "$public" ]]; then
+    if [[ ! -f "$private" || -L "$private" ]]; then
+        echo "vmbackupd-receiver-hostkey: unsafe or incomplete private host key" >&2
+        exit 1
+    fi
+
+    if [[ ! -f "$public" || -L "$public" ]]; then
+        echo "vmbackupd-receiver-hostkey: unsafe or incomplete public host key" >&2
+        exit 1
+    fi
+
+    chmod 0600 "$private"
+    chmod 0644 "$public"
+    chown root:root "$private" "$public"
+
+    exit 0
+fi
+
+tmp="$root/.ssh_host_ed25519_key.$$"
+
+cleanup() {
+    rm -f -- "$tmp" "$tmp.pub"
+}
+trap cleanup EXIT
+
+/usr/bin/ssh-keygen \
+    -q \
+    -t ed25519 \
+    -N "" \
+    -C "vmbackupd-receiver-host" \
+    -f "$tmp"
+
+chmod 0600 "$tmp"
+chmod 0644 "$tmp.pub"
+chown root:root "$tmp" "$tmp.pub"
+
+mv -T "$tmp" "$private"
+mv -T "$tmp.pub" "$public"
+
+trap - EXIT
