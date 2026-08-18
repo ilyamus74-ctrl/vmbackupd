@@ -23,6 +23,7 @@ def _parser():
                   "identity-show", "identity-generate", "identity-rotate",
                   "hostkey-show", "hostkey-add", "hostkey-revoke",
               ],
+              "receiver": ["key-list", "key-add", "key-revoke"],
               "vm": ["discover", "list", "show", "register"],
               "job": ["list", "show", "create", "update"], "backup": ["run"],
               "run": ["list", "show"], "restore-point": ["list", "show"],
@@ -68,6 +69,12 @@ def _parser():
                 item.add_argument("destination_id")
                 if command == "hostkey-add":
                     item.add_argument("--key", required=True)
+            if group == "receiver":
+                if command == "key-add":
+                    item.add_argument("--label", required=True)
+                    item.add_argument("--key", required=True)
+                elif command == "key-revoke":
+                    item.add_argument("fingerprint")
             if group == "vm" and command == "register":
                 item.add_argument("domain"); item.add_argument("--name")
             if group == "job" and command == "create":
@@ -131,7 +138,24 @@ def _parser():
 def _request(args):
     method = f"{args.group.replace('-', '_')}.{args.command.replace('-', '_')}"
     params = {}
-    if args.group == "ssh":
+    if args.group == "receiver":
+        action = args.command.removeprefix("key-")
+        method = f"receiver.key.{action}"
+
+        if action == "list":
+            params = {}
+        elif action == "add":
+            params = {
+                "label": args.label,
+                "key": args.key,
+            }
+        elif action == "revoke":
+            params = {
+                "fingerprint": args.fingerprint,
+            }
+        else:
+            raise ValueError("unknown receiver command")
+    elif args.group == "ssh":
         params = {"destination_id": args.destination_id}
         if args.command.startswith("identity-"):
             action = args.command.removeprefix("identity-")

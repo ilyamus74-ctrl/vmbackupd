@@ -21,6 +21,7 @@ from .repository import DomainInvariantError, SQLiteRepository
 from .runtime import DaemonRuntime
 from .ssh_identity import SSHIdentityManager
 from .ssh_known_hosts import SSHKnownHostsManager
+from .ssh_receiver import SSHReceiverRegistry
 from .version import __version__
 
 
@@ -239,10 +240,15 @@ def compose(config: AppConfig) -> Components:
     ssh_known_hosts_manager = SSHKnownHostsManager(
         ssh_root,
     )
+    ssh_receiver_manager = SSHReceiverRegistry(
+        config.daemon.database_path.parent / "receiver",
+        clock,
+    )
     application = VmbackupApplication(
         repository, runtime, read_driver, config, node, clock, __version__,
         ssh_identity_manager=ssh_identity_manager,
         ssh_known_hosts_manager=ssh_known_hosts_manager,
+        ssh_receiver_manager=ssh_receiver_manager,
     )
     server = ApiServer(application, config.daemon.socket_path, config.daemon.socket_mode)
     return Components(config, repository, runtime, application, server)

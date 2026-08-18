@@ -16,6 +16,7 @@ from .models import (
 from .repository import DomainInvariantError, SQLiteRepository
 from .ssh_identity import SSHIdentityError
 from .ssh_known_hosts import SSHKnownHostsError
+from .ssh_receiver import SSHReceiverError
 from .storage import LocalStorageTester, lexical_storage_path, storage_path_has_symlink
 
 
@@ -31,12 +32,13 @@ class ApplicationError(RuntimeError):
 class VmbackupApplication:
     def __init__(self, repository: SQLiteRepository, runtime, driver, config, node, clock: Clock,
                  version: str, storage_tester=None, ssh_identity_manager=None,
-                 ssh_known_hosts_manager=None) -> None:
+                 ssh_known_hosts_manager=None, ssh_receiver_manager=None) -> None:
         self.repository, self.runtime, self.driver = repository, runtime, driver
         self.config, self.node, self.clock, self.version = config, node, clock, version
         self.storage_tester = storage_tester or LocalStorageTester()
         self.ssh_identity_manager = ssh_identity_manager
         self.ssh_known_hosts_manager = ssh_known_hosts_manager
+        self.ssh_receiver_manager = ssh_receiver_manager
 
     def dispatch(self, method: str, params: dict) -> object:
         handlers = {
@@ -51,6 +53,9 @@ class VmbackupApplication:
             "ssh.hostkey.show": self.ssh_hostkey_show,
             "ssh.hostkey.add": self.ssh_hostkey_add,
             "ssh.hostkey.revoke": self.ssh_hostkey_revoke,
+            "receiver.key.list": self.receiver_key_list,
+            "receiver.key.add": self.receiver_key_add,
+            "receiver.key.revoke": self.receiver_key_revoke,
             "vm.discover": self.vm_discover, "vm.list": self.vm_list,
             "vm.show": self.vm_show, "vm.register": self.vm_register,
             "job.list": self.job_list, "job.show": self.job_show,
@@ -77,6 +82,8 @@ class VmbackupApplication:
         except SSHIdentityError as exc:
             raise ApplicationError(exc.code, str(exc)) from None
         except SSHKnownHostsError as exc:
+            raise ApplicationError(exc.code, str(exc)) from None
+        except SSHReceiverError as exc:
             raise ApplicationError(exc.code, str(exc)) from None
         except TypeError as exc:
             raise ApplicationError("INVALID_PARAMS", str(exc)) from None
@@ -417,6 +424,28 @@ class VmbackupApplication:
         return self._serialize_ssh_hostkey(
             destination,
             value,
+        )
+
+    def _require_ssh_receiver_manager(self):
+        if self.ssh_receiver_manager is None:
+            raise ApplicationError(
+                "SSH_RECEIVER_UNAVAILABLE",
+                "SSH receiver registry is not configured",
+            )
+        return self.ssh_receiver_manager
+
+    def receiver_key_list(self):
+        return self._require_ssh_receiver_manager().list()
+
+    def receiver_key_add(self, label, key):
+        return self._require_ssh_receiver_manager().add(
+            label,
+            key,
+        )
+
+    def receiver_key_revoke(self, fingerprint):
+        return self._require_ssh_receiver_manager().revoke(
+            fingerprint
         )
 
     def vm_discover(self): return list(self.driver.discover_domains())

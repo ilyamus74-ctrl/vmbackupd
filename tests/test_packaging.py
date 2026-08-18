@@ -177,6 +177,7 @@ def test_sysusers_and_tmpfiles_are_restrictive_and_scoped():
     assert "d /var/lib/vmbackupd/control 0750 vmbackupd vmbackupd -" in tmpfiles
     assert "d /var/lib/vmbackupd/ssh 0700 vmbackupd vmbackupd -" in tmpfiles
     assert "d /var/lib/vmbackupd/ssh/identities 0700 vmbackupd vmbackupd -" in tmpfiles
+    assert "d /var/lib/vmbackupd/receiver 0700 vmbackupd vmbackupd -" in tmpfiles
     assert "d /var/lib/libvirt/images/vmbackupd 0750 vmbackupd qemu -" in tmpfiles
     assert all("0777" not in line and "0666" not in line for line in tmpfiles)
     assert all(not line.startswith("r ") and not line.startswith("R ") for line in tmpfiles)
