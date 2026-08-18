@@ -1113,11 +1113,91 @@ Acceptance coverage proves:
 
 ---
 
+# SSH.1a — Storage transport identity
+
+Status: CLOSED
+
+Implementation commit:
+
+    93d13e4 — Add SSH storage transport identity
+
+Implemented schema v10 storage transport identity as the persistence foundation
+for remote SSH backup destinations.
+
+Storage destinations now support:
+
+    storage_type        LOCAL | SSH
+    ssh_host
+    ssh_port
+    ssh_user
+    ssh_remote_root
+
+The existing backup_data_root remains the local source-side backup/staging root.
+For SSH destinations, ssh_remote_root represents the destination-side storage
+root.
+
+Existing schema-v9 destinations migrate transactionally to:
+
+    storage_type = LOCAL
+    ssh_host = NULL
+    ssh_port = NULL
+    ssh_user = NULL
+    ssh_remote_root = NULL
+
+without changing destination IDs, jobs, runs, restore points, or backup
+artifacts.
+
+SSH destination identity requires:
+
+- non-empty host;
+- explicit TCP port in the range 1..65535;
+- non-empty remote user;
+- absolute traversal-free remote root.
+
+Non-standard SSH ports are persisted as first-class destination identity and
+are not treated as command-line-only configuration.
+
+SQLite triggers and repository validation enforce the LOCAL/SSH transport
+contract fail-closed, including NULL and partially populated SSH identities.
+
+After the first job run references a destination, transport identity becomes
+immutable. This includes:
+
+    storage_type
+    backup_data_root
+    ssh_host
+    ssh_port
+    ssh_user
+    ssh_remote_root
+
+Historical schema migration contracts remain version-specific. Schema v3-v9
+validation does not incorrectly require v10 SSH triggers or columns, and the
+ordered migration chain remains valid through v10.
+
+Acceptance coverage proves:
+
+- persistence of SSH destination identity;
+- persistence of a non-standard SSH port;
+- rejection of incomplete or malformed SSH destinations;
+- database-level rejection when application validation is bypassed;
+- immutable transport identity after first run;
+- v9 -> v10 migration without historical data loss;
+- historical migration regression compatibility;
+- complete project pytest regression;
+- Python compilation;
+- Cockpit JavaScript syntax validation;
+- git diff validation.
+
+This phase does not implement SSH keys, known_hosts, connection testing,
+remote capacity inspection, file transfer, remote verification, or promotion.
+
+---
+
 # Current position
 
 Current implementation milestone:
 
-    Cockpit reclaim policy controls — CLOSED
+    SSH.1a storage transport identity — CLOSED
 
 Current safety boundary:
 
@@ -1136,4 +1216,6 @@ Current safety boundary:
     DAILY DST-safe scheduling     YES
     Cockpit DAILY controls        YES
     Cockpit reclaim controls      YES
+    SSH destination schema        YES
+    SSH transport identity        YES
     remote SSH transfer           NO
