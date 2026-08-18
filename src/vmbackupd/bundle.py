@@ -1160,6 +1160,60 @@ class BundlePurger:
             label=label,
         )
 
+    def _open_optional_operation_directory(
+        self,
+        operation_id: str,
+    ) -> int | None:
+        """Open an existing reclaim operation namespace, or report absence.
+
+        Missing controlled namespaces are normal during fresh RETIRING.
+        Existing symlinks, non-directories or unsafe roots remain fatal.
+        """
+
+        operation = BundlePathPlanner._uuid_component(
+            operation_id,
+            "reclaim operation ID",
+        )
+
+        try:
+            BundlePublisher._reject_symlinks(self.planner.root)
+        except BundlePublicationError as exc:
+            raise BundlePurgeError(
+                "backup root contains a symbolic link"
+            ) from exc
+
+        try:
+            root_fd = os.open(
+                self.planner.root,
+                BundlePublisher._directory_flags(),
+            )
+        except OSError as exc:
+            raise BundlePurgeError(
+                "backup root is not a safe directory"
+            ) from exc
+
+        reclaim_fd = None
+
+        try:
+            reclaim_fd = self._open_optional_child_directory(
+                root_fd,
+                ".reclaim",
+                label="reclaim namespace",
+            )
+
+            if reclaim_fd is None:
+                return None
+
+            return self._open_optional_child_directory(
+                reclaim_fd,
+                operation,
+                label="reclaim operation namespace",
+            )
+        finally:
+            if reclaim_fd is not None:
+                os.close(reclaim_fd)
+            os.close(root_fd)
+
     def _open_operation_directory(
         self,
         operation_id: str,
@@ -1625,9 +1679,16 @@ class BundlePurger:
     ) -> BundleReclaimPresence:
         """Inspect deterministic quarantine/purge names without following links."""
 
-        operation_fd = self._open_operation_directory(
+        operation_fd = self._open_optional_operation_directory(
             operation_id
         )
+
+        if operation_fd is None:
+            return BundleReclaimPresence(
+                quarantine_exists=False,
+                purging_exists=False,
+            )
+
         purging_fd = None
 
         try:

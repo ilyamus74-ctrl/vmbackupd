@@ -4,6 +4,7 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -22,6 +23,7 @@ from vmbackupd.models import (
     ArtifactKind, ArtifactState, BackupArtifact, BackupJob, BackupKind, BackupPolicy, JobRun,
     LibvirtExternalState, Node, RetentionPolicy, RunState, StorageDestination, VM,
 )
+from vmbackupd.reclaim_execution import ReclaimRecoveryRequiredError
 from vmbackupd.repository import SQLiteRepository
 from vmbackupd.serialization import restore_point as serialize_restore_point
 
@@ -288,7 +290,11 @@ def test_insufficient_free_space_blocks_start(execution, monkeypatch):
     assert "selected_reclaim_chain_ids=-" in (result.error or "")
     assert "selected_reclaim_bytes=0" in (result.error or "")
     assert "backup_possible_after_reclaim=false" in (result.error or "")
-    assert "reclaim_execution=NOT_IMPLEMENTED" in (result.error or "")
+    assert (
+        "reclaim_execution=NOT_ALLOWED_BY_POLICY"
+        in (result.error or "")
+    )
+    assert "NOT_IMPLEMENTED" not in (result.error or "")
 
 
 def test_capacity_reserve_mismatch_fails_closed_before_start(execution):
@@ -306,69 +312,63 @@ def test_capacity_reserve_mismatch_fails_closed_before_start(execution):
     assert not execution[5].data_run_directory(execution[3].id).exists()
 
 
-def test_space_optimized_reports_reclaimable_closed_chain_without_deleting(
-    execution, monkeypatch,
+def add_capacity_full_chain(
+    execution,
+    value,
+    *,
+    chain_id,
+    status,
+    created_at,
 ):
-    repository, vm, job, run, _, staging, _ = execution
+    repository, vm, job, _, _, staging, _ = execution
 
-    # Enable capacity reclaim planning for this job only.
-    repository.connection.execute(
-        """UPDATE backup_jobs
-           SET space_reclaim_mode = 'SPACE_OPTIMIZED'
-           WHERE id = ?""",
-        (job.id,),
+    source_run = JobRun(
+        job.id,
+        storage_destination_id=job.storage_destination_id,
+        state=RunState.SUCCESS,
+        id=str(uuid4()),
     )
+    repository.add_run(source_run)
 
-    old_chain_id = "reclaim-old"
-    active_chain_id = "reclaim-active"
-    old_restore_point_id = "reclaim-old-rp"
-    old_run_id = "44444444-4444-4444-8444-444444444444"
-    old_created_at = datetime(
-        2025, 12, 1, 12, 0, tzinfo=timezone.utc
-    )
-
-    # Build one real, measurable published bundle in the exact final
-    # namespace expected by BundlePhysicalInspector.
-    value, mutation = executor(execution)
     bundle = value.bundle_planner.final(
-        vm.id, old_run_id, old_created_at
+        vm.id,
+        source_run.id,
+        created_at,
     )
     disks = bundle / "disks"
     metadata = bundle / "metadata"
+
     disks.mkdir(parents=True)
     metadata.mkdir()
 
     disk = disks / "vda.qcow2"
     disk.write_bytes(b"x" * 8192)
-    (metadata / "domain.xml").write_text("<domain/>")
-    (metadata / "manifest.json").write_text("{}\\n")
-    (metadata / "restore-point.json").write_text("{}\\n")
 
-    # The CLOSED chain is reclaimable. The ACTIVE chain exists only to
-    # preserve minimum_full_chains=1 after reclaim.
+    (metadata / "domain.xml").write_text("<domain/>")
+    (metadata / "manifest.json").write_text("{}\n")
+    (metadata / "restore-point.json").write_text("{}\n")
+
+    closed_at = (
+        created_at.isoformat()
+        if status == "CLOSED"
+        else None
+    )
+
     repository.connection.execute(
         """INSERT INTO backup_chains
            (id, vm_id, status, created_at, closed_at)
-           VALUES (?, ?, 'CLOSED', ?, ?)""",
+           VALUES (?, ?, ?, ?, ?)""",
         (
-            old_chain_id,
+            chain_id,
             vm.id,
-            old_created_at.isoformat(),
-            old_created_at.isoformat(),
+            status,
+            created_at.isoformat(),
+            closed_at,
         ),
     )
-    repository.connection.execute(
-        """INSERT INTO backup_chains
-           (id, vm_id, status, created_at, closed_at)
-           VALUES (?, ?, 'ACTIVE', ?, NULL)""",
-        (
-            active_chain_id,
-            vm.id,
-            datetime(
-                2025, 12, 2, 12, 0, tzinfo=timezone.utc
-            ).isoformat(),
-        ),
-    )
+
+    restore_point_id = str(uuid4())
+
     repository.connection.execute(
         """INSERT INTO restore_points
            (id, chain_id, job_run_id, kind, sequence,
@@ -378,18 +378,193 @@ def test_space_optimized_reports_reclaimable_closed_chain_without_deleting(
            VALUES (?, ?, ?, 'FULL', 0, ?, NULL, NULL,
                    'AVAILABLE', ?, ?)""",
         (
-            old_restore_point_id,
-            old_chain_id,
-            run.id,
+            restore_point_id,
+            chain_id,
+            source_run.id,
             str(disk),
-            old_created_at.isoformat(),
+            created_at.isoformat(),
             str(bundle),
         ),
     )
+
+    artifact_id = str(uuid4())
+
+    repository.connection.execute(
+        """INSERT INTO backup_artifacts (
+               id, job_run_id, restore_point_id,
+               kind, disk_target,
+               object_id, published_object_id,
+               format, size_bytes,
+               checksum_algorithm, checksum,
+               planned_capacity,
+               prepared_device, prepared_inode,
+               state, created_at, verified_at
+           )
+           VALUES (
+               ?, ?, ?,
+               'DISK', 'vda',
+               ?, ?,
+               'qcow2', ?,
+               NULL, NULL,
+               NULL,
+               NULL, NULL,
+               'PUBLISHED', ?, ?
+           )""",
+        (
+            artifact_id,
+            source_run.id,
+            restore_point_id,
+            str(staging.control_root / f"{artifact_id}.incoming"),
+            str(disk),
+            disk.stat().st_size,
+            created_at.isoformat(),
+            created_at.isoformat(),
+        ),
+    )
+
     repository.connection.commit()
 
-    # Existing destination policy reserves 5%. Free space is set exactly
-    # at that reserve, so the new FULL cannot start without reclaim.
+    return restore_point_id, bundle, disk
+
+
+def prepare_space_optimized_capacity_reclaim(
+    execution,
+):
+    repository, vm, job, run, _, _, _ = execution
+
+    repository.connection.execute(
+        """UPDATE backup_jobs
+           SET space_reclaim_mode = 'SPACE_OPTIMIZED'
+           WHERE id = ?""",
+        (job.id,),
+    )
+    repository.connection.commit()
+
+    value, mutation = executor(execution)
+
+    old_created_at = datetime(
+        2025, 12, 1, 12, 0, tzinfo=timezone.utc
+    )
+    survivor_created_at = datetime(
+        2025, 12, 2, 12, 0, tzinfo=timezone.utc
+    )
+
+    old_chain_id = "reclaim-old"
+    survivor_chain_id = "reclaim-survivor"
+
+    old_point_id, old_bundle, old_disk = (
+        add_capacity_full_chain(
+            execution,
+            value,
+            chain_id=old_chain_id,
+            status="CLOSED",
+            created_at=old_created_at,
+        )
+    )
+
+    _, survivor_bundle, _ = add_capacity_full_chain(
+        execution,
+        value,
+        chain_id=survivor_chain_id,
+        status="ACTIVE",
+        created_at=survivor_created_at,
+    )
+
+    return (
+        value,
+        mutation,
+        old_chain_id,
+        old_point_id,
+        old_bundle,
+        old_disk,
+        survivor_bundle,
+    )
+
+
+def test_space_optimized_executes_reclaim_before_backup_start(
+    execution,
+    monkeypatch,
+):
+    (
+        value,
+        mutation,
+        old_chain_id,
+        old_point_id,
+        old_bundle,
+        _,
+        survivor_bundle,
+    ) = prepare_space_optimized_capacity_reclaim(
+        execution
+    )
+
+    repository, _, _, run, _, staging, _ = execution
+
+    free_values = iter(
+        (
+            (5000, 100000),
+            (9000, 100000),
+            (9000, 100000),
+        )
+    )
+
+    monkeypatch.setattr(
+        staging,
+        "free_space",
+        lambda: next(
+            free_values,
+            (9000, 100000),
+        ),
+    )
+
+    result = value.advance_run(run.id)
+
+    assert result.state is RunState.BACKING_UP
+    assert mutation.calls
+
+    operation = repository.get_reclaim_operation_for_run(
+        run.id
+    )
+
+    assert operation is not None
+    assert operation.state.value == "COMPLETED"
+    assert operation.free_bytes_after == 9000
+
+    assert not old_bundle.exists()
+    assert survivor_bundle.is_dir()
+
+    with pytest.raises(KeyError):
+        repository.get_chain(old_chain_id)
+
+    assert all(
+        point.id != old_point_id
+        for point in repository.list_restore_points(
+            execution[1].id
+        )
+    )
+
+    # Reclaim completes before current backup staging is created.
+    assert staging.run_directory(run.id).is_dir()
+    assert staging.data_run_directory(run.id).is_dir()
+
+
+def test_space_optimized_refuses_start_when_actual_free_remains_insufficient(
+    execution,
+    monkeypatch,
+):
+    (
+        value,
+        mutation,
+        old_chain_id,
+        _,
+        old_bundle,
+        _,
+        survivor_bundle,
+    ) = prepare_space_optimized_capacity_reclaim(
+        execution
+    )
+
+    repository, _, _, run, _, staging, _ = execution
+
     monkeypatch.setattr(
         staging,
         "free_space",
@@ -401,31 +576,197 @@ def test_space_optimized_reports_reclaimable_closed_chain_without_deleting(
     assert result.state is RunState.CLEANUP
     assert mutation.calls == []
 
-    error = result.error or ""
-    assert "insufficient staging space" in error
-    assert "reclaim_mode=SPACE_OPTIMIZED" in error
-    assert (
-        f"selected_reclaim_chain_ids={old_chain_id}"
-        in error
-    )
-    assert "selected_reclaim_bytes=" in error
-    assert "backup_possible_after_reclaim=true" in error
-    assert "inspection_issues=0" in error
-    assert "reclaim_execution=NOT_IMPLEMENTED" in error
-
-    # Critical 3E.8a invariant: planning must not execute reclaim.
-    assert bundle.is_dir()
-    assert disk.is_file()
-    assert disk.read_bytes() == b"x" * 8192
-    assert repository.get_chain(old_chain_id).status.value == "CLOSED"
-    assert any(
-        point.id == old_restore_point_id
-        for point in repository.list_restore_points(vm.id)
+    operation = repository.get_reclaim_operation_for_run(
+        run.id
     )
 
-    # The failed current run never created its staging targets either.
+    assert operation is not None
+    assert operation.state.value == "COMPLETED"
+    assert operation.free_bytes_after == 5000
+
+    assert "measured free space after reclaim" in (
+        result.error or ""
+    )
+
+    assert not old_bundle.exists()
+    assert survivor_bundle.is_dir()
+
+    with pytest.raises(KeyError):
+        repository.get_chain(old_chain_id)
+
     assert not staging.run_directory(run.id).exists()
     assert not staging.data_run_directory(run.id).exists()
+
+
+def test_reclaim_recovery_blocks_libvirt_start_and_marks_run_recovery(
+    execution,
+    monkeypatch,
+):
+    (
+        value,
+        mutation,
+        _,
+        _,
+        old_bundle,
+        _,
+        survivor_bundle,
+    ) = prepare_space_optimized_capacity_reclaim(
+        execution
+    )
+
+    repository, _, _, run, _, staging, _ = execution
+
+    monkeypatch.setattr(
+        staging,
+        "free_space",
+        lambda: (5000, 100000),
+    )
+
+    def fail_reclaim(executor_self, operation_id):
+        executor_self.repository.begin_reclaim_retirement(
+            operation_id
+        )
+        executor_self.repository.require_reclaim_recovery(
+            operation_id,
+            "simulated reclaim crash",
+        )
+        raise ReclaimRecoveryRequiredError(
+            "simulated reclaim crash"
+        )
+
+    monkeypatch.setattr(
+        "vmbackupd.libvirt_execution.ReclaimExecutor.execute",
+        fail_reclaim,
+    )
+
+    result = value.advance_run(run.id)
+
+    assert result.state is RunState.BACKING_UP
+    assert result.recovery_required is True
+    assert "capacity reclaim requires recovery" in (
+        result.recovery_reason or ""
+    )
+
+    assert mutation.calls == []
+
+    operation = repository.get_reclaim_operation_for_run(
+        run.id
+    )
+
+    assert operation is not None
+    assert operation.state.value == "RECOVERY_REQUIRED"
+    assert operation.recovery_from_state.value == "RETIRING"
+
+    # No filesystem reclaim happened before the simulated failure.
+    assert old_bundle.is_dir()
+    assert survivor_bundle.is_dir()
+
+    assert not staging.run_directory(run.id).exists()
+    assert not staging.data_run_directory(run.id).exists()
+
+
+def test_existing_reclaim_operation_is_reused_after_retry(
+    execution,
+    monkeypatch,
+):
+    (
+        value,
+        mutation,
+        _,
+        _,
+        old_bundle,
+        _,
+        survivor_bundle,
+    ) = prepare_space_optimized_capacity_reclaim(
+        execution
+    )
+
+    repository, _, job, run, _, staging, _ = execution
+
+    estimate, _ = value._capacity_estimate(
+        "domain-uuid",
+        repository.get_persisted_libvirt_plan(run.id).disks,
+    )
+
+    capacity_plan = value.capacity_planning.plan_job(
+        job.id,
+        free_bytes=5000,
+        total_bytes=100000,
+        required_backup_bytes=estimate,
+    )
+
+    reclaim = capacity_plan.reclaim_plan
+
+    physical_by_chain = {
+        chain.chain_id: chain.physical_bytes
+        for chain in capacity_plan.chains
+    }
+
+    selected = [
+        (
+            chain_id,
+            physical_by_chain[chain_id],
+        )
+        for chain_id in reclaim.selected_reclaim_chain_ids
+    ]
+
+    assert selected
+    assert all(size is not None for _, size in selected)
+
+    operation = repository.create_reclaim_operation(
+        run.id,
+        [
+            (chain_id, int(size))
+            for chain_id, size in selected
+        ],
+        required_backup_bytes=estimate,
+        free_bytes_before=5000,
+        reserve_bytes=5000,
+    )
+
+    operation_id = operation.id
+
+    free_values = iter(
+        (
+            (5000, 100000),
+            (9000, 100000),
+            (9000, 100000),
+        )
+    )
+
+    monkeypatch.setattr(
+        staging,
+        "free_space",
+        lambda: next(
+            free_values,
+            (9000, 100000),
+        ),
+    )
+
+    result = value.advance_run(run.id)
+
+    assert result.state is RunState.BACKING_UP
+    assert mutation.calls
+
+    persisted = repository.get_reclaim_operation_for_run(
+        run.id
+    )
+
+    assert persisted is not None
+    assert persisted.id == operation_id
+    assert persisted.state.value == "COMPLETED"
+
+    count = repository.connection.execute(
+        """SELECT COUNT(*)
+           FROM reclaim_operations
+           WHERE job_run_id = ?""",
+        (run.id,),
+    ).fetchone()[0]
+
+    assert count == 1
+    assert not old_bundle.exists()
+    assert survivor_bundle.is_dir()
+
 
 
 def test_live_capacity_uses_libvirt_targets_and_not_source_qemu_img(execution):

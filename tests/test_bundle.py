@@ -961,3 +961,90 @@ def test_reclaim_presence_distinguishes_quarantine_and_purging(
 
     assert presence.quarantine_exists is False
     assert presence.purging_exists is True
+
+
+def test_reclaim_presence_treats_missing_namespace_as_absent(
+    tmp_path,
+):
+    planner = BundlePathPlanner(tmp_path)
+    purger = BundlePurger(planner)
+
+    presence = purger.inspect_reclaim_presence(
+        operation_id=OPERATION_ID,
+        restore_point_id=RESTORE_POINT_ID,
+    )
+
+    assert presence.quarantine_exists is False
+    assert presence.purging_exists is False
+
+
+def test_reclaim_presence_treats_missing_operation_namespace_as_absent(
+    tmp_path,
+):
+    planner = BundlePathPlanner(tmp_path)
+    reclaim = tmp_path / ".reclaim"
+    reclaim.mkdir()
+
+    purger = BundlePurger(planner)
+
+    presence = purger.inspect_reclaim_presence(
+        operation_id=OPERATION_ID,
+        restore_point_id=RESTORE_POINT_ID,
+    )
+
+    assert presence.quarantine_exists is False
+    assert presence.purging_exists is False
+
+
+def test_reclaim_presence_rejects_symlink_reclaim_namespace(
+    tmp_path,
+):
+    planner = BundlePathPlanner(tmp_path)
+
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+
+    (tmp_path / ".reclaim").symlink_to(
+        target,
+        target_is_directory=True,
+    )
+
+    purger = BundlePurger(planner)
+
+    with pytest.raises(
+        BundlePurgeError,
+        match="reclaim namespace",
+    ):
+        purger.inspect_reclaim_presence(
+            operation_id=OPERATION_ID,
+            restore_point_id=RESTORE_POINT_ID,
+        )
+
+
+def test_reclaim_presence_rejects_symlink_operation_namespace(
+    tmp_path,
+):
+    planner = BundlePathPlanner(tmp_path)
+
+    reclaim = tmp_path / ".reclaim"
+    reclaim.mkdir()
+
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+
+    operation = reclaim / OPERATION_ID
+    operation.symlink_to(
+        target,
+        target_is_directory=True,
+    )
+
+    purger = BundlePurger(planner)
+
+    with pytest.raises(
+        BundlePurgeError,
+        match="reclaim operation namespace",
+    ):
+        purger.inspect_reclaim_presence(
+            operation_id=OPERATION_ID,
+            restore_point_id=RESTORE_POINT_ID,
+        )

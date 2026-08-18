@@ -25,7 +25,12 @@ from .libvirt_backend import (
 )
 from .models import (
     ArtifactKind, ArtifactState, BackupArtifact, BackupKind, Event, JobRun,
-    LibvirtExternalState, RunDisk, RunState,
+    LibvirtExternalState, ReclaimOperation, ReclaimOperationState,
+    RunDisk, RunState, SpaceReclaimMode,
+)
+from .reclaim_execution import (
+    ReclaimExecutor, ReclaimInsufficientSpaceError,
+    ReclaimRecoveryRequiredError,
 )
 from .planner import BackupPlanner
 from .repository import DomainInvariantError, SQLiteRepository
@@ -62,6 +67,17 @@ class ImageInfo:
     format: str
     virtual_size: int
     actual_size: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StartCapacityDecision:
+    """Measured capacity facts authorizing this backup start."""
+
+    free_bytes: int
+    reserve_bytes: int
+    reclaim_shortfall_bytes: int
+    reclaim_candidate_count: int
+    inspection_issue_count: int
 
 
 class QemuImageInspector:
@@ -481,6 +497,418 @@ class LibvirtBackupExecutor:
             return self._poll_running(run)
         return run
 
+    def _reclaim_executor(
+        self,
+        storage_destination_id: str,
+    ) -> ReclaimExecutor:
+        return ReclaimExecutor(
+            self.repository,
+            self.bundle_planner,
+            storage_destination_id=storage_destination_id,
+            free_space_reader=lambda _: self.staging.free_space()[0],
+        )
+
+    @staticmethod
+    def _required_capacity(
+        required_backup_bytes: int,
+        reserve_bytes: int,
+    ) -> int:
+        return required_backup_bytes + reserve_bytes
+
+    def _validate_existing_reclaim(
+        self,
+        operation: ReclaimOperation,
+        run: JobRun,
+        *,
+        job_id: str,
+        vm_id: str,
+        storage_destination_id: str,
+        required_backup_bytes: int,
+        reserve_bytes: int,
+    ) -> None:
+        if operation.job_run_id != run.id:
+            raise LibvirtExecutionSafetyError(
+                "persisted reclaim belongs to another run"
+            )
+        if operation.job_id != job_id:
+            raise LibvirtExecutionSafetyError(
+                "persisted reclaim belongs to another job"
+            )
+        if operation.vm_id != vm_id:
+            raise LibvirtExecutionSafetyError(
+                "persisted reclaim belongs to another VM"
+            )
+        if (
+            operation.storage_destination_id
+            != storage_destination_id
+        ):
+            raise LibvirtExecutionSafetyError(
+                "persisted reclaim belongs to another "
+                "storage destination"
+            )
+        if (
+            operation.required_backup_bytes
+            != required_backup_bytes
+        ):
+            raise LibvirtExecutionSafetyError(
+                "persisted reclaim backup estimate differs "
+                "from current estimate"
+            )
+        if operation.reserve_bytes != reserve_bytes:
+            raise LibvirtExecutionSafetyError(
+                "persisted reclaim reserve differs "
+                "from current reserve"
+            )
+
+    def _require_current_free_space(
+        self,
+        *,
+        required_backup_bytes: int,
+    ) -> tuple[int, int, int]:
+        free_bytes, total_bytes = self.staging.free_space()
+
+        if total_bytes <= 0:
+            raise LibvirtExecutionSafetyError(
+                "storage destination reports invalid total capacity"
+            )
+        if free_bytes < 0 or free_bytes > total_bytes:
+            raise LibvirtExecutionSafetyError(
+                "storage destination reports invalid free capacity"
+            )
+
+        reserve_bytes = max(
+            self.minimum_free_bytes,
+            int(
+                total_bytes
+                * self.minimum_free_percent
+                / 100
+            ),
+        )
+
+        return free_bytes, total_bytes, reserve_bytes
+
+    def _require_post_reclaim_capacity(
+        self,
+        *,
+        required_backup_bytes: int,
+    ) -> tuple[int, int]:
+        free_after, _, reserve_after = (
+            self._require_current_free_space(
+                required_backup_bytes=required_backup_bytes
+            )
+        )
+
+        if free_after < self._required_capacity(
+            required_backup_bytes,
+            reserve_after,
+        ):
+            raise LibvirtExecutionSafetyError(
+                "measured free space after reclaim is insufficient: "
+                f"estimate={required_backup_bytes}, "
+                f"free={free_after}, reserve={reserve_after}"
+            )
+
+        return free_after, reserve_after
+
+    def _capacity_reclaim_error(
+        self,
+        *,
+        estimate: int,
+        free: int,
+        reserve: int,
+        job,
+        capacity_plan,
+    ) -> LibvirtExecutionSafetyError:
+        reclaim = capacity_plan.reclaim_plan
+
+        selected = (
+            ",".join(reclaim.selected_reclaim_chain_ids)
+            if reclaim.selected_reclaim_chain_ids
+            else "-"
+        )
+
+        if (
+            job.retention_policy.space_reclaim_mode
+            is SpaceReclaimMode.SAFE
+        ):
+            execution = "NOT_ALLOWED_BY_POLICY"
+        else:
+            execution = "NO_COMPLETE_PLAN"
+
+        return LibvirtExecutionSafetyError(
+            "insufficient staging space: "
+            f"estimate={estimate}, free={free}, reserve={reserve}, "
+            f"shortfall={reclaim.shortfall_bytes}, "
+            "reclaim_mode="
+            f"{job.retention_policy.space_reclaim_mode.value}, "
+            "candidate_reclaim_bytes="
+            f"{reclaim.candidate_reclaim_bytes}, "
+            f"selected_reclaim_chain_ids={selected}, "
+            f"selected_reclaim_bytes={reclaim.selected_reclaim_bytes}, "
+            "backup_possible_after_reclaim="
+            f"{str(reclaim.backup_possible_after_reclaim).lower()}, "
+            f"inspection_issues={len(capacity_plan.inspection_issues)}, "
+            f"reclaim_execution={execution}"
+        )
+
+    def _execute_existing_reclaim(
+        self,
+        operation: ReclaimOperation,
+        run: JobRun,
+        *,
+        job,
+        vm,
+        estimate: int,
+        free: int,
+        reserve: int,
+    ) -> StartCapacityDecision | None:
+        assert job.storage_destination_id is not None
+
+        self._validate_existing_reclaim(
+            operation,
+            run,
+            job_id=job.id,
+            vm_id=vm.id,
+            storage_destination_id=job.storage_destination_id,
+            required_backup_bytes=estimate,
+            reserve_bytes=reserve,
+        )
+
+        state = operation.state
+        enough_now = free >= self._required_capacity(
+            estimate,
+            reserve,
+        )
+
+        def current_decision() -> StartCapacityDecision:
+            return StartCapacityDecision(
+                free_bytes=free,
+                reserve_bytes=reserve,
+                reclaim_shortfall_bytes=0,
+                reclaim_candidate_count=0,
+                inspection_issue_count=0,
+            )
+
+        if state is ReclaimOperationState.RECOVERY_REQUIRED:
+            self.repository.mark_recovery_required(
+                run.id,
+                "capacity reclaim requires recovery: "
+                f"{operation.error or 'reclaim operation requires recovery'}",
+                self.clock.now(),
+            )
+            return None
+
+        if state is ReclaimOperationState.COMPLETED:
+            if not enough_now:
+                raise LibvirtExecutionSafetyError(
+                    "completed capacity reclaim no longer has "
+                    "sufficient current free space: "
+                    f"estimate={estimate}, free={free}, "
+                    f"reserve={reserve}"
+                )
+            return current_decision()
+
+        if state is ReclaimOperationState.ABORTED:
+            if not enough_now:
+                raise LibvirtExecutionSafetyError(
+                    "aborted capacity reclaim cannot be recreated "
+                    "for this backup run"
+                )
+            return current_decision()
+
+        if state is ReclaimOperationState.PLANNED:
+            if (
+                job.retention_policy.space_reclaim_mode
+                is not SpaceReclaimMode.SPACE_OPTIMIZED
+            ):
+                self.repository.abort_reclaim(operation.id)
+
+                if enough_now:
+                    return current_decision()
+
+                raise LibvirtExecutionSafetyError(
+                    "planned capacity reclaim was aborted because "
+                    "SPACE_OPTIMIZED is no longer enabled"
+                )
+
+            if enough_now:
+                self.repository.abort_reclaim(operation.id)
+                return current_decision()
+
+        try:
+            self._reclaim_executor(
+                operation.storage_destination_id
+            ).execute(operation.id)
+        except ReclaimRecoveryRequiredError as exc:
+            self.repository.mark_recovery_required(
+                run.id,
+                f"capacity reclaim requires recovery: {exc}",
+                self.clock.now(),
+            )
+            return None
+        except ReclaimInsufficientSpaceError as exc:
+            raise LibvirtExecutionSafetyError(str(exc)) from exc
+
+        free_after, reserve_after = (
+            self._require_post_reclaim_capacity(
+                required_backup_bytes=estimate
+            )
+        )
+
+        return StartCapacityDecision(
+            free_bytes=free_after,
+            reserve_bytes=reserve_after,
+            reclaim_shortfall_bytes=0,
+            reclaim_candidate_count=0,
+            inspection_issue_count=0,
+        )
+
+    def _ensure_start_capacity(
+        self,
+        run: JobRun,
+        *,
+        job,
+        vm,
+        estimate: int,
+    ) -> StartCapacityDecision | None:
+        if job.storage_destination_id is None:
+            raise LibvirtExecutionSafetyError(
+                "backup job has no storage destination"
+            )
+
+        free, total, reserve = self._require_current_free_space(
+            required_backup_bytes=estimate
+        )
+
+        # Durable reclaim takes precedence over a fresh capacity plan.
+        # Once reclaim exists, a retry must resume that exact transaction
+        # rather than replanning against a catalog that may already have
+        # hidden or retired restore points.
+        existing = self.repository.get_reclaim_operation_for_run(
+            run.id
+        )
+
+        if existing is not None:
+            return self._execute_existing_reclaim(
+                existing,
+                run,
+                job=job,
+                vm=vm,
+                estimate=estimate,
+                free=free,
+                reserve=reserve,
+            )
+
+        # Preserve the original read-only capacity validation and
+        # diagnostics even when no reclaim is currently required.
+        capacity_plan = self.capacity_planning.plan_job(
+            job.id,
+            free_bytes=free,
+            total_bytes=total,
+            required_backup_bytes=estimate,
+        )
+        reclaim = capacity_plan.reclaim_plan
+
+        if reclaim.reserve_bytes != reserve:
+            raise LibvirtExecutionSafetyError(
+                "capacity planning reserve mismatch: "
+                f"executor={reserve}, planner={reclaim.reserve_bytes}"
+            )
+
+        if reclaim.backup_possible_now:
+            return StartCapacityDecision(
+                free_bytes=free,
+                reserve_bytes=reserve,
+                reclaim_shortfall_bytes=reclaim.shortfall_bytes,
+                reclaim_candidate_count=len(
+                    reclaim.candidate_chain_ids
+                ),
+                inspection_issue_count=len(
+                    capacity_plan.inspection_issues
+                ),
+            )
+
+        if (
+            not reclaim.backup_possible_after_reclaim
+            or not reclaim.selected_reclaim_chain_ids
+        ):
+            raise self._capacity_reclaim_error(
+                estimate=estimate,
+                free=free,
+                reserve=reserve,
+                job=job,
+                capacity_plan=capacity_plan,
+            )
+
+        physical_by_chain = {
+            chain.chain_id: chain.physical_bytes
+            for chain in capacity_plan.chains
+        }
+
+        selected_chains: list[tuple[str, int]] = []
+
+        for chain_id in reclaim.selected_reclaim_chain_ids:
+            physical_bytes = physical_by_chain.get(chain_id)
+
+            if physical_bytes is None:
+                raise LibvirtExecutionSafetyError(
+                    "selected reclaim chain has no durable "
+                    "physical capacity fact"
+                )
+
+            selected_chains.append(
+                (chain_id, physical_bytes)
+            )
+
+        if (
+            sum(size for _, size in selected_chains)
+            != reclaim.selected_reclaim_bytes
+        ):
+            raise LibvirtExecutionSafetyError(
+                "selected reclaim chain bytes differ "
+                "from capacity plan"
+            )
+
+        operation = self.repository.create_reclaim_operation(
+            run.id,
+            selected_chains,
+            required_backup_bytes=estimate,
+            free_bytes_before=free,
+            reserve_bytes=reserve,
+        )
+
+        try:
+            self._reclaim_executor(
+                operation.storage_destination_id
+            ).execute(operation.id)
+        except ReclaimRecoveryRequiredError as exc:
+            self.repository.mark_recovery_required(
+                run.id,
+                f"capacity reclaim requires recovery: {exc}",
+                self.clock.now(),
+            )
+            return None
+        except ReclaimInsufficientSpaceError as exc:
+            raise LibvirtExecutionSafetyError(str(exc)) from exc
+
+        free_after, reserve_after = (
+            self._require_post_reclaim_capacity(
+                required_backup_bytes=estimate
+            )
+        )
+
+        return StartCapacityDecision(
+            free_bytes=free_after,
+            reserve_bytes=reserve_after,
+            reclaim_shortfall_bytes=reclaim.shortfall_bytes,
+            reclaim_candidate_count=len(
+                reclaim.candidate_chain_ids
+            ),
+            inspection_issue_count=len(
+                capacity_plan.inspection_issues
+            ),
+        )
+
     def _start(self, run: JobRun) -> None:
         plan = self.repository.get_persisted_libvirt_plan(run.id)
         assert plan is not None
@@ -513,49 +941,15 @@ class LibvirtBackupExecutor:
         estimate, capacities = self._capacity_estimate(
             operation.domain_uuid, plan.disks
         )
-        free, total = self.staging.free_space()
-        reserve = max(
-            self.minimum_free_bytes,
-            int(total * self.minimum_free_percent / 100),
+
+        start_capacity = self._ensure_start_capacity(
+            run,
+            job=job,
+            vm=vm,
+            estimate=estimate,
         )
-
-        capacity_plan = self.capacity_planning.plan_job(
-            job.id,
-            free_bytes=free,
-            total_bytes=total,
-            required_backup_bytes=estimate,
-        )
-        reclaim = capacity_plan.reclaim_plan
-
-        # The executor and persisted destination policy must describe the
-        # same safety reserve. A stale routing/executor instance fails closed.
-        if reclaim.reserve_bytes != reserve:
-            raise LibvirtExecutionSafetyError(
-                "capacity planning reserve mismatch: "
-                f"executor={reserve}, planner={reclaim.reserve_bytes}"
-            )
-
-        if not reclaim.backup_possible_now:
-            selected = (
-                ",".join(reclaim.selected_reclaim_chain_ids)
-                if reclaim.selected_reclaim_chain_ids
-                else "-"
-            )
-            raise LibvirtExecutionSafetyError(
-                "insufficient staging space: "
-                f"estimate={estimate}, free={free}, reserve={reserve}, "
-                f"shortfall={reclaim.shortfall_bytes}, "
-                "reclaim_mode="
-                f"{job.retention_policy.space_reclaim_mode.value}, "
-                "candidate_reclaim_bytes="
-                f"{reclaim.candidate_reclaim_bytes}, "
-                f"selected_reclaim_chain_ids={selected}, "
-                f"selected_reclaim_bytes={reclaim.selected_reclaim_bytes}, "
-                "backup_possible_after_reclaim="
-                f"{str(reclaim.backup_possible_after_reclaim).lower()}, "
-                f"inspection_issues={len(capacity_plan.inspection_issues)}, "
-                "reclaim_execution=NOT_IMPLEMENTED"
-            )
+        if start_capacity is None:
+            return
 
         run_dir = self.staging.prepare_new_run(run.id, plan.artifacts)
         if self.output_preparer is None:
@@ -563,11 +957,15 @@ class LibvirtBackupExecutor:
         for artifact in plan.artifacts:
             if artifact.kind is not ArtifactKind.DISK:
                 continue
-            capacity = capacities[artifact.disk_target or ""]
-            prepared = self.output_preparer.prepare(run.id, artifact, capacity)
+            disk_capacity = capacities[artifact.disk_target or ""]
+            prepared = self.output_preparer.prepare(
+                run.id,
+                artifact,
+                disk_capacity,
+            )
             try:
                 self.repository.record_prepared_artifact(
-                    artifact.id, capacity=capacity,
+                    artifact.id, capacity=disk_capacity,
                     device=prepared.st_dev, inode=prepared.st_ino,
                 )
             except Exception:
@@ -594,13 +992,19 @@ class LibvirtBackupExecutor:
             job_run_id=run.id,
             event_type="LIBVIRT_BACKUP_CAPACITY_ESTIMATED",
             message=(
-                f"virtual-size estimate={estimate}, free={free}, "
-                f"reserve={reserve}, expected-remaining={free - estimate}, "
+                f"virtual-size estimate={estimate}, "
+                f"free={start_capacity.free_bytes}, "
+                f"reserve={start_capacity.reserve_bytes}, "
+                "expected-remaining="
+                f"{start_capacity.free_bytes - estimate}, "
                 "reclaim-mode="
                 f"{job.retention_policy.space_reclaim_mode.value}, "
-                f"reclaim-shortfall={reclaim.shortfall_bytes}, "
-                f"reclaim-candidates={len(reclaim.candidate_chain_ids)}, "
-                f"inspection-issues={len(capacity_plan.inspection_issues)}"
+                "reclaim-shortfall="
+                f"{start_capacity.reclaim_shortfall_bytes}, "
+                "reclaim-candidates="
+                f"{start_capacity.reclaim_candidate_count}, "
+                "inspection-issues="
+                f"{start_capacity.inspection_issue_count}"
             ),
             created_at=now,
         ))
