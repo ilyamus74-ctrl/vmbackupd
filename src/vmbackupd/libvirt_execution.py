@@ -12,7 +12,11 @@ from pathlib import Path
 from typing import Callable
 
 from .clock import Clock, SystemClock
-from .bundle import BundlePathPlanner, BundlePublicationError, BundlePublisher
+from .bundle import (
+    BundlePathPlanner, BundlePhysicalInspector, BundlePublicationError,
+    BundlePublisher,
+)
+from .capacity import CapacityPlanningService, FullChainCapacityCollector
 from .command import CommandError, CommandResult, CommandRunner
 from .libvirt_backend import (
     CompletedJobInspection, DomainJobOperation, DomainJobState, DomainJobType,
@@ -397,6 +401,12 @@ class LibvirtBackupExecutor:
         )
         self.bundle_planner = BundlePathPlanner(staging.backup_data_root)
         self.bundle_publisher = BundlePublisher(self.bundle_planner)
+        self.capacity_planning = CapacityPlanningService(
+            repository,
+            FullChainCapacityCollector(
+                BundlePhysicalInspector(self.bundle_planner)
+            ),
+        )
         self._ownership_tokens: set[str] = set()
         self._current_step_owned = False
 
@@ -500,13 +510,53 @@ class LibvirtBackupExecutor:
             raise LibvirtExecutionSafetyError("; ".join(
                 f"{issue.code}: {issue.message}" for issue in preflight.errors
             ))
-        estimate, capacities = self._capacity_estimate(operation.domain_uuid, plan.disks)
+        estimate, capacities = self._capacity_estimate(
+            operation.domain_uuid, plan.disks
+        )
         free, total = self.staging.free_space()
-        reserve = max(self.minimum_free_bytes, int(total * self.minimum_free_percent / 100))
-        if estimate > free - reserve:
+        reserve = max(
+            self.minimum_free_bytes,
+            int(total * self.minimum_free_percent / 100),
+        )
+
+        capacity_plan = self.capacity_planning.plan_job(
+            job.id,
+            free_bytes=free,
+            total_bytes=total,
+            required_backup_bytes=estimate,
+        )
+        reclaim = capacity_plan.reclaim_plan
+
+        # The executor and persisted destination policy must describe the
+        # same safety reserve. A stale routing/executor instance fails closed.
+        if reclaim.reserve_bytes != reserve:
             raise LibvirtExecutionSafetyError(
-                f"insufficient staging space: estimate={estimate}, free={free}, reserve={reserve}"
+                "capacity planning reserve mismatch: "
+                f"executor={reserve}, planner={reclaim.reserve_bytes}"
             )
+
+        if not reclaim.backup_possible_now:
+            selected = (
+                ",".join(reclaim.selected_reclaim_chain_ids)
+                if reclaim.selected_reclaim_chain_ids
+                else "-"
+            )
+            raise LibvirtExecutionSafetyError(
+                "insufficient staging space: "
+                f"estimate={estimate}, free={free}, reserve={reserve}, "
+                f"shortfall={reclaim.shortfall_bytes}, "
+                "reclaim_mode="
+                f"{job.retention_policy.space_reclaim_mode.value}, "
+                "candidate_reclaim_bytes="
+                f"{reclaim.candidate_reclaim_bytes}, "
+                f"selected_reclaim_chain_ids={selected}, "
+                f"selected_reclaim_bytes={reclaim.selected_reclaim_bytes}, "
+                "backup_possible_after_reclaim="
+                f"{str(reclaim.backup_possible_after_reclaim).lower()}, "
+                f"inspection_issues={len(capacity_plan.inspection_issues)}, "
+                "reclaim_execution=NOT_IMPLEMENTED"
+            )
+
         run_dir = self.staging.prepare_new_run(run.id, plan.artifacts)
         if self.output_preparer is None:
             raise LibvirtExecutionSafetyError("output image preparation is not configured")
@@ -541,9 +591,17 @@ class LibvirtBackupExecutor:
                 )
         now = self.clock.now()
         self.repository.record_event(Event(
-            job_run_id=run.id, event_type="LIBVIRT_BACKUP_CAPACITY_ESTIMATED",
-            message=(f"virtual-size estimate={estimate}, free={free}, reserve={reserve}, "
-                     f"expected-remaining={free - estimate}"),
+            job_run_id=run.id,
+            event_type="LIBVIRT_BACKUP_CAPACITY_ESTIMATED",
+            message=(
+                f"virtual-size estimate={estimate}, free={free}, "
+                f"reserve={reserve}, expected-remaining={free - estimate}, "
+                "reclaim-mode="
+                f"{job.retention_policy.space_reclaim_mode.value}, "
+                f"reclaim-shortfall={reclaim.shortfall_bytes}, "
+                f"reclaim-candidates={len(reclaim.candidate_chain_ids)}, "
+                f"inspection-issues={len(capacity_plan.inspection_issues)}"
+            ),
             created_at=now,
         ))
         self.repository.transition_libvirt_external_state(

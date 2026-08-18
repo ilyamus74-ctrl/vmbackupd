@@ -159,7 +159,16 @@ def execution(tmp_path):
 
 
 def executor(execution, *, allow=True, mutation=None, images=None, prepared=None, **kwargs):
-    repository, _, _, _, driver, staging, clock = execution
+    repository, vm, job, _, driver, staging, clock = execution
+    destination = repository.get_storage_destination(
+        vm.node_id, job.storage_destination_id
+    )
+    kwargs.setdefault(
+        "minimum_free_bytes", destination.minimum_free_bytes
+    )
+    kwargs.setdefault(
+        "minimum_free_percent", destination.minimum_free_percent
+    )
     mutation = mutation or Mutation(repository)
     value = LibvirtBackupExecutor(
         repository, driver, mutation, staging, images or Images(),
@@ -255,12 +264,168 @@ def test_final_preflight_disk_inventory_change_blocks_start(execution):
     assert mutation.calls == []
 
 
-def test_insufficient_free_space_blocks_start(execution):
-    value, mutation = executor(execution, minimum_free_bytes=10**30)
-    assert value.advance_run(execution[3].id).state is RunState.CLEANUP
+def test_insufficient_free_space_blocks_start(execution, monkeypatch):
+    # Keep executor and persisted destination reserve aligned and make the
+    # actual destination free space insufficient.
+    monkeypatch.setattr(
+        execution[5],
+        "free_space",
+        lambda: (1, 10**9),
+    )
+    value, mutation = executor(execution)
+
+    result = value.advance_run(execution[3].id)
+
+    assert result.state is RunState.CLEANUP
     assert mutation.calls == []
     assert not execution[5].run_directory(execution[3].id).exists()
     assert not execution[5].data_run_directory(execution[3].id).exists()
+
+    assert "insufficient staging space" in (result.error or "")
+    assert "shortfall=" in (result.error or "")
+    assert "reclaim_mode=SAFE" in (result.error or "")
+    assert "candidate_reclaim_bytes=" in (result.error or "")
+    assert "selected_reclaim_chain_ids=-" in (result.error or "")
+    assert "selected_reclaim_bytes=0" in (result.error or "")
+    assert "backup_possible_after_reclaim=false" in (result.error or "")
+    assert "reclaim_execution=NOT_IMPLEMENTED" in (result.error or "")
+
+
+def test_capacity_reserve_mismatch_fails_closed_before_start(execution):
+    value, mutation = executor(
+        execution,
+        minimum_free_bytes=10**30,
+    )
+
+    result = value.advance_run(execution[3].id)
+
+    assert result.state is RunState.CLEANUP
+    assert mutation.calls == []
+    assert "capacity planning reserve mismatch" in (result.error or "")
+    assert not execution[5].run_directory(execution[3].id).exists()
+    assert not execution[5].data_run_directory(execution[3].id).exists()
+
+
+def test_space_optimized_reports_reclaimable_closed_chain_without_deleting(
+    execution, monkeypatch,
+):
+    repository, vm, job, run, _, staging, _ = execution
+
+    # Enable capacity reclaim planning for this job only.
+    repository.connection.execute(
+        """UPDATE backup_jobs
+           SET space_reclaim_mode = 'SPACE_OPTIMIZED'
+           WHERE id = ?""",
+        (job.id,),
+    )
+
+    old_chain_id = "reclaim-old"
+    active_chain_id = "reclaim-active"
+    old_restore_point_id = "reclaim-old-rp"
+    old_run_id = "44444444-4444-4444-8444-444444444444"
+    old_created_at = datetime(
+        2025, 12, 1, 12, 0, tzinfo=timezone.utc
+    )
+
+    # Build one real, measurable published bundle in the exact final
+    # namespace expected by BundlePhysicalInspector.
+    value, mutation = executor(execution)
+    bundle = value.bundle_planner.final(
+        vm.id, old_run_id, old_created_at
+    )
+    disks = bundle / "disks"
+    metadata = bundle / "metadata"
+    disks.mkdir(parents=True)
+    metadata.mkdir()
+
+    disk = disks / "vda.qcow2"
+    disk.write_bytes(b"x" * 8192)
+    (metadata / "domain.xml").write_text("<domain/>")
+    (metadata / "manifest.json").write_text("{}\\n")
+    (metadata / "restore-point.json").write_text("{}\\n")
+
+    # The CLOSED chain is reclaimable. The ACTIVE chain exists only to
+    # preserve minimum_full_chains=1 after reclaim.
+    repository.connection.execute(
+        """INSERT INTO backup_chains
+           (id, vm_id, status, created_at, closed_at)
+           VALUES (?, ?, 'CLOSED', ?, ?)""",
+        (
+            old_chain_id,
+            vm.id,
+            old_created_at.isoformat(),
+            old_created_at.isoformat(),
+        ),
+    )
+    repository.connection.execute(
+        """INSERT INTO backup_chains
+           (id, vm_id, status, created_at, closed_at)
+           VALUES (?, ?, 'ACTIVE', ?, NULL)""",
+        (
+            active_chain_id,
+            vm.id,
+            datetime(
+                2025, 12, 2, 12, 0, tzinfo=timezone.utc
+            ).isoformat(),
+        ),
+    )
+    repository.connection.execute(
+        """INSERT INTO restore_points
+           (id, chain_id, job_run_id, kind, sequence,
+            backup_object_id, parent_restore_point_id,
+            libvirt_checkpoint_name, status, created_at,
+            bundle_object_id)
+           VALUES (?, ?, ?, 'FULL', 0, ?, NULL, NULL,
+                   'AVAILABLE', ?, ?)""",
+        (
+            old_restore_point_id,
+            old_chain_id,
+            run.id,
+            str(disk),
+            old_created_at.isoformat(),
+            str(bundle),
+        ),
+    )
+    repository.connection.commit()
+
+    # Existing destination policy reserves 5%. Free space is set exactly
+    # at that reserve, so the new FULL cannot start without reclaim.
+    monkeypatch.setattr(
+        staging,
+        "free_space",
+        lambda: (5000, 100000),
+    )
+
+    result = value.advance_run(run.id)
+
+    assert result.state is RunState.CLEANUP
+    assert mutation.calls == []
+
+    error = result.error or ""
+    assert "insufficient staging space" in error
+    assert "reclaim_mode=SPACE_OPTIMIZED" in error
+    assert (
+        f"selected_reclaim_chain_ids={old_chain_id}"
+        in error
+    )
+    assert "selected_reclaim_bytes=" in error
+    assert "backup_possible_after_reclaim=true" in error
+    assert "inspection_issues=0" in error
+    assert "reclaim_execution=NOT_IMPLEMENTED" in error
+
+    # Critical 3E.8a invariant: planning must not execute reclaim.
+    assert bundle.is_dir()
+    assert disk.is_file()
+    assert disk.read_bytes() == b"x" * 8192
+    assert repository.get_chain(old_chain_id).status.value == "CLOSED"
+    assert any(
+        point.id == old_restore_point_id
+        for point in repository.list_restore_points(vm.id)
+    )
+
+    # The failed current run never created its staging targets either.
+    assert not staging.run_directory(run.id).exists()
+    assert not staging.data_run_directory(run.id).exists()
 
 
 def test_live_capacity_uses_libvirt_targets_and_not_source_qemu_img(execution):
