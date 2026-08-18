@@ -2,6 +2,7 @@
 node_name = "local"
 database_path = "/var/lib/vmbackupd/state.db"
 socket_path = "/run/vmbackupd/vmbackupd.sock"
+control_root = "/var/lib/vmbackupd/control"
 socket_mode = "0660"
 tick_interval_seconds = 1
 controller_lease_seconds = 30
@@ -16,7 +17,6 @@ default_destination = "local-root"
 
 [[storage.destinations]]
 name = "local-root"
-control_root = "/var/lib/vmbackupd/control/local-root"
 backup_data_root = "/var/lib/libvirt/images/vmbackupd"
 backup_data_mode = "0750"
 # If set, backup_data_user must be the account running vmbackupd.
@@ -28,7 +28,6 @@ minimum_free_percent = 5
 
 [[storage.destinations]]
 name = "local-home"
-control_root = "/var/lib/vmbackupd/control/local-home"
 backup_data_root = "/home/user/backups/vmbackupd"
 backup_data_mode = "0750"
 minimum_free_bytes = 0

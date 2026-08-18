@@ -9,7 +9,7 @@ def domain():
     repository = SQLiteRepository()
     node = Node(name="node-1")
     repository.add_node(node)
-    destination = StorageDestination("local", "/control", "/data", node.id, is_default=True)
+    destination = StorageDestination("local", "/data", node.id, is_default=True)
     repository.add_storage_destination(destination)
     vm = VM(node_id=node.id, name="test-vm", external_id="vm-101")
     repository.add_vm(vm)

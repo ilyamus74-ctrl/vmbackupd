@@ -112,8 +112,15 @@ libvirt `domblkinfo`, while `qemu-img info` is used only on completed backup
 outputs during structural verification.
 
 Artifacts progress through constrained repository transitions to `VERIFIED`.
-Existing atomic finalization then publishes all artifacts, the AVAILABLE restore
-point, chain lifecycle changes, and SUCCESS together. Phase 3B does not run a
+For new v4 executions, disks are still at their immutable execution paths under
+`.incoming/<run-id>/disks`. vmbackupd writes durable domain, manifest, and
+restore-point metadata beside them, validates the complete bundle, and
+atomically renames the whole run directory to
+`vms/<vm-id>/<year>/<month>/<UTC timestamp>_<run-id>` on the same filesystem.
+Cross-device rename has no copy fallback. Disk device/inode identity is checked
+again after rename. Only then are final `published_object_id` paths recorded and
+atomic SQLite finalization publishes the AVAILABLE restore point, chain changes,
+and SUCCESS together. Phase 3B does not run a
 long `qemu-img check` or compute full-image hashes inside a daemon tick.
 
 Before external start, cleanup may remove only daemon-owned metadata inside the
@@ -121,6 +128,19 @@ run directory and prepared disk targets whose persisted device/inode still
 match. A prepared image alone does not imply that libvirt was called. Once
 `START_REQUESTED` exists, automatic filesystem cleanup is refused because QEMU
 may own output state; RUNNING and UNKNOWN targets are likewise preserved.
+If filesystem publication succeeds but SQLite finalization fails, the final
+bundle is retained and the run remains recovery-required; bundle existence
+alone never proves success.
+
+`metadata/restore-point.json` uses the JobRun ID as the bundle identity and
+records the storage destination, stable internal VM ID plus human/libvirt
+identity, kind/chain/sequence/parent, the persisted run creation time and
+libvirt backup completion time when available,
+relative disk and metadata paths, planned and verified sizes, application
+consistency, and verification level. It does not fabricate a database
+RestorePoint ID before the atomic database finalization creates one.
+It deliberately contains no `filesystem_published_at`: the rename instant is
+not persisted as publication evidence and is therefore not invented.
 
 Before completed output is inspected, vmbackupd requires the path to remain the
 same prepared regular file and proves it is readable. Substitution or access

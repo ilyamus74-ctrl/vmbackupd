@@ -195,3 +195,21 @@ Job updates begin `BEGIN IMMEDIATE` before reading mutable job state. Schedule
 cursor derivation and the update therefore share one linearization point with
 the scheduler's separate SQLite connection; an API update cannot overwrite a
 cursor that the scheduler advanced after an earlier read.
+
+Destination executors are cached together with the complete persisted
+`StorageDestination` snapshot. A changed reserve or other mutable field causes
+the next cooperative routing step to construct a replacement executor, so a
+daemon restart is unnecessary. Historical runs still route by immutable
+destination ID.
+
+## Phase 3E.6/v4 bundle publication
+
+Each destination executor uses the global `daemon.control_root` for private
+working XML and the run's immutable destination snapshot for its Backup
+location. New disk outputs are prepared under `.incoming/<run-id>/disks`.
+After structural verification, durable metadata is completed there and the
+whole directory is atomically renamed into the VM-ID/year/month final tree.
+Only after published paths are persisted may SQLite finalize the run as SUCCESS
+and publish an AVAILABLE restore point. A crash after rename remains
+FINALIZING/recovery-required; neither incoming nor final evidence is
+automatically deleted after START_REQUESTED.

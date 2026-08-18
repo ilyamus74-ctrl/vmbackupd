@@ -24,8 +24,8 @@ NOW = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
 def catalog(repository):
     node = Node("EU")
     repository.add_node(node)
-    first = StorageDestination("first", "/control/a", "/data/a", node.id, is_default=True)
-    second = StorageDestination("second", "/control/b", "/data/b", node.id)
+    first = StorageDestination("first", "/data/a", node.id, is_default=True)
+    second = StorageDestination("second", "/data/b", node.id)
     repository.add_storage_destination(first)
     repository.add_storage_destination(second)
     vm = VM(node.id, "guest", "guest", "uuid")
@@ -54,6 +54,11 @@ def version_one_database(path):
     connection.execute("DROP TRIGGER job_runs_destination_required_insert")
     connection.execute("DROP TRIGGER job_runs_destination_required_update")
     connection.execute("DROP TRIGGER job_runs_destination_immutable")
+    connection.execute("DROP TRIGGER storage_destination_identity_immutable_after_run")
+    connection.execute("ALTER TABLE storage_destinations ADD COLUMN control_root TEXT")
+    connection.execute("UPDATE storage_destinations SET control_root = '/control'")
+    connection.execute("ALTER TABLE backup_artifacts DROP COLUMN published_object_id")
+    connection.execute("ALTER TABLE restore_points DROP COLUMN bundle_object_id")
     connection.execute("ALTER TABLE job_runs DROP COLUMN storage_destination_id")
     connection.execute("UPDATE schema_version SET version = 1 WHERE id = 1")
     connection.commit()
@@ -63,7 +68,7 @@ def version_one_database(path):
 
 def test_schema_v2_fresh_and_v1_migration_backfills_run_destination(tmp_path):
     fresh = SQLiteRepository(tmp_path / "fresh.db")
-    assert fresh.schema_version == CURRENT_SCHEMA_VERSION == 2
+    assert fresh.schema_version == CURRENT_SCHEMA_VERSION == 4
     assert "storage_destination_id" in {
         row[1] for row in fresh.connection.execute("PRAGMA table_info(job_runs)")
     }
@@ -79,7 +84,7 @@ def test_schema_v2_fresh_and_v1_migration_backfills_run_destination(tmp_path):
     path = tmp_path / "v1.db"
     _, destination, _, _, run = version_one_database(path)
     migrated = SQLiteRepository(path)
-    assert migrated.schema_version == 2
+    assert migrated.schema_version == 4
     assert migrated.get_run(run.id).storage_destination_id == destination.id
     assert list(migrated.connection.execute("PRAGMA foreign_key_check")) == []
     assert [row[1] for row in migrated.connection.execute(
@@ -108,7 +113,7 @@ def test_v1_migration_rolls_back_and_rejects_missing_destination(tmp_path):
     }
     assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 1
     connection.close()
-    assert SQLiteRepository(path).schema_version == 2
+    assert SQLiteRepository(path).schema_version == 4
 
     malformed = tmp_path / "malformed.db"
     version_one_database(malformed)
@@ -158,9 +163,12 @@ def test_migration_and_current_validation_reject_cross_node_destinations(tmp_pat
         "INSERT INTO nodes VALUES ('foreign-node', 'foreign', ?)", (NOW.isoformat(),)
     )
     connection.execute(
-        """INSERT INTO storage_destinations VALUES
-           ('foreign-destination', 'foreign-node', 'foreign', '/c', '/d', 488,
-            NULL, NULL, 0, 5, 1, ?)""", (NOW.isoformat(),)
+        """INSERT INTO storage_destinations
+           (id, node_id, name, backup_data_root, backup_data_mode,
+            backup_data_uid, backup_data_gid, minimum_free_bytes,
+            minimum_free_percent, is_default, created_at, control_root)
+           VALUES ('foreign-destination', 'foreign-node', 'foreign', '/d', 488,
+                   NULL, NULL, 0, 5, 1, ?, '/c')""", (NOW.isoformat(),)
     )
     connection.execute("UPDATE backup_jobs SET storage_destination_id='foreign-destination'")
     connection.execute("DELETE FROM job_runs")
@@ -176,7 +184,7 @@ def test_migration_and_current_validation_reject_cross_node_destinations(tmp_pat
     repository.add_job(job)
     foreign = Node("foreign")
     repository.add_node(foreign)
-    other = StorageDestination("other", "/x", "/y", foreign.id, is_default=True)
+    other = StorageDestination("other", "/y", foreign.id, is_default=True)
     repository.add_storage_destination(other)
     repository.connection.execute(
         "UPDATE backup_jobs SET storage_destination_id=? WHERE id=?", (other.id, job.id)
@@ -208,7 +216,7 @@ def test_job_run_destination_snapshot_is_sqlite_immutable():
     foreign = Node("foreign")
     repository.add_node(foreign)
     foreign_destination = StorageDestination(
-        "foreign", "/foreign/control", "/foreign/data", foreign.id, is_default=True,
+        "foreign", "/foreign/data", foreign.id, is_default=True,
     )
     repository.add_storage_destination(foreign_destination)
     with pytest.raises(sqlite3.IntegrityError, match="immutable"):
@@ -255,7 +263,7 @@ def test_add_job_requires_explicit_local_destination():
     assert repository.list_storage_destinations(node.id) == []
     foreign = Node("foreign")
     repository.add_node(foreign)
-    destination = StorageDestination("foreign", "/c", "/d", foreign.id, is_default=True)
+    destination = StorageDestination("foreign", "/d", foreign.id, is_default=True)
     repository.add_storage_destination(destination)
     with pytest.raises(DomainInvariantError, match="STORAGE_DESTINATION_NOT_LOCAL"):
         repository.add_job(BackupJob(vm.id, "foreign", storage_destination_id=destination.id))
@@ -358,7 +366,7 @@ def test_job_update_rejects_foreign_destination_and_conflicting_selectors():
     })
     foreign = Node("UA")
     repository.add_node(foreign)
-    destination = StorageDestination("foreign", "/c", "/d", foreign.id, is_default=True)
+    destination = StorageDestination("foreign", "/d", foreign.id, is_default=True)
     repository.add_storage_destination(destination)
     with pytest.raises(ApplicationError):
         app.dispatch("job.update", {"id": job["id"], "storage_destination_id": destination.id})

@@ -215,6 +215,10 @@ def test_incremental_planning_uses_parent_restore_point_checkpoint(domain):
     for state in (RunState.BACKING_UP, RunState.TRANSFERRING,
                   RunState.VERIFYING, RunState.FINALIZING):
         repository.transition_run(first.id, state)
+    repository.record_published_artifact_paths(first.id, {
+        artifact.id: artifact.object_id
+        for artifact in repository.list_artifacts_for_run(first.id)
+    })
     repository.finalize_success(first.id)
     base_point = repository.list_restore_points(vm.id)[0]
 

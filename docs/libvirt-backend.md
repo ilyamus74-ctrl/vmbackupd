@@ -174,3 +174,9 @@ Phase 3B execution is described in
 [`libvirt-execution.md`](libvirt-execution.md). The read-only driver remains
 separate from the narrowly scoped mutation driver. The first executable plans
 are FULL-only jobs with incrementals disabled and no checkpoint metadata.
+
+The libvirt backup XML freezes each disk's execution `object_id` under the
+destination's `.incoming` tree. Publication does not rewrite that historical
+identity: schema v4 records the final bundle location separately as
+`published_object_id`. This preserves exact mutation evidence while giving
+restore and future retention code a durable published path.

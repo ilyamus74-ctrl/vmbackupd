@@ -47,16 +47,23 @@ configuration, state database, control data, and backup objects intact.
 
 ## Backup data placement
 
-QEMU-written push data is outside private daemon control state. A likely
-Fedora-oriented default is:
+The private execution workspace is globally configured as
+`daemon.control_root = /var/lib/vmbackupd/control`. QEMU-written push data and
+durable restore bundles are outside that workspace. The Fedora-oriented new
+bundle layout is:
 
 ```text
-/var/lib/libvirt/images/vmbackupd/<run-id>/<disk-target>.qcow2
+/var/lib/libvirt/images/vmbackupd/.incoming/<run-id>/disks/<target>.qcow2
+/var/lib/libvirt/images/vmbackupd/vms/<vm-id>/<YYYY>/<MM>/<timestamp>_<run-id>/
+    disks/<target>.qcow2
+    metadata/domain.xml
+    metadata/manifest.json
+    metadata/restore-point.json
 ```
 
-Control and data roots are independently configurable and supplied through the
-production TOML rather than repeated in backend code.
-Control run directories are private. Data run directories use an explicit mode
+Only the Backup location belongs to a StorageDestination. The control workspace
+is daemon-private and never editable through destination management.
+Control run directories are private. Incoming bundle directories use an explicit mode
 and optional UID/GID suitable for the installed libvirt/QEMU environment;
 vmbackupd never invents a Fedora QEMU identity or falls back to mode 0777.
 The run directory may remain 0750 because vmbackupd exclusively pre-creates

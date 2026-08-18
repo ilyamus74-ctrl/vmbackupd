@@ -6,6 +6,7 @@ import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from .bundle import BundlePathPlanner
 from .models import (
     ArtifactKind, ArtifactState, BackupArtifact, BackupChain, BackupChainStatus,
     BackupJob, BackupKind, BackupPolicy, CatchUpMode, DaemonInstance, Event,
@@ -17,6 +18,7 @@ from .models import (
 )
 from .state_machine import InvalidStateTransition, validate_transition
 from .schema import ensure_current_schema, get_schema_version
+from .storage import lexical_storage_path
 
 
 class DomainInvariantError(ValueError):
@@ -112,10 +114,17 @@ class SQLiteRepository:
 
     def add_storage_destination(self, value: StorageDestination) -> None:
         self._insert("storage_destinations", value, (
-            "id", "node_id", "name", "control_root", "backup_data_root", "backup_data_mode",
+            "id", "node_id", "name", "backup_data_root", "backup_data_mode",
             "backup_data_uid", "backup_data_gid", "minimum_free_bytes",
             "minimum_free_percent", "is_default", "created_at",
         ))
+
+    def storage_destination_identity_locked(self, node_id: str, destination_id: str) -> bool:
+        self.get_storage_destination(node_id, destination_id)
+        return self.connection.execute(
+            "SELECT 1 FROM job_runs WHERE storage_destination_id = ? LIMIT 1",
+            (destination_id,),
+        ).fetchone() is not None
 
     def get_storage_destination(self, node_id: str, destination_id: str) -> StorageDestination:
         row = self.connection.execute(
@@ -126,7 +135,6 @@ class SQLiteRepository:
             raise KeyError(destination_id)
         return StorageDestination(
             id=row["id"], node_id=row["node_id"], name=row["name"],
-            control_root=row["control_root"],
             backup_data_root=row["backup_data_root"],
             backup_data_mode=row["backup_data_mode"], backup_data_uid=row["backup_data_uid"],
             backup_data_gid=row["backup_data_gid"], minimum_free_bytes=row["minimum_free_bytes"],
@@ -153,52 +161,197 @@ class SQLiteRepository:
             raise DomainInvariantError("no default storage destination is configured")
         return self.get_storage_destination(node_id, row["id"])
 
-    def sync_storage_destinations(
+    def bootstrap_storage_destinations(
         self, node_id: str, destinations: list[StorageDestination], default_name: str,
     ) -> list[StorageDestination]:
         if not destinations or default_name not in {item.name for item in destinations}:
             raise DomainInvariantError("invalid configured storage catalog")
         try:
-            with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            if self.connection.execute(
+                "SELECT 1 FROM storage_destinations WHERE node_id = ? LIMIT 1", (node_id,)
+            ).fetchone():
+                default_count = self.connection.execute(
+                    "SELECT COUNT(*) FROM storage_destinations "
+                    "WHERE node_id = ? AND is_default = 1", (node_id,),
+                ).fetchone()[0]
+                if default_count != 1:
+                    self.connection.rollback()
+                    raise DomainInvariantError(
+                        "STORAGE_DEFAULT_INVARIANT_VIOLATION"
+                    )
+                self.connection.commit()
+                return self.list_storage_destinations(node_id)
+            try:
                 for intended in destinations:
                     if intended.node_id != node_id:
                         raise DomainInvariantError("storage destination belongs to another node")
-                    existing = self.get_storage_destination_by_name(node_id, intended.name)
-                    if existing is None:
-                        self.connection.execute(
-                            """INSERT INTO storage_destinations VALUES
-                               (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
-                            (intended.id, node_id, intended.name, intended.control_root,
-                             intended.backup_data_root, intended.backup_data_mode,
-                             intended.backup_data_uid, intended.backup_data_gid,
-                             intended.minimum_free_bytes, intended.minimum_free_percent,
-                             intended.created_at.isoformat()),
-                        )
-                        continue
-                    actual = (existing.control_root, existing.backup_data_root,
-                              existing.backup_data_mode, existing.backup_data_uid,
-                              existing.backup_data_gid, existing.minimum_free_bytes,
-                              existing.minimum_free_percent)
-                    wanted = (intended.control_root, intended.backup_data_root,
-                              intended.backup_data_mode, intended.backup_data_uid,
-                              intended.backup_data_gid, intended.minimum_free_bytes,
-                              intended.minimum_free_percent)
-                    if actual != wanted:
-                        raise DomainInvariantError(
-                            f"configured storage destination {intended.name} conflicts with persisted metadata"
-                        )
-                self.connection.execute(
-                    "UPDATE storage_destinations SET is_default = 0 WHERE node_id = ?", (node_id,)
-                )
-                cursor = self.connection.execute(
-                    """UPDATE storage_destinations SET is_default = 1
-                       WHERE node_id = ? AND name = ?""", (node_id, default_name),
-                )
-                if cursor.rowcount != 1:
+                    self.connection.execute(
+                        """INSERT INTO storage_destinations VALUES
+                           (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (intended.id, node_id, intended.name,
+                         intended.backup_data_root, intended.backup_data_mode,
+                         intended.backup_data_uid, intended.backup_data_gid,
+                         intended.minimum_free_bytes, intended.minimum_free_percent,
+                         int(intended.name == default_name), intended.created_at.isoformat()),
+                    )
+                default_count = self.connection.execute(
+                    "SELECT COUNT(*) FROM storage_destinations "
+                    "WHERE node_id = ? AND is_default = 1", (node_id,),
+                ).fetchone()[0]
+                if default_count != 1:
                     raise DomainInvariantError("configured default storage destination is missing")
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
         except sqlite3.IntegrityError as exc:
             raise DomainInvariantError(f"storage catalog rejected: {exc}") from exc
         return self.list_storage_destinations(node_id)
+
+    def sync_storage_destinations(
+        self, node_id: str, destinations: list[StorageDestination], default_name: str,
+    ) -> list[StorageDestination]:
+        """Compatibility alias for bootstrap-only storage seeding."""
+        return self.bootstrap_storage_destinations(node_id, destinations, default_name)
+
+    def _validate_storage_uniqueness(
+        self, node_id: str, name: str, backup_data_root: str,
+        *, exclude_id: str | None = None,
+    ) -> None:
+        rows = self.connection.execute(
+            "SELECT id, name, backup_data_root FROM storage_destinations "
+            "WHERE node_id = ?", (node_id,),
+        )
+        for row in rows:
+            if row["id"] == exclude_id:
+                continue
+            if row["name"] == name:
+                raise DomainInvariantError("STORAGE_DESTINATION_NAME_EXISTS")
+            if row["backup_data_root"] == backup_data_root:
+                raise DomainInvariantError("STORAGE_BACKUP_DATA_ROOT_EXISTS")
+
+    @staticmethod
+    def _validate_storage_fields(value: StorageDestination) -> None:
+        if not value.name.strip():
+            raise DomainInvariantError("STORAGE_DESTINATION_NAME_REQUIRED")
+        try:
+            data = lexical_storage_path(value.backup_data_root)
+        except ValueError:
+            raise DomainInvariantError("STORAGE_ROOT_INVALID")
+        if value.minimum_free_bytes < 0 or not 0 <= value.minimum_free_percent <= 100:
+            raise DomainInvariantError("STORAGE_RESERVE_INVALID")
+
+    def create_storage_destination(
+        self, value: StorageDestination, *, make_default: bool = False,
+    ) -> StorageDestination:
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            self.get_node(value.node_id)
+            self._validate_storage_fields(value)
+            self._validate_storage_uniqueness(
+                value.node_id, value.name, value.backup_data_root,
+            )
+            first = self.connection.execute(
+                "SELECT 1 FROM storage_destinations WHERE node_id = ? LIMIT 1", (value.node_id,)
+            ).fetchone() is None
+            if first or make_default:
+                self.connection.execute(
+                    "UPDATE storage_destinations SET is_default = 0 WHERE node_id = ?",
+                    (value.node_id,),
+                )
+            self.connection.execute(
+                """INSERT INTO storage_destinations VALUES
+                   (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (value.id, value.node_id, value.name,
+                 value.backup_data_root, value.backup_data_mode, value.backup_data_uid,
+                 value.backup_data_gid, value.minimum_free_bytes,
+                 value.minimum_free_percent, int(first or make_default),
+                 value.created_at.isoformat()),
+            )
+            self.connection.commit()
+        except sqlite3.IntegrityError as exc:
+            self.connection.rollback()
+            raise DomainInvariantError(f"STORAGE_DESTINATION_REJECTED: {exc}") from exc
+        except Exception:
+            self.connection.rollback()
+            raise
+        return self.get_storage_destination(value.node_id, value.id)
+
+    def update_storage_destination(
+        self, node_id: str, destination_id: str, *, name: str | None = None,
+        backup_data_root: str | None = None,
+        minimum_free_bytes: int | None = None,
+        minimum_free_percent: float | None = None, make_default: bool = False,
+    ) -> StorageDestination:
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            current = self.get_storage_destination(node_id, destination_id)
+            updated = StorageDestination(
+                id=current.id, node_id=current.node_id, created_at=current.created_at,
+                name=current.name if name is None else name,
+                backup_data_root=(current.backup_data_root if backup_data_root is None
+                                  else backup_data_root),
+                backup_data_mode=current.backup_data_mode,
+                backup_data_uid=current.backup_data_uid,
+                backup_data_gid=current.backup_data_gid,
+                minimum_free_bytes=(current.minimum_free_bytes if minimum_free_bytes is None
+                                    else minimum_free_bytes),
+                minimum_free_percent=(current.minimum_free_percent
+                                      if minimum_free_percent is None
+                                      else minimum_free_percent),
+                is_default=current.is_default or make_default,
+            )
+            self._validate_storage_fields(updated)
+            if self.storage_destination_identity_locked(node_id, destination_id) and (
+                updated.backup_data_root != current.backup_data_root
+            ):
+                raise DomainInvariantError("STORAGE_DESTINATION_IDENTITY_LOCKED")
+            self._validate_storage_uniqueness(
+                node_id, updated.name, updated.backup_data_root,
+                exclude_id=destination_id,
+            )
+            if make_default:
+                self.connection.execute(
+                    "UPDATE storage_destinations SET is_default = 0 WHERE node_id = ?", (node_id,)
+                )
+            self.connection.execute(
+                """UPDATE storage_destinations SET name = ?,
+                   backup_data_root = ?, minimum_free_bytes = ?, minimum_free_percent = ?,
+                   is_default = ? WHERE id = ? AND node_id = ?""",
+                (updated.name, updated.backup_data_root,
+                 updated.minimum_free_bytes, updated.minimum_free_percent,
+                 int(updated.is_default), destination_id, node_id),
+            )
+            self.connection.commit()
+        except sqlite3.IntegrityError as exc:
+            self.connection.rollback()
+            message = ("STORAGE_DESTINATION_IDENTITY_LOCKED" if "physical identity" in str(exc)
+                       else f"STORAGE_DESTINATION_REJECTED: {exc}")
+            raise DomainInvariantError(message) from exc
+        except Exception:
+            self.connection.rollback()
+            raise
+        return self.get_storage_destination(node_id, destination_id)
+
+    def set_default_storage_destination(
+        self, node_id: str, destination_id: str,
+    ) -> StorageDestination:
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            self.get_storage_destination(node_id, destination_id)
+            self.connection.execute(
+                "UPDATE storage_destinations SET is_default = 0 WHERE node_id = ?", (node_id,)
+            )
+            self.connection.execute(
+                "UPDATE storage_destinations SET is_default = 1 WHERE node_id = ? AND id = ?",
+                (node_id, destination_id),
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+        return self.get_storage_destination(node_id, destination_id)
 
     def add_job(self, value: BackupJob) -> None:
         vm = self.get_vm(value.vm_id)
@@ -400,18 +553,45 @@ class SQLiteRepository:
             raise DomainInvariantError("persisted libvirt plan artifact identities are immutable")
         self.connection.execute(
             """INSERT INTO backup_artifacts
-               (id, job_run_id, restore_point_id, kind, disk_target, object_id, format,
+               (id, job_run_id, restore_point_id, kind, disk_target, object_id,
+                published_object_id, format,
                 size_bytes, checksum_algorithm, checksum, planned_capacity,
                 prepared_device, prepared_inode, state, created_at, verified_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (artifact.id, artifact.job_run_id, artifact.restore_point_id, artifact.kind,
-             artifact.disk_target, artifact.object_id, artifact.format, artifact.size_bytes,
+             artifact.disk_target, artifact.object_id, artifact.published_object_id,
+             artifact.format, artifact.size_bytes,
              artifact.checksum_algorithm, artifact.checksum, artifact.planned_capacity,
              artifact.prepared_device, artifact.prepared_inode, artifact.state,
              artifact.created_at.isoformat(),
              artifact.verified_at.isoformat() if artifact.verified_at else None),
         )
         self.connection.commit()
+
+    def record_published_artifact_paths(
+        self, run_id: str, paths: dict[str, str],
+    ) -> None:
+        """Record final bundle paths without changing immutable execution identities."""
+        with self.connection:
+            run = self.get_run(run_id)
+            if run.state is not RunState.FINALIZING:
+                raise DomainInvariantError("artifact publication requires FINALIZING")
+            rows = self.connection.execute(
+                "SELECT id, state, published_object_id FROM backup_artifacts WHERE job_run_id = ?",
+                (run_id,),
+            ).fetchall()
+            if not rows or set(paths) != {row["id"] for row in rows}:
+                raise DomainInvariantError("published artifact path set is incomplete")
+            for row in rows:
+                if ArtifactState(row["state"]) is not ArtifactState.VERIFIED:
+                    raise DomainInvariantError("only VERIFIED artifacts may receive published paths")
+                current = row["published_object_id"]
+                if current is not None and current != paths[row["id"]]:
+                    raise DomainInvariantError("published artifact identity is immutable")
+                self.connection.execute(
+                    "UPDATE backup_artifacts SET published_object_id = ? WHERE id = ?",
+                    (paths[row["id"]], row["id"]),
+                )
 
     def mark_artifact_verified(
         self, artifact_id: str, *, size_bytes: int | None = None,
@@ -526,12 +706,14 @@ class SQLiteRepository:
                 self.connection.execute(
                     """INSERT INTO backup_artifacts
                        (id, job_run_id, restore_point_id, kind, disk_target, object_id,
-                        format, size_bytes, checksum_algorithm, checksum, state,
+                        published_object_id, format, size_bytes, checksum_algorithm,
+                        checksum, state,
                         planned_capacity, prepared_device, prepared_inode,
                         created_at, verified_at)
-                       VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (artifact.id, run_id, artifact.kind, artifact.disk_target,
-                     artifact.object_id, artifact.format, artifact.size_bytes,
+                     artifact.object_id, artifact.published_object_id,
+                     artifact.format, artifact.size_bytes,
                      artifact.checksum_algorithm, artifact.checksum, artifact.state,
                      artifact.planned_capacity, artifact.prepared_device,
                      artifact.prepared_inode,
@@ -753,23 +935,27 @@ class SQLiteRepository:
                     synthetic = (
                         BackupArtifact(job_run_id=run_id, kind=ArtifactKind.DISK,
                                        disk_target="vda", object_id=backup_object_id,
+                                       published_object_id=backup_object_id,
                                        format="qcow2", state=ArtifactState.VERIFIED,
                                        verified_at=now),
                         BackupArtifact(job_run_id=run_id, kind=ArtifactKind.DOMAIN_XML,
                                        object_id=f"mock-domain://{run_id}", format="xml",
+                                       published_object_id=f"mock-domain://{run_id}",
                                        state=ArtifactState.VERIFIED, verified_at=now),
                     )
                     for artifact in synthetic:
                         self.connection.execute(
                             """INSERT INTO backup_artifacts
                                (id, job_run_id, restore_point_id, kind, disk_target,
-                                object_id, format, size_bytes, checksum_algorithm, checksum,
+                                object_id, published_object_id, format, size_bytes,
+                                checksum_algorithm, checksum,
                                 planned_capacity, prepared_device, prepared_inode, state,
                                 created_at, verified_at)
-                               VALUES (?, ?, NULL, ?, ?, ?, ?, NULL, NULL, NULL,
+                               VALUES (?, ?, NULL, ?, ?, ?, ?, ?, NULL, NULL, NULL,
                                        NULL, NULL, NULL, ?, ?, ?)""",
                             (artifact.id, run_id, artifact.kind, artifact.disk_target,
-                             artifact.object_id, artifact.format, artifact.state,
+                             artifact.object_id, artifact.published_object_id,
+                             artifact.format, artifact.state,
                              artifact.created_at.isoformat(), now.isoformat()),
                         )
                     artifacts = self.connection.execute(
@@ -779,6 +965,10 @@ class SQLiteRepository:
                     raise DomainInvariantError("successful finalization requires artifacts")
                 if any(ArtifactState(a["state"]) is not ArtifactState.VERIFIED for a in artifacts):
                     raise DomainInvariantError("all artifacts must be VERIFIED before SUCCESS")
+                if any(a["published_object_id"] is None for a in artifacts):
+                    raise DomainInvariantError(
+                        "all artifacts require durable published paths before SUCCESS"
+                    )
                 kinds = {ArtifactKind(a["kind"]) for a in artifacts}
                 if ArtifactKind.DISK not in kinds or ArtifactKind.DOMAIN_XML not in kinds:
                     raise DomainInvariantError("verified DISK and DOMAIN_XML artifacts are required")
@@ -798,20 +988,29 @@ class SQLiteRepository:
                     )
                 operation = self.get_libvirt_operation(run_id)
                 first_disk = next(a for a in artifacts if ArtifactKind(a["kind"]) is ArtifactKind.DISK)
+                bundle_object_id = (
+                    self._derive_bundle_object_id(artifacts, row)
+                    if operation is not None and operation.completed_at is not None else None
+                )
                 point = RestorePoint(
                     chain_id=row["planned_chain_id"], job_run_id=run_id,
                     kind=BackupKind(row["planned_kind"]), sequence=row["planned_sequence"],
                     parent_restore_point_id=row["parent_restore_point_id"],
-                    backup_object_id=first_disk["object_id"],
+                    backup_object_id=first_disk["published_object_id"],
+                    bundle_object_id=bundle_object_id,
                     libvirt_checkpoint_name=operation.checkpoint_name if operation else None,
                     created_at=now,
                 )
                 self.connection.execute(
-                    "INSERT INTO restore_points VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    """INSERT INTO restore_points
+                       (id, chain_id, job_run_id, kind, sequence, backup_object_id,
+                        parent_restore_point_id, libvirt_checkpoint_name, status,
+                        created_at, bundle_object_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (point.id, point.chain_id, point.job_run_id, point.kind, point.sequence,
                      point.backup_object_id, point.parent_restore_point_id,
                      point.libvirt_checkpoint_name, point.status,
-                     point.created_at.isoformat()),
+                     point.created_at.isoformat(), point.bundle_object_id),
                 )
                 self.connection.execute(
                     """UPDATE backup_artifacts SET restore_point_id = ?, state = 'PUBLISHED'
@@ -823,6 +1022,51 @@ class SQLiteRepository:
         except sqlite3.IntegrityError as exc:
             raise DomainInvariantError(f"successful finalization rejected: {exc}") from exc
         return self.get_run(run_id)
+
+    def _derive_bundle_object_id(
+        self, artifacts: list[sqlite3.Row], run_context: sqlite3.Row,
+    ) -> str:
+        """Derive one durable bundle root using persisted paths only."""
+        domain_rows = [row for row in artifacts
+                       if ArtifactKind(row["kind"]) is ArtifactKind.DOMAIN_XML]
+        manifest_rows = [row for row in artifacts
+                         if ArtifactKind(row["kind"]) is ArtifactKind.MANIFEST]
+        disk_rows = [row for row in artifacts
+                     if ArtifactKind(row["kind"]) is ArtifactKind.DISK]
+        if len(domain_rows) != 1 or len(manifest_rows) != 1 or not disk_rows:
+            raise DomainInvariantError("real backup bundle artifact set is incomplete")
+
+        domain = Path(domain_rows[0]["published_object_id"])
+        if (not domain.is_absolute() or ".." in domain.parts
+                or domain.name != "domain.xml" or domain.parent.name != "metadata"):
+            raise DomainInvariantError("published domain XML is outside a valid bundle")
+        bundle = domain.parent.parent
+        destination = self.connection.execute(
+            "SELECT backup_data_root FROM storage_destinations WHERE id = ?",
+            (run_context["storage_destination_id"],),
+        ).fetchone()
+        if destination is None:
+            raise DomainInvariantError("run storage destination is missing")
+        expected_bundle = BundlePathPlanner(destination["backup_data_root"]).final(
+            run_context["vm_id"], run_context["id"],
+            datetime.fromisoformat(run_context["created_at"]),
+        )
+        if bundle != expected_bundle:
+            raise DomainInvariantError("published artifacts use an unexpected bundle root")
+        manifest = Path(manifest_rows[0]["published_object_id"])
+        if manifest != bundle / "metadata" / "manifest.json":
+            raise DomainInvariantError("published manifest is outside the artifact bundle")
+        for row in disk_rows:
+            target = row["disk_target"]
+            if (not target or target in {".", ".."}
+                    or any(character not in
+                           "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+                           for character in target)):
+                raise DomainInvariantError("published disk target is missing")
+            path = Path(row["published_object_id"])
+            if path != bundle / "disks" / f"{target}.qcow2":
+                raise DomainInvariantError("published disk is outside the artifact bundle")
+        return str(bundle)
 
     def _validate_finalization_context(self, row: sqlite3.Row) -> None:
         if RunState(row["state"]) is not RunState.FINALIZING:
@@ -1574,6 +1818,7 @@ class SQLiteRepository:
             id=row["id"], chain_id=row["chain_id"], job_run_id=row["job_run_id"],
             kind=BackupKind(row["kind"]), sequence=row["sequence"],
             backup_object_id=row["backup_object_id"],
+            bundle_object_id=row["bundle_object_id"],
             parent_restore_point_id=row["parent_restore_point_id"],
             libvirt_checkpoint_name=row["libvirt_checkpoint_name"],
             status=RestorePointStatus(row["status"]),
@@ -1586,6 +1831,7 @@ class SQLiteRepository:
             id=row["id"], job_run_id=row["job_run_id"],
             restore_point_id=row["restore_point_id"], kind=ArtifactKind(row["kind"]),
             disk_target=row["disk_target"], object_id=row["object_id"],
+            published_object_id=row["published_object_id"],
             format=row["format"], size_bytes=row["size_bytes"],
             checksum_algorithm=row["checksum_algorithm"], checksum=row["checksum"],
             planned_capacity=row["planned_capacity"],

@@ -464,7 +464,7 @@ class StagingPathPlanner:
 
     def _data_run_root(self, run_id: str) -> PurePosixPath:
         self._validate_component(run_id, "run ID")
-        return self.backup_data_root / run_id
+        return self.backup_data_root / ".incoming" / run_id
 
     @staticmethod
     def _validate_component(value: str, label: str) -> None:
@@ -473,7 +473,7 @@ class StagingPathPlanner:
 
     def disk(self, run_id: str, target: str) -> str:
         self._validate_component(target, "disk target")
-        return str(self._data_run_root(run_id) / f"{target}.qcow2")
+        return str(self._data_run_root(run_id) / "disks" / f"{target}.qcow2")
 
     def domain_xml(self, run_id: str) -> str:
         return str(self._run_root(run_id) / "domain.xml")

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Callable
 
 from .clock import Clock, SystemClock
+from .bundle import BundlePathPlanner, BundlePublicationError, BundlePublisher
 from .command import CommandError, CommandResult, CommandRunner
 from .libvirt_backend import (
     CompletedJobInspection, DomainJobOperation, DomainJobState, DomainJobType,
@@ -209,7 +210,10 @@ class StagingFilesystem:
 
     def data_run_directory(self, run_id: str) -> Path:
         self.run_directory(run_id)  # validates the component
-        return self.backup_data_root / run_id
+        return self.backup_data_root / ".incoming" / run_id
+
+    def data_disks_directory(self, run_id: str) -> Path:
+        return self.data_run_directory(run_id) / "disks"
 
     def prepare_new_run(
         self, run_id: str, artifacts: tuple[BackupArtifact, ...] | list[BackupArtifact],
@@ -239,10 +243,17 @@ class StagingFilesystem:
                 )
         run_dir.mkdir(mode=0o700)
         os.chmod(run_dir, 0o700)
+        incoming_root = self.backup_data_root / ".incoming"
+        if incoming_root.is_symlink():
+            raise LibvirtExecutionSafetyError("backup incoming root is a symlink")
+        incoming_root.mkdir(mode=self.backup_data_mode, exist_ok=True)
         data_run_dir.mkdir(mode=self.backup_data_mode)
         os.chmod(data_run_dir, self.backup_data_mode)
+        disks_dir = self.data_disks_directory(run_id)
+        disks_dir.mkdir(mode=self.backup_data_mode)
         if self.backup_data_gid is not None:
             self._chown(data_run_dir, -1, self.backup_data_gid)
+            self._chown(disks_dir, -1, self.backup_data_gid)
         return run_dir
 
     def _require_direct_path(
@@ -269,7 +280,7 @@ class StagingFilesystem:
 
     def require_data_path(self, run_id: str, path: str | Path) -> Path:
         return self._require_direct_path(
-            run_id, path, self.backup_data_root, self.data_run_directory(run_id)
+            run_id, path, self.backup_data_root, self.data_disks_directory(run_id)
         )
 
     def require_run_path(self, run_id: str, path: str | Path) -> Path:
@@ -340,6 +351,10 @@ class StagingFilesystem:
                 path.unlink()
         if run_dir.exists() and not run_dir.is_symlink() and not any(run_dir.iterdir()):
             run_dir.rmdir()
+        disks_dir = self.data_disks_directory(run_id)
+        if (disks_dir.exists() and not disks_dir.is_symlink()
+                and not any(disks_dir.iterdir())):
+            disks_dir.rmdir()
         data_run_dir = self.data_run_directory(run_id)
         if (data_run_dir.exists() and not data_run_dir.is_symlink()
                 and not any(data_run_dir.iterdir())):
@@ -380,6 +395,8 @@ class LibvirtBackupExecutor:
             repository, read_driver,
             StagingPathPlanner(str(staging.control_root), str(staging.backup_data_root)),
         )
+        self.bundle_planner = BundlePathPlanner(staging.backup_data_root)
+        self.bundle_publisher = BundlePublisher(self.bundle_planner)
         self._ownership_tokens: set[str] = set()
         self._current_step_owned = False
 
@@ -427,7 +444,14 @@ class LibvirtBackupExecutor:
         if run.state is RunState.VERIFYING:
             return self._verify(run)
         if run.state is RunState.FINALIZING:
-            return self.repository.finalize_success(run_id)
+            try:
+                self._publish_bundle(run)
+                return self.repository.finalize_success(run_id)
+            except Exception as exc:
+                return self.repository.mark_recovery_required(
+                    run_id, f"bundle publication/finalization requires recovery: {exc}",
+                    self.clock.now(),
+                )
         return run
 
     def _advance_backup(self, run: JobRun) -> JobRun:
@@ -646,7 +670,9 @@ class LibvirtBackupExecutor:
                 "target": artifact.disk_target,
                 "source": {"type": source.source_type, "path": source.source_path,
                            "format": source.source_format},
-                "artifact_path": artifact.object_id,
+                "artifact_path": str(BundlePathPlanner.disk_relative(
+                    artifact.disk_target or ""
+                )),
                 "size_bytes": info.st_size,
                 "image_format": image.format,
             })
@@ -699,6 +725,80 @@ class LibvirtBackupExecutor:
                 size_bytes=manifest_path.stat().st_size, now=self.clock.now(),
             )
         return self.repository.transition_run(run.id, RunState.FINALIZING)
+
+    def _publish_bundle(self, run: JobRun) -> None:
+        artifacts = self.repository.list_artifacts_for_run(run.id)
+        if artifacts and all(item.published_object_id is not None for item in artifacts):
+            return
+        if any(item.published_object_id is not None for item in artifacts):
+            raise BundlePublicationError("artifact publication evidence is incomplete")
+        plan = self.repository.get_persisted_libvirt_plan(run.id)
+        if plan is None:
+            raise BundlePublicationError("persisted libvirt plan is missing")
+        job = self.repository.get_job(run.job_id)
+        vm = self.repository.get_vm(job.vm_id)
+        operation = plan.operation
+        domain = self._artifact(artifacts, ArtifactKind.DOMAIN_XML)
+        manifest = self._artifact(artifacts, ArtifactKind.MANIFEST)
+        disk_artifacts = sorted(
+            (item for item in artifacts if item.kind is ArtifactKind.DISK),
+            key=lambda item: item.disk_target or "",
+        )
+        disk_metadata = [{
+            "target": item.disk_target,
+            "relative_path": str(BundlePathPlanner.disk_relative(item.disk_target or "")),
+            "format": item.format,
+            "planned_capacity": item.planned_capacity,
+            "verified_size": item.size_bytes,
+        } for item in disk_artifacts]
+        restore_metadata = {
+            "format_version": 1,
+            "bundle_id": run.id,
+            "job_run_id": run.id,
+            "storage_destination_id": run.storage_destination_id,
+            "vm": {
+                "id": vm.id,
+                "name": vm.name,
+                "external_id": vm.external_id,
+                "libvirt_domain_uuid": vm.libvirt_domain_uuid,
+            },
+            "backup_kind": run.planned_kind,
+            "chain_id": run.planned_chain_id,
+            "sequence": run.planned_sequence,
+            "parent_restore_point_id": run.parent_restore_point_id,
+            "run_created_at": run.created_at.isoformat(),
+            "backup_completed_at": (
+                operation.completed_at.isoformat() if operation.completed_at else None
+            ),
+            "disks": disk_metadata,
+            "metadata_paths": {
+                "domain_xml": "metadata/domain.xml",
+                "manifest": "metadata/manifest.json",
+                "restore_point": "metadata/restore-point.json",
+            },
+            "application_consistency": "crash-consistent",
+            "verification_level": "structural",
+        }
+        encoded_restore = (
+            json.dumps(restore_metadata, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        _, published = self.bundle_publisher.publish(
+            run_id=run.id, vm_id=vm.id, created_at=run.created_at,
+            domain_xml=self.staging.require_control_path(run.id, domain.object_id),
+            manifest=self.staging.require_control_path(run.id, manifest.object_id).read_bytes(),
+            restore_point=encoded_restore,
+            disks=[(
+                item.disk_target or "", item.prepared_device or -1,
+                item.prepared_inode or -1,
+            ) for item in disk_artifacts],
+        )
+        paths = {
+            domain.id: str(published["domain.xml"]),
+            manifest.id: str(published["manifest.json"]),
+        }
+        paths.update({item.id: str(published[item.disk_target or ""])
+                      for item in disk_artifacts})
+        self.repository.record_published_artifact_paths(run.id, paths)
 
     def advance_cleanup(self, run_id: str) -> JobRun:
         run = self.repository.get_run(run_id)

@@ -24,6 +24,7 @@ class DaemonConfig:
     node_name: str
     database_path: Path
     socket_path: Path
+    control_root: Path = Path("/var/lib/vmbackupd/control")
     socket_mode: int = 0o660
     tick_interval_seconds: float = 1
     controller_lease_seconds: int = 30
@@ -39,7 +40,6 @@ class LibvirtConfig:
 @dataclass(frozen=True, slots=True)
 class StorageConfig:
     name: str
-    control_root: Path
     backup_data_root: Path
     backup_data_mode: int = 0o750
     backup_data_uid: int | None = None
@@ -114,6 +114,10 @@ def load_config(
             node_name=node_name,
             database_path=_absolute(daemon_raw["database_path"], "daemon.database_path"),
             socket_path=_absolute(daemon_raw["socket_path"], "daemon.socket_path"),
+            control_root=_absolute(
+                daemon_raw.get("control_root", "/var/lib/vmbackupd/control"),
+                "daemon.control_root",
+            ),
             socket_mode=_mode(daemon_raw.get("socket_mode", "0660"), "daemon.socket_mode"),
             tick_interval_seconds=tick, controller_lease_seconds=controller,
             execution_lease_seconds=execution,
@@ -130,6 +134,11 @@ def load_config(
         for index, item in enumerate(raw_destinations):
             if not isinstance(item, dict):
                 raise ConfigError(f"storage destination {index} must be a table")
+            if "control_root" in item:
+                raise ConfigError(
+                    "storage.destinations[].control_root is obsolete; "
+                    "configure daemon.control_root instead"
+                )
             user, group = item.get("backup_data_user"), item.get("backup_data_group")
             try:
                 uid = int(user_lookup(str(user)).pw_uid) if user is not None else None
@@ -145,8 +154,6 @@ def load_config(
                 raise ConfigError(f"unknown backup data group: {group}") from exc
             destination = StorageConfig(
                 name=str(item.get("name", "")).strip(),
-                control_root=_absolute(item["control_root"],
-                                       f"storage.destinations[{index}].control_root"),
                 backup_data_root=_absolute(item["backup_data_root"],
                                            f"storage.destinations[{index}].backup_data_root"),
                 backup_data_mode=_mode(item.get("backup_data_mode", "0750"),
@@ -157,8 +164,6 @@ def load_config(
             )
             if not destination.name:
                 raise ConfigError("storage destination name cannot be empty")
-            if destination.control_root == destination.backup_data_root:
-                raise ConfigError("control and backup data roots must differ")
             if (destination.minimum_free_bytes < 0
                     or not 0 <= destination.minimum_free_percent <= 100):
                 raise ConfigError("invalid storage reserve")
@@ -166,6 +171,9 @@ def load_config(
         names = [item.name for item in destinations]
         if len(names) != len(set(names)):
             raise ConfigError("storage destination names must be unique")
+        data_roots = [item.backup_data_root for item in destinations]
+        if len(data_roots) != len(set(data_roots)):
+            raise ConfigError("storage backup data roots must be unique")
         default = str(storage_raw.get("default_destination", "")).strip()
         if default not in names:
             raise ConfigError("storage.default_destination must name a configured destination")

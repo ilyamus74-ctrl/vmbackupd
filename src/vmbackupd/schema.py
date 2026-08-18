@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import Callable, Mapping
 
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 4
 
 
 class SchemaError(RuntimeError):
@@ -59,7 +59,7 @@ CURRENT_SCHEMA_STATEMENTS = (
     )""",
     """CREATE TABLE storage_destinations (
         id TEXT PRIMARY KEY, node_id TEXT NOT NULL REFERENCES nodes(id), name TEXT NOT NULL,
-        control_root TEXT NOT NULL, backup_data_root TEXT NOT NULL,
+        backup_data_root TEXT NOT NULL,
         backup_data_mode INTEGER NOT NULL, backup_data_uid INTEGER, backup_data_gid INTEGER,
         minimum_free_bytes INTEGER NOT NULL, minimum_free_percent REAL NOT NULL,
         is_default INTEGER NOT NULL, created_at TEXT NOT NULL, UNIQUE(node_id, name)
@@ -90,6 +90,7 @@ CURRENT_SCHEMA_STATEMENTS = (
         parent_restore_point_id TEXT REFERENCES restore_points(id),
         libvirt_checkpoint_name TEXT,
         status TEXT NOT NULL CHECK(status = 'AVAILABLE'), created_at TEXT NOT NULL,
+        bundle_object_id TEXT,
         UNIQUE(chain_id, sequence)
     )""",
     """CREATE TABLE backup_artifacts (
@@ -103,7 +104,7 @@ CURRENT_SCHEMA_STATEMENTS = (
         prepared_device INTEGER, prepared_inode INTEGER,
         state TEXT NOT NULL CHECK(state IN
             ('PLANNED', 'WRITING', 'COMPLETE', 'VERIFIED', 'PUBLISHED')),
-        created_at TEXT NOT NULL, verified_at TEXT,
+        created_at TEXT NOT NULL, verified_at TEXT, published_object_id TEXT,
         CHECK((kind = 'DISK' AND disk_target IS NOT NULL) OR
               (kind != 'DISK' AND disk_target IS NULL)),
         UNIQUE(job_run_id, kind, disk_target)
@@ -169,13 +170,28 @@ CURRENT_SCHEMA_STATEMENTS = (
         BEFORE UPDATE OF storage_destination_id ON job_runs
         WHEN NEW.storage_destination_id IS NOT OLD.storage_destination_id
         BEGIN SELECT RAISE(ABORT, 'job run storage destination is immutable'); END""",
+    """CREATE TRIGGER storage_destination_identity_immutable_after_run
+        BEFORE UPDATE OF node_id, backup_data_root, backup_data_mode,
+                         backup_data_uid, backup_data_gid ON storage_destinations
+        WHEN EXISTS (
+            SELECT 1 FROM job_runs WHERE storage_destination_id = OLD.id
+        ) AND (
+            NEW.node_id IS NOT OLD.node_id OR
+            NEW.backup_data_root IS NOT OLD.backup_data_root OR
+            NEW.backup_data_mode IS NOT OLD.backup_data_mode OR
+            NEW.backup_data_uid IS NOT OLD.backup_data_uid OR
+            NEW.backup_data_gid IS NOT OLD.backup_data_gid
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'storage destination physical identity is immutable');
+        END""",
 )
 
 
 CURRENT_COLUMNS = {
     "nodes": {"id", "name", "created_at"},
     "vms": {"id", "node_id", "name", "external_id", "libvirt_domain_uuid", "created_at"},
-    "storage_destinations": {"id", "node_id", "name", "control_root", "backup_data_root",
+    "storage_destinations": {"id", "node_id", "name", "backup_data_root",
                              "backup_data_mode", "backup_data_uid", "backup_data_gid",
                              "minimum_free_bytes", "minimum_free_percent", "is_default",
                              "created_at"},
@@ -190,9 +206,11 @@ CURRENT_COLUMNS = {
     "backup_chains": {"id", "vm_id", "status", "created_at", "closed_at"},
     "restore_points": {"id", "chain_id", "job_run_id", "kind", "sequence",
                        "backup_object_id", "parent_restore_point_id",
-                       "libvirt_checkpoint_name", "status", "created_at"},
+                       "libvirt_checkpoint_name", "status", "created_at",
+                       "bundle_object_id"},
     "backup_artifacts": {"id", "job_run_id", "restore_point_id", "kind", "disk_target",
-                         "object_id", "format", "size_bytes", "checksum_algorithm", "checksum",
+                         "object_id", "published_object_id", "format", "size_bytes",
+                         "checksum_algorithm", "checksum",
                          "planned_capacity", "prepared_device", "prepared_inode", "state",
                          "created_at", "verified_at"},
     "run_disks": {"run_id", "target_dev", "source_type", "source_path", "source_format",
@@ -212,7 +230,12 @@ CURRENT_COLUMNS = {
                                "heartbeat_at", "expires_at"},
 }
 
-VERSION_1_COLUMNS = {name: set(columns) for name, columns in CURRENT_COLUMNS.items()}
+VERSION_3_COLUMNS = {name: set(columns) for name, columns in CURRENT_COLUMNS.items()}
+VERSION_3_COLUMNS["storage_destinations"].add("control_root")
+VERSION_3_COLUMNS["backup_artifacts"].remove("published_object_id")
+VERSION_3_COLUMNS["restore_points"].remove("bundle_object_id")
+VERSION_2_COLUMNS = {name: set(columns) for name, columns in VERSION_3_COLUMNS.items()}
+VERSION_1_COLUMNS = {name: set(columns) for name, columns in VERSION_2_COLUMNS.items()}
 VERSION_1_COLUMNS["job_runs"].remove("storage_destination_id")
 
 LEGACY_COLUMNS = {name: set(columns) for name, columns in VERSION_1_COLUMNS.items()}
@@ -257,9 +280,33 @@ REQUIRED_TRIGGERS = {
     "job_runs_destination_required_insert",
     "job_runs_destination_required_update",
     "job_runs_destination_immutable",
+    "storage_destination_identity_immutable_after_run",
 }
 
-DESTINATION_TRIGGER_STATEMENTS = CURRENT_SCHEMA_STATEMENTS[-3:]
+VERSION_2_TRIGGERS = {
+    "job_runs_destination_required_insert",
+    "job_runs_destination_required_update",
+    "job_runs_destination_immutable",
+}
+DESTINATION_TRIGGER_STATEMENTS = CURRENT_SCHEMA_STATEMENTS[-4:-1]
+STORAGE_IDENTITY_TRIGGER_SQL = CURRENT_SCHEMA_STATEMENTS[-1]
+VERSION_3_STORAGE_IDENTITY_TRIGGER_SQL = """CREATE TRIGGER
+        storage_destination_identity_immutable_after_run
+        BEFORE UPDATE OF node_id, control_root, backup_data_root, backup_data_mode,
+                         backup_data_uid, backup_data_gid ON storage_destinations
+        WHEN EXISTS (
+            SELECT 1 FROM job_runs WHERE storage_destination_id = OLD.id
+        ) AND (
+            NEW.node_id IS NOT OLD.node_id OR
+            NEW.control_root IS NOT OLD.control_root OR
+            NEW.backup_data_root IS NOT OLD.backup_data_root OR
+            NEW.backup_data_mode IS NOT OLD.backup_data_mode OR
+            NEW.backup_data_uid IS NOT OLD.backup_data_uid OR
+            NEW.backup_data_gid IS NOT OLD.backup_data_gid
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'storage destination physical identity is immutable');
+        END"""
 
 
 def _table_names(connection: sqlite3.Connection) -> set[str]:
@@ -340,12 +387,11 @@ def _validate_fingerprint(
             raise UnsupportedSchemaError(f"schema index columns mismatch for {name}")
 
 
-def validate_current_schema(connection: sqlite3.Connection) -> None:
-    _validate_fingerprint(connection, CURRENT_COLUMNS)
+def _validate_version_two_data(connection: sqlite3.Connection) -> None:
     triggers = {row[0] for row in connection.execute(
         "SELECT name FROM sqlite_master WHERE type = 'trigger'"
     )}
-    if not REQUIRED_TRIGGERS <= triggers:
+    if not VERSION_2_TRIGGERS <= triggers:
         raise UnsupportedSchemaError("schema destination-snapshot triggers are missing")
     if connection.execute(
         "SELECT 1 FROM job_runs WHERE storage_destination_id IS NULL LIMIT 1"
@@ -373,6 +419,57 @@ def validate_current_schema(connection: sqlite3.Connection) -> None:
     violations = list(connection.execute("PRAGMA foreign_key_check"))
     if violations:
         raise UnsupportedSchemaError("database contains foreign-key violations")
+
+
+def _validate_version_two_schema(connection: sqlite3.Connection) -> None:
+    _validate_fingerprint(connection, VERSION_2_COLUMNS)
+    _validate_version_two_data(connection)
+
+
+def validate_current_schema(connection: sqlite3.Connection) -> None:
+    _validate_fingerprint(connection, CURRENT_COLUMNS)
+    _validate_version_two_data(connection)
+    triggers = {row[0] for row in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+    )}
+    if not REQUIRED_TRIGGERS <= triggers:
+        raise UnsupportedSchemaError("schema storage-identity trigger is missing")
+    invalid_default = connection.execute(
+        """SELECT node_id FROM storage_destinations
+           GROUP BY node_id
+           HAVING COUNT(*) > 0
+              AND SUM(CASE WHEN is_default = 1 THEN 1 ELSE 0 END) != 1
+           LIMIT 1"""
+    ).fetchone()
+    if invalid_default:
+        raise UnsupportedSchemaError(
+            "non-empty node storage catalog must contain exactly one default"
+        )
+    if connection.execute(
+        """SELECT 1 FROM backup_artifacts
+           WHERE state = 'PUBLISHED' AND published_object_id IS NULL LIMIT 1"""
+    ).fetchone():
+        raise UnsupportedSchemaError("published artifact has no durable object identity")
+
+
+def _validate_version_three_schema(connection: sqlite3.Connection) -> None:
+    _validate_fingerprint(connection, VERSION_3_COLUMNS)
+    _validate_version_two_data(connection)
+    trigger = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND "
+        "name='storage_destination_identity_immutable_after_run'"
+    ).fetchone()
+    if trigger is None or "control_root" not in (trigger[0] or ""):
+        raise UnsupportedSchemaError("schema version 3 storage-identity trigger is malformed")
+    invalid_default = connection.execute(
+        """SELECT node_id FROM storage_destinations GROUP BY node_id
+           HAVING COUNT(*) > 0
+              AND SUM(CASE WHEN is_default = 1 THEN 1 ELSE 0 END) != 1 LIMIT 1"""
+    ).fetchone()
+    if invalid_default:
+        raise UnsupportedSchemaError(
+            "non-empty node storage catalog must contain exactly one default"
+        )
 
 
 def _create_current(connection: sqlite3.Connection) -> None:
@@ -430,9 +527,31 @@ def migrate_1_to_2(connection: sqlite3.Connection) -> None:
         connection.execute(statement)
 
 
+def migrate_2_to_3(connection: sqlite3.Connection) -> None:
+    connection.execute(VERSION_3_STORAGE_IDENTITY_TRIGGER_SQL)
+
+
+def migrate_3_to_4(connection: sqlite3.Connection) -> None:
+    connection.execute("DROP TRIGGER storage_destination_identity_immutable_after_run")
+    connection.execute("ALTER TABLE storage_destinations DROP COLUMN control_root")
+    connection.execute(
+        "ALTER TABLE backup_artifacts ADD COLUMN published_object_id TEXT"
+    )
+    connection.execute(
+        "ALTER TABLE restore_points ADD COLUMN bundle_object_id TEXT"
+    )
+    connection.execute(
+        """UPDATE backup_artifacts SET published_object_id = object_id
+           WHERE state = 'PUBLISHED'"""
+    )
+    connection.execute(STORAGE_IDENTITY_TRIGGER_SQL)
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: migrate_0_to_1,
     1: migrate_1_to_2,
+    2: migrate_2_to_3,
+    3: migrate_3_to_4,
 }
 
 
@@ -560,6 +679,10 @@ def ensure_current_schema(
     if version < CURRENT_SCHEMA_VERSION:
         if version == 1:
             _validate_fingerprint(connection, VERSION_1_COLUMNS)
+        elif version == 2:
+            _validate_version_two_schema(connection)
+        elif version == 3:
+            _validate_version_three_schema(connection)
         current = version
         while current < CURRENT_SCHEMA_VERSION:
             step = migration_steps.get(current)
@@ -572,6 +695,10 @@ def ensure_current_schema(
                 step(connection)
                 if current + 1 == CURRENT_SCHEMA_VERSION:
                     validate_current_schema(connection)
+                elif current + 1 == 3:
+                    _validate_version_three_schema(connection)
+                elif current + 1 == 2:
+                    _validate_version_two_schema(connection)
                 elif current + 1 == 1:
                     _validate_fingerprint(connection, VERSION_1_COLUMNS)
                 connection.execute(

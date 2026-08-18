@@ -76,7 +76,7 @@ def test_cockpit_success_waits_for_normal_close_and_rejects_lifecycle_errors():
     assert "channel.close()" not in close_handler
 
 
-def test_cockpit_method_allow_list_is_exactly_phase3e5_boundary():
+def test_cockpit_method_allow_list_is_exactly_phase3e6_boundary():
     api = source("api.js")
     match = re.search(
         r"const ALLOWED_METHODS = Object\.freeze\(\[(.*?)\]\);",
@@ -90,6 +90,10 @@ def test_cockpit_method_allow_list_is_exactly_phase3e5_boundary():
         "vm.discover",
         "vm.list",
         "storage.list",
+        "storage.create",
+        "storage.update",
+        "storage.set_default",
+        "storage.test",
         "job.list",
         "run.list",
         "restore_point.list",
@@ -99,8 +103,7 @@ def test_cockpit_method_allow_list_is_exactly_phase3e5_boundary():
         "job.update",
         "backup.run",
     ]
-    for forbidden in ("storage.create", "storage.update", "storage.delete",
-                      "restore.run", "retention.run", "recovery.update"):
+    for forbidden in ("storage.delete", "restore.run", "retention.run", "recovery.update"):
         assert forbidden not in api
 
 
@@ -210,6 +213,35 @@ def test_cockpit_job_management_is_full_only_and_refreshes_authoritative_data():
     assert 'await api.request("job.update"' in javascript
     assert 'await api.request("backup.run"' in javascript
     assert 'await refresh();' in javascript
+
+
+def test_cockpit_local_storage_management_is_explicit_and_non_destructive():
+    html = source("index.html")
+    javascript = source("vmbackupd.js")
+    assert all(value in html for value in (
+        "Add destination", "Type", 'value="Local" readonly', "Backup location",
+        "Stores the complete VM backup bundle", "Minimum free space", "Minimum free percent",
+        "Make default",
+    ))
+    assert "Control root" not in html
+    assert "storage-control-root" not in javascript
+    assert all(value in javascript for value in (
+        'actionButton("Edit"', 'actionButton("Test"', 'actionButton("Set default"',
+        'api.request("storage.create"', 'api.request("storage.update"',
+        'api.request("storage.set_default"', 'api.request("storage.test"',
+        "destination.identity_locked",
+    ))
+    assert "Create a new destination to move future backups" in html
+    assert "This is the current default. Set another destination as default to change it." in html
+    assert "defaultCheckbox.disabled = Boolean(destination && destination.is_default)" in javascript
+    assert "defaultCheckbox.checked = destination ? destination.is_default : false" in javascript
+    assert "storage.delete" not in javascript
+    assert 'await refresh();' in javascript
+    assert "currentModel.storage.map" in javascript
+    assert "exactByteParts" in javascript and "minimumFreeBytes" in javascript
+    assert 'className = `probe-result ${result && result.ok ? "success" : "error"}`' in javascript
+    assert 'document.getElementById("storage-test-result")' in javascript
+    assert 'document.getElementById("storage-dialog-test-result")' in javascript
 
 
 def test_cockpit_registration_flow_and_run_now_safety_are_explicit():

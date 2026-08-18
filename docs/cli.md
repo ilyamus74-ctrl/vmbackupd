@@ -6,6 +6,13 @@ misfire, `--enable`/`--disable`, `--schedule`/`--manual`, and mutually exclusive
 `--schedule` and `--disabled`; defaults remain enabled and manual. The CLI still
 uses only the UNIX API.
 
+Phase 3E.6 adds `storage create`, `storage update ID`, `storage set-default ID`,
+and `storage test ID`. Create/update accept `--backup-data-root` (the Local
+Backup location) and reserve policy; there is no `--control-root` option.
+`--default` atomically selects the destination. Test requests the daemon's
+bounded filesystem probe. The CLI never accesses SQLite or storage paths
+directly, and there is no storage delete command.
+
 `vmbackupctl` is a first-class console client and communicates exclusively with
 the versioned UNIX API. It does not import the repository or invoke virsh.
 

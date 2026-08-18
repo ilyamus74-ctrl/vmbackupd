@@ -13,6 +13,10 @@ from .models import (
     BackupJob, BackupPolicy, RetentionPolicy, SchedulePolicy, StorageDestination,
 )
 from .repository import DomainInvariantError, SQLiteRepository
+from .storage import LocalStorageTester, lexical_storage_path, storage_path_has_symlink
+
+
+_UNSET = object()
 
 
 class ApplicationError(RuntimeError):
@@ -23,14 +27,18 @@ class ApplicationError(RuntimeError):
 
 class VmbackupApplication:
     def __init__(self, repository: SQLiteRepository, runtime, driver, config, node, clock: Clock,
-                 version: str) -> None:
+                 version: str, storage_tester=None) -> None:
         self.repository, self.runtime, self.driver = repository, runtime, driver
         self.config, self.node, self.clock, self.version = config, node, clock, version
+        self.storage_tester = storage_tester or LocalStorageTester()
 
     def dispatch(self, method: str, params: dict) -> object:
         handlers = {
             "daemon.status": self.daemon_status, "node.list": self.node_list,
             "storage.list": self.storage_list, "storage.show": self.storage_show,
+            "storage.create": self.storage_create, "storage.update": self.storage_update,
+            "storage.set_default": self.storage_set_default,
+            "storage.test": self.storage_test,
             "vm.discover": self.vm_discover, "vm.list": self.vm_list,
             "vm.show": self.vm_show, "vm.register": self.vm_register,
             "job.list": self.job_list, "job.show": self.job_show,
@@ -61,11 +69,11 @@ class VmbackupApplication:
 
     def _free(self, destination: StorageDestination) -> int | None:
         try:
-            path = Path(destination.backup_data_root)
-            while not path.exists() and path != path.parent:
-                path = path.parent
+            path = lexical_storage_path(destination.backup_data_root)
+            if storage_path_has_symlink(path) or not path.is_dir():
+                return None
             return shutil.disk_usage(path).free
-        except OSError:
+        except (OSError, ValueError):
             return None
 
     def daemon_status(self):
@@ -84,17 +92,140 @@ class VmbackupApplication:
                 "libvirt_mutation_enabled": self.config.libvirt.allow_mutation,
                 "database_path": str(self.config.daemon.database_path),
                 "database_schema_version": self.repository.get_database_schema_version(),
-                "control_root": default.control_root,
+                "control_root": str(self.config.daemon.control_root),
                 "backup_data_root": default.backup_data_root,
                 "free_backup_data_bytes": self._free(default),
                 "nonterminal_run_count": len(runs),
                 "recovery_required_count": sum(r.recovery_required for r in runs)}
 
     def node_list(self): return [serialization.node(x) for x in self.repository.list_nodes()]
-    def storage_list(self): return [serialization.storage(x, free_bytes=self._free(x)) for x in self.repository.list_storage_destinations(self.node.id)]
+    def _serialize_storage(self, value):
+        return serialization.storage(
+            value, free_bytes=self._free(value),
+            identity_locked=self.repository.storage_destination_identity_locked(
+                self.node.id, value.id
+            ),
+        )
+
+    def storage_list(self):
+        return [self._serialize_storage(x)
+                for x in self.repository.list_storage_destinations(self.node.id)]
+
     def storage_show(self, id):
         value = self.repository.get_storage_destination(self.node.id, id)
-        return serialization.storage(value, free_bytes=self._free(value))
+        return self._serialize_storage(value)
+
+    @staticmethod
+    def _validate_storage_values(name, backup_data_root,
+                                 minimum_free_bytes, minimum_free_percent):
+        if not isinstance(name, str) or not name.strip():
+            raise ApplicationError("INVALID_PARAMS", "storage name must not be empty")
+        try:
+            data = lexical_storage_path(backup_data_root)
+        except ValueError:
+            raise ApplicationError(
+                "INVALID_PARAMS", "storage roots must be absolute and traversal-free"
+            ) from None
+        free_bytes = int(minimum_free_bytes)
+        free_percent = float(minimum_free_percent)
+        if free_bytes < 0 or not 0 <= free_percent <= 100:
+            raise ApplicationError("INVALID_PARAMS", "storage reserve is outside valid range")
+        return name.strip(), str(data), free_bytes, free_percent
+
+    def _seed_access_profile(self):
+        values = self.repository.list_storage_destinations(self.node.id)
+        if values:
+            try:
+                return self.repository.get_default_storage_destination(self.node.id)
+            except DomainInvariantError:
+                return values[0]
+        configured = next(
+            item for item in self.config.storage.destinations
+            if item.name == self.config.storage.default_destination
+        )
+        return configured
+
+    def storage_create(self, name, backup_data_root,
+                       minimum_free_bytes=0, minimum_free_percent=5,
+                       make_default=False):
+        if not isinstance(make_default, bool):
+            raise ApplicationError("INVALID_PARAMS", "make_default must be boolean")
+        name, backup_data_root, free_bytes, free_percent = (
+            self._validate_storage_values(name, backup_data_root,
+                                          minimum_free_bytes, minimum_free_percent)
+        )
+        profile = self._seed_access_profile()
+        value = StorageDestination(
+            node_id=self.node.id, name=name,
+            backup_data_root=backup_data_root,
+            backup_data_mode=profile.backup_data_mode,
+            backup_data_uid=profile.backup_data_uid,
+            backup_data_gid=profile.backup_data_gid,
+            minimum_free_bytes=free_bytes, minimum_free_percent=free_percent,
+        )
+        return self._serialize_storage(
+            self.repository.create_storage_destination(value, make_default=make_default)
+        )
+
+    def storage_update(self, id, name=None, backup_data_root=None,
+                       minimum_free_bytes=None, minimum_free_percent=None,
+                       make_default=False):
+        if not isinstance(make_default, bool):
+            raise ApplicationError("INVALID_PARAMS", "make_default must be boolean")
+        if name is not None and (not isinstance(name, str) or not name.strip()):
+            raise ApplicationError("INVALID_PARAMS", "storage name must not be empty")
+        for root in (backup_data_root,):
+            if root is not None:
+                try:
+                    lexical_storage_path(root)
+                except ValueError:
+                    raise ApplicationError(
+                        "INVALID_PARAMS", "storage roots must be absolute and traversal-free"
+                    ) from None
+        if minimum_free_bytes is not None and int(minimum_free_bytes) < 0:
+            raise ApplicationError("INVALID_PARAMS", "minimum_free_bytes must be non-negative")
+        if (minimum_free_percent is not None
+                and not 0 <= float(minimum_free_percent) <= 100):
+            raise ApplicationError("INVALID_PARAMS", "minimum_free_percent is outside valid range")
+        value = self.repository.update_storage_destination(
+            self.node.id, id, name=None if name is None else name.strip(),
+            backup_data_root=backup_data_root,
+            minimum_free_bytes=(None if minimum_free_bytes is None
+                                else int(minimum_free_bytes)),
+            minimum_free_percent=(None if minimum_free_percent is None
+                                  else float(minimum_free_percent)),
+            make_default=make_default,
+        )
+        return self._serialize_storage(value)
+
+    def storage_set_default(self, id):
+        return self._serialize_storage(
+            self.repository.set_default_storage_destination(self.node.id, id)
+        )
+
+    def storage_test(self, id=None, backup_data_root=_UNSET,
+                     minimum_free_bytes=_UNSET, minimum_free_percent=_UNSET):
+        if id is not None:
+            if any(value is not _UNSET for value in (
+                backup_data_root, minimum_free_bytes, minimum_free_percent,
+            )):
+                raise ApplicationError("INVALID_PARAMS", "test by ID or candidate, not both")
+            value = self.repository.get_storage_destination(self.node.id, id)
+            backup_data_root = value.backup_data_root
+            minimum_free_bytes = value.minimum_free_bytes
+            minimum_free_percent = value.minimum_free_percent
+        elif backup_data_root is _UNSET:
+            raise ApplicationError("INVALID_PARAMS", "candidate backup_data_root is required")
+        else:
+            minimum_free_bytes = 0 if minimum_free_bytes is _UNSET else minimum_free_bytes
+            minimum_free_percent = 5 if minimum_free_percent is _UNSET else minimum_free_percent
+        _, backup_data_root, free_bytes, free_percent = (
+            self._validate_storage_values("candidate", backup_data_root,
+                                          minimum_free_bytes, minimum_free_percent)
+        )
+        return self.storage_tester.test(
+            backup_data_root, free_bytes, free_percent,
+        )
     def vm_discover(self): return list(self.driver.discover_domains())
     def vm_list(self): return [serialization.vm(x) for x in self.repository.list_vms(self.node.id)]
     def vm_show(self, id):

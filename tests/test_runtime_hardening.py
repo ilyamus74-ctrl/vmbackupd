@@ -21,7 +21,7 @@ def add_vm_job(repository, node, name, *, vm=None, due=None):
         repository.add_vm(vm)
     destinations = repository.list_storage_destinations(node.id)
     if not destinations:
-        destination = StorageDestination("local", "/control", "/data", node.id,
+        destination = StorageDestination("local", "/data", node.id,
                                          is_default=True)
         repository.add_storage_destination(destination)
     else:

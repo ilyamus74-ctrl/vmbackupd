@@ -65,8 +65,12 @@ Phase 3E.5 keeps the read methods explicit and adds exactly four mutations:
 - `job.create`
 - `job.update`
 - `backup.run`
+- `storage.create`
+- `storage.update`
+- `storage.set_default`
+- `storage.test`
 
-There is no generic arbitrary-method entry point. Storage CRUD, restore,
+There is no generic arbitrary-method entry point. Storage deletion, restore,
 retention, recovery mutation, and peer operations remain unavailable.
 
 ## Operational dashboard
@@ -135,6 +139,25 @@ libvirt mutation was disabled. No backup ran and no second backup job was
 intentionally persisted during acceptance. This validates the development
 source path only; packaged Phase 3E.5 browser validation is not yet claimed.
 
+Phase 3E.6 adds Local destination Add, Edit, Test, and Set default actions via
+the explicit `storage.create`, `storage.update`, `storage.set_default`, and
+`storage.test` allow-list entries. Type is fixed as Local. Exact byte and
+percentage reserves remain editable without rounding. The API-provided
+`identity_locked` field disables Backup-location editing after backup history
+references a destination and explains that moving future backups requires a
+new destination; historical runs remain on the old one. Test results explicitly
+describe a daemon-side filesystem probe, not a real backup. Successful storage
+mutations refresh the complete dataset and job destination selector. Cockpit
+does not edit TOML and exposes no Delete action. Packaged Phase 3E.6 browser
+validation is not yet claimed.
+
+The Add/Edit form deliberately contains no Control root. It presents Name,
+fixed Type Local, Backup location, exact Bytes/MiB/GiB reserve input, reserve
+percent, and default selection. Its helper explains that the Backup location
+stores the complete bundle: disk data plus durable restore metadata. Row Test
+results stay beside Storage and use success/error styling; dialog probes have a
+dedicated result field rather than masquerading as form validation errors.
+
 ## Current status
 
 Repository tests validate the manifest, package layout, raw-channel constants,
@@ -153,8 +176,8 @@ The live Dashboard showed runtime `RUNNING`, version 0.1.0, Node `maker`,
 controller ownership, schema version 1, `qemu:///system`, mutation disabled, and
 zero non-terminal or recovery-required runs. VM discovery displayed the running
 `win10` domain with UUID `e2258b2e-fcac-4086-9d1e-f8daa8887e04`. Storage showed
-the default `local-root` destination as `Type = Local`, including control/data
-roots, free space, and reserve policy. Repeated Refresh operations successfully
+the default `local-root` destination as `Type = Local`, including its then-current
+path fields, free space, and reserve policy. Repeated Refresh operations successfully
 reloaded `daemon.status`, `vm.discover`, and `storage.list` without timeout,
 framing, API, permission, or stale-table errors after the fresh login.
 

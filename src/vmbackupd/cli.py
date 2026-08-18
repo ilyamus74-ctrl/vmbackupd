@@ -17,7 +17,8 @@ def _parser():
     parser.add_argument("--socket", default=DEFAULT_SOCKET)
     parser.add_argument("--json", action="store_true")
     top = parser.add_subparsers(dest="group", required=True)
-    simple = {"daemon": ["status"], "node": ["list"], "storage": ["list", "show"],
+    simple = {"daemon": ["status"], "node": ["list"],
+              "storage": ["list", "show", "create", "update", "set-default", "test"],
               "vm": ["discover", "list", "show", "register"],
               "job": ["list", "show", "create", "update"], "backup": ["run"],
               "run": ["list", "show"], "restore-point": ["list", "show"],
@@ -28,6 +29,20 @@ def _parser():
         for command in commands:
             item = subs.add_parser(command)
             if command == "show": item.add_argument("id")
+            if group == "storage" and command == "create":
+                item.add_argument("--name", required=True)
+                item.add_argument("--backup-data-root", required=True)
+                item.add_argument("--minimum-free-bytes", type=int, default=0)
+                item.add_argument("--minimum-free-percent", type=float, default=5)
+                item.add_argument("--default", action="store_true")
+            if group == "storage" and command == "update":
+                item.add_argument("id"); item.add_argument("--name")
+                item.add_argument("--backup-data-root")
+                item.add_argument("--minimum-free-bytes", type=int)
+                item.add_argument("--minimum-free-percent", type=float)
+                item.add_argument("--default", action="store_true")
+            if group == "storage" and command in {"set-default", "test"}:
+                item.add_argument("id")
             if group == "vm" and command == "register":
                 item.add_argument("domain"); item.add_argument("--name")
             if group == "job" and command == "create":
@@ -61,10 +76,23 @@ def _parser():
 
 
 def _request(args):
-    method = f"{args.group.replace('-', '_')}.{args.command}"
+    method = f"{args.group.replace('-', '_')}.{args.command.replace('-', '_')}"
     params = {}
     if args.command == "show":
         params["run_id" if args.group == "recovery" else "id"] = args.id
+    elif args.group == "storage" and args.command == "create":
+        params = {"name": args.name, "backup_data_root": args.backup_data_root,
+                  "minimum_free_bytes": args.minimum_free_bytes,
+                  "minimum_free_percent": args.minimum_free_percent,
+                  "make_default": args.default}
+    elif args.group == "storage" and args.command == "update":
+        params = {"id": args.id, "name": args.name,
+                  "backup_data_root": args.backup_data_root,
+                  "minimum_free_bytes": args.minimum_free_bytes,
+                  "minimum_free_percent": args.minimum_free_percent,
+                  "make_default": args.default}
+    elif args.group == "storage" and args.command in {"set-default", "test"}:
+        params = {"id": args.id}
     elif args.group == "vm" and args.command == "register":
         params = {"external_id": args.domain, "name": args.name}
     elif args.group == "job" and args.command == "create":

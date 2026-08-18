@@ -155,7 +155,6 @@ class BackupJob:
 @dataclass(frozen=True, slots=True)
 class StorageDestination:
     name: str
-    control_root: str
     backup_data_root: str
     node_id: str
     backup_data_mode: int = 0o750
@@ -206,6 +205,7 @@ class RestorePoint:
     kind: BackupKind
     sequence: int
     backup_object_id: str | None = None
+    bundle_object_id: str | None = None
     parent_restore_point_id: str | None = None
     libvirt_checkpoint_name: str | None = None
     status: RestorePointStatus = RestorePointStatus.AVAILABLE
@@ -218,6 +218,7 @@ class BackupArtifact:
     job_run_id: str
     kind: ArtifactKind
     object_id: str
+    published_object_id: str | None = None
     state: ArtifactState = ArtifactState.PLANNED
     disk_target: str | None = None
     restore_point_id: str | None = None

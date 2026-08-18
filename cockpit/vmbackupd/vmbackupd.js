@@ -5,12 +5,16 @@
     const notice = document.getElementById("notice");
     const refreshButton = document.getElementById("refresh");
     const addJobButton = document.getElementById("add-job");
+    const addStorageButton = document.getElementById("add-storage");
     const jobDialog = document.getElementById("job-dialog");
     const jobForm = document.getElementById("job-form");
+    const storageDialog = document.getElementById("storage-dialog");
+    const storageForm = document.getElementById("storage-form");
     const TERMINAL_STATES = new Set(["SUCCESS", "FAILED"]);
     const RECENT_RUN_LIMIT = 20;
     let currentModel = null;
     let editingJobId = null;
+    let editingStorageId = null;
 
     function text(value) {
         if (value === null || value === undefined || value === "")
@@ -313,6 +317,14 @@
         const rows = model.storage.map(destination => {
             const usable = destination.free_bytes === null || destination.free_bytes === undefined ?
                 null : Math.max(0, destination.free_bytes - destination.minimum_free_bytes);
+            const actions = document.createElement("div");
+            actions.className = "row-actions";
+            actions.append(
+                actionButton("Edit", () => openStorageDialog(destination), false),
+                actionButton("Test", () => testStoredDestination(destination), false),
+            );
+            if (!destination.is_default)
+                actions.append(actionButton("Set default", () => setDefaultStorage(destination), false));
             return tableRow([
                 destination.name,
                 ["Local", "nowrap"],
@@ -321,9 +333,126 @@
                 [`${bytes(destination.minimum_free_bytes)} / ${text(destination.minimum_free_percent)}%`, "nowrap"],
                 [bytes(usable), "nowrap"],
                 [destination.backup_data_root, "path-cell"],
+                actions,
             ]);
         });
-        replaceRows("storage", rows, 7, "No storage destinations configured");
+        replaceRows("storage", rows, 8, "No storage destinations configured");
+    }
+
+    function exactByteParts(value) {
+        const bytesValue = Number(value);
+        for (const unit of [1073741824, 1048576, 1]) {
+            if (Number.isSafeInteger(bytesValue) && bytesValue % unit === 0)
+                return { value: bytesValue / unit, unit };
+        }
+        return { value: bytesValue, unit: 1 };
+    }
+
+    function minimumFreeBytes() {
+        const value = Number(document.getElementById("storage-minimum-value").value);
+        const unit = Number(document.getElementById("storage-minimum-unit").value);
+        const result = value * unit;
+        if (!Number.isSafeInteger(value) || value < 0 || !Number.isSafeInteger(result))
+            throw new Error("Minimum free space must be an exact non-negative integer");
+        return result;
+    }
+
+    function showProbeResult(node, result, failedMessage = null) {
+        node.hidden = false;
+        node.className = `probe-result ${result && result.ok ? "success" : "error"}`;
+        node.textContent = failedMessage ||
+            `${result.message}; free ${bytes(result.free_bytes)}. ` +
+            "Daemon-side Backup-location filesystem test only; no VM backup was run.";
+    }
+
+    function openStorageDialog(destination = null) {
+        editingStorageId = destination ? destination.id : null;
+        document.getElementById("storage-dialog-title").textContent =
+            destination ? "Edit destination" : "Add destination";
+        document.getElementById("storage-name").value = destination ? destination.name : "";
+        document.getElementById("storage-data-root").value = destination ? destination.backup_data_root : "";
+        const reserve = exactByteParts(destination ? destination.minimum_free_bytes : 0);
+        document.getElementById("storage-minimum-value").value = reserve.value;
+        document.getElementById("storage-minimum-unit").value = String(reserve.unit);
+        document.getElementById("storage-minimum-percent").value =
+            destination ? destination.minimum_free_percent : 5;
+        const defaultCheckbox = document.getElementById("storage-default");
+        defaultCheckbox.checked = destination ? destination.is_default : false;
+        defaultCheckbox.disabled = Boolean(destination && destination.is_default);
+        document.getElementById("storage-default-note").hidden =
+            !Boolean(destination && destination.is_default);
+        const locked = Boolean(destination && destination.identity_locked);
+        document.getElementById("storage-data-root").disabled = locked;
+        document.getElementById("storage-identity-note").hidden = !locked;
+        document.getElementById("storage-form-error").textContent = "";
+        document.getElementById("storage-dialog-test-result").hidden = true;
+        storageDialog.showModal();
+    }
+
+    function storageFormParams() {
+        return {
+            name: document.getElementById("storage-name").value.trim(),
+            backup_data_root: document.getElementById("storage-data-root").value,
+            minimum_free_bytes: minimumFreeBytes(),
+            minimum_free_percent: Number(document.getElementById("storage-minimum-percent").value),
+            make_default: document.getElementById("storage-default").checked,
+        };
+    }
+
+    async function saveStorage(event) {
+        event.preventDefault();
+        const errorNode = document.getElementById("storage-form-error");
+        errorNode.textContent = "";
+        try {
+            const params = storageFormParams();
+            if (editingStorageId)
+                await api.request("storage.update", { id: editingStorageId, ...params });
+            else
+                await api.request("storage.create", params);
+            storageDialog.close();
+            await refresh();
+            setNotice("Storage destination saved", "success");
+        } catch (error) {
+            errorNode.textContent = failureMessage(error);
+        }
+    }
+
+    async function testStoredDestination(destination) {
+        const resultNode = document.getElementById("storage-test-result");
+        try {
+            resultNode.hidden = false;
+            resultNode.className = "probe-result";
+            resultNode.textContent = `Testing Local destination ${destination.name}…`;
+            const result = await api.request("storage.test", { id: destination.id });
+            showProbeResult(resultNode, result);
+        } catch (error) {
+            showProbeResult(resultNode, null, failureMessage(error));
+        }
+    }
+
+    async function testStorageCandidate() {
+        const resultNode = document.getElementById("storage-dialog-test-result");
+        resultNode.hidden = true;
+        try {
+            const params = storageFormParams();
+            delete params.name;
+            delete params.make_default;
+            const result = await api.request("storage.test", params);
+            showProbeResult(resultNode, result);
+        } catch (error) {
+            showProbeResult(resultNode, null, failureMessage(error));
+        }
+    }
+
+    async function setDefaultStorage(destination) {
+        try {
+            setNotice(`Setting ${destination.name} as default…`, "loading");
+            await api.request("storage.set_default", { id: destination.id });
+            await refresh();
+            setNotice(`${destination.name} is now the default destination`, "success");
+        } catch (error) {
+            setNotice(failureMessage(error), "error");
+        }
     }
 
     function renderDiscoveredVms(model) {
@@ -545,11 +674,15 @@
 
     refreshButton.addEventListener("click", refresh);
     addJobButton.addEventListener("click", () => openJobDialog());
+    addStorageButton.addEventListener("click", () => openStorageDialog());
     document.getElementById("job-cancel").addEventListener("click", () => jobDialog.close());
     document.getElementById("job-vm").addEventListener("change", updateRegistrationNote);
     document.getElementById("job-schedule").addEventListener("change", event => {
         document.getElementById("interval-fields").hidden = event.target.value !== "interval";
     });
     jobForm.addEventListener("submit", saveJob);
+    document.getElementById("storage-cancel").addEventListener("click", () => storageDialog.close());
+    document.getElementById("storage-test-candidate").addEventListener("click", testStorageCandidate);
+    storageForm.addEventListener("submit", saveStorage);
     refresh();
 }());

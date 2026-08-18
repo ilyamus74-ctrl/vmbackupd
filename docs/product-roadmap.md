@@ -125,8 +125,8 @@ RUNNING/mutation-disabled presentation.
 
 Phase 3E.5 adds Backup Job creation/editing, enable/disable, and guarded Run now
 through the same allow-listed API. Discovered VMs can be registered explicitly
-as the first save step. FULL is fixed; storage CRUD and broader configuration
-remain Phase 3E.6. Runs snapshot their destination, so editing a job affects
+as the first save step. FULL is fixed; Local storage management follows in
+Phase 3E.6 below. Runs snapshot their destination, so editing a job affects
 future runs only. Manual Cockpit 345 source/development-browser acceptance
 passed against schema v2: the existing successful FULL run and `AVAILABLE`
 restore point rendered, Edit populated and saved job metadata with a complete
@@ -135,6 +135,17 @@ schedule, and retention controls, FULL remained fixed, and Run now remained
 disabled with libvirt mutation off. The edited job was restored afterward; no
 backup ran and no second job was intentionally persisted. Packaged Phase 3E.5
 browser validation remains pending, and peer/node overview remains Phase 3F.
+
+Phase 3E.6 adds operational Local destination creation, editing, default
+selection, and bounded daemon-side testing. SQLite is authoritative after the
+one-time TOML seed. The revised schema v4 keeps `daemon.control_root` private,
+defines StorageDestination as the user Backup location, separates staging and
+published artifact identities, and publishes each new success as a
+self-contained bundle. Existing v3 published backups remain in place. Physical
+destination identity locks once history references it; name and reserves stay
+mutable. No destination deletion, remote type, or TOML editing is introduced.
+Packaged Phase 3E.6 browser validation remains pending. SSH/rsync and peer-node
+storage remain Phase 3F and will transfer the same complete bundle.
 
 Future retention deletion is constrained by a permanent fail-safe contract:
 **no new valid backup means no automatic deletion**. Automatic expiration is a

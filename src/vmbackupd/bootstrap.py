@@ -48,9 +48,11 @@ class StorageRoutingExecutor:
         )
         if destination.node_id != vm.node_id:
             raise DomainInvariantError("STORAGE_DESTINATION_NOT_LOCAL")
-        if destination.id not in self.executors:
-            self.executors[destination.id] = self.factory(destination)
-        return self.executors[destination.id]
+        cached = self.executors.get(destination.id)
+        if cached is None or cached[0] != destination:
+            cached = (destination, self.factory(destination))
+            self.executors[destination.id] = cached
+        return cached[1]
 
     def prepare_advance(self, run_id, daemon_instance_id, now):
         self._for_run(run_id).prepare_advance(run_id, daemon_instance_id, now)
@@ -141,7 +143,7 @@ class RuntimeWorker:
 
             def executor_for(destination):
                 staging = StagingFilesystem(
-                    destination.control_root, destination.backup_data_root,
+                    self.config.daemon.control_root, destination.backup_data_root,
                     backup_data_uid=destination.backup_data_uid,
                     backup_data_gid=destination.backup_data_gid,
                     backup_data_mode=destination.backup_data_mode,
@@ -206,14 +208,16 @@ def compose(config: AppConfig) -> Components:
     node = repository.get_or_create_node(config.daemon.node_name)
     intended = [StorageDestination(
         node_id=node.id,
-        name=item.name, control_root=str(item.control_root),
+        name=item.name,
         backup_data_root=str(item.backup_data_root), backup_data_mode=item.backup_data_mode,
         backup_data_uid=item.backup_data_uid, backup_data_gid=item.backup_data_gid,
         minimum_free_bytes=item.minimum_free_bytes,
         minimum_free_percent=item.minimum_free_percent,
         is_default=item.name == config.storage.default_destination,
     ) for item in config.storage.destinations]
-    repository.sync_storage_destinations(node.id, intended, config.storage.default_destination)
+    repository.bootstrap_storage_destinations(
+        node.id, intended, config.storage.default_destination
+    )
     read_driver = VirshLibvirtDriver(SubprocessCommandRunner(), config.libvirt.uri)
     runtime = RuntimeWorker(config, node.id)
     application = VmbackupApplication(repository, runtime, read_driver, config, node, clock,

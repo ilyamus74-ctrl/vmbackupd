@@ -145,7 +145,7 @@ def test_packaged_config_is_safe_and_resolves_auto_node(tmp_path):
     assert config.daemon.socket_path == Path("/run/vmbackupd/vmbackupd.sock")
     assert config.libvirt.uri == "qemu:///system"
     assert config.libvirt.allow_mutation is False
-    assert config.storage.default.control_root == Path("/var/lib/vmbackupd/control")
+    assert config.daemon.control_root == Path("/var/lib/vmbackupd/control")
     assert config.storage.default.backup_data_root == Path(
         "/var/lib/libvirt/images/vmbackupd"
     )

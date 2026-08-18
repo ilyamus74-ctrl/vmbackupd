@@ -35,6 +35,7 @@ TOML = """[daemon]
 node_name = "local"
 database_path = "{db}"
 socket_path = "{sock}"
+control_root = "{control}"
 socket_mode = "0660"
 tick_interval_seconds = 0.01
 controller_lease_seconds = 30
@@ -46,7 +47,6 @@ allow_mutation = false
 default_destination = "default"
 [[storage.destinations]]
 name = "default"
-control_root = "{control}"
 backup_data_root = "{data}"
 backup_data_mode = "0750"
 minimum_free_bytes = 0
@@ -66,11 +66,24 @@ def test_valid_toml_configuration_and_defaults(tmp_path):
     assert config.daemon.socket_mode == 0o660
     assert config.libvirt.allow_mutation is False
     assert config.storage.default.backup_data_mode == 0o750
+    assert config.daemon.control_root == tmp_path / "control"
+
+
+def test_legacy_destination_control_root_is_rejected(tmp_path):
+    path = write_config(tmp_path)
+    text = path.read_text().replace(
+        'name = "default"',
+        f'name = "default"\ncontrol_root = "{tmp_path / "legacy-control"}"',
+    )
+    path.write_text(text)
+    with pytest.raises(ConfigError, match=r"control_root is obsolete.*daemon.control_root"):
+        load_config(path)
 
 
 @pytest.mark.parametrize("replacement", [
     ("database_path = ", 'database_path = "relative.db" # '),
     ('socket_mode = "0660"', 'socket_mode = "0666"'),
+    ('control_root = ', 'control_root = "/var/lib/x/../control" # '),
         ('backup_data_mode = "0750"', 'backup_data_mode = "0777"'),
 ])
 def test_invalid_configuration_is_rejected(tmp_path, replacement):
@@ -100,7 +113,6 @@ def test_multiple_storage_destinations_default_and_validation(tmp_path):
                        control=tmp_path / "control-a", data=tmp_path / "data-a")
     text += f'''\n[[storage.destinations]]
 name = "second"
-control_root = "{tmp_path / 'control-b'}"
 backup_data_root = "{tmp_path / 'data-b'}"
 backup_data_mode = "0750"
 minimum_free_bytes = 10
@@ -131,8 +143,9 @@ class Driver:
 def app(tmp_path):
     repository = SQLiteRepository()
     node = repository.get_or_create_node("local")
-    destination = StorageDestination("default", str(tmp_path / "control"),
-                                     str(tmp_path / "data"), node.id, is_default=True)
+    destination = StorageDestination(
+        "default", str(tmp_path / "data"), node.id, is_default=True
+    )
     repository.add_storage_destination(destination)
     config = AppConfig(DaemonConfig("local", tmp_path / "state.db", tmp_path / "api.sock"),
                        LibvirtConfig(allow_mutation=False),
@@ -191,8 +204,7 @@ def test_job_creation_uses_default_storage_and_lists(app):
 
 
 def test_jobs_select_different_destinations_and_persist(app, tmp_path):
-    second = StorageDestination("second", str(tmp_path / "control-2"),
-                                str(tmp_path / "data-2"), app.node.id)
+    second = StorageDestination("second", str(tmp_path / "data-2"), app.node.id)
     app.repository.add_storage_destination(second)
     vm = app.dispatch("vm.register", {"external_id": "guest"})
     first = app.dispatch("job.create", {"vm_id": vm["id"], "name": "first"})
@@ -208,7 +220,6 @@ def test_storage_catalog_and_job_selection_survive_restart(tmp_path):
                        control=tmp_path / "control-a", data=tmp_path / "data-a")
     text += f'''\n[[storage.destinations]]
 name = "second"
-control_root = "{tmp_path / 'control-b'}"
 backup_data_root = "{tmp_path / 'data-b'}"
 backup_data_mode = "0750"
 minimum_free_bytes = 0
@@ -343,7 +354,7 @@ def test_api_lists_status_and_objects(app, tmp_path):
                 ).encode() + b"\n")
                 assert response["ok"] is True
                 if method == "daemon.status":
-                    assert response["result"]["database_schema_version"] == 2
+                    assert response["result"]["database_schema_version"] == 4
             assert (await exchange(server.socket_path, json.dumps(
                 {"version": 1, "id": "show", "method": "vm.show", "params": {"id": vm["id"]}}
             ).encode() + b"\n"))["result"]["id"] == vm["id"]
@@ -461,8 +472,7 @@ def test_local_api_excludes_foreign_node_operational_state(app):
     app.repository.add_run(eu_run)
     ua = Node("UA"); app.repository.add_node(ua)
     ua_destination = StorageDestination(
-        node_id=ua.id, name="ua-root", control_root="/ua-control",
-        backup_data_root="/ua-data", is_default=True,
+        node_id=ua.id, name="ua-root", backup_data_root="/ua-data", is_default=True,
     )
     app.repository.add_storage_destination(ua_destination)
     ua_vm = VM(ua.id, "ua-vm", "ua-vm"); app.repository.add_vm(ua_vm)
@@ -509,10 +519,8 @@ def test_sigterm_stops_foreground_entrypoint_cleanly(tmp_path):
 
 def node_destinations(node, tmp_path, prefix):
     return [
-        StorageDestination("local-root", str(tmp_path / prefix / "control-root"),
-                           str(tmp_path / prefix / "data-root"), node.id),
-        StorageDestination("local-home", str(tmp_path / prefix / "control-home"),
-                           str(tmp_path / prefix / "data-home"), node.id),
+        StorageDestination("local-root", str(tmp_path / prefix / "data-root"), node.id),
+        StorageDestination("local-home", str(tmp_path / prefix / "data-home"), node.id),
     ]
 
 
@@ -558,7 +566,7 @@ def test_storage_destinations_and_defaults_are_independent_per_node(tmp_path):
     repository.sync_storage_destinations(
         eu.id, node_destinations(eu, tmp_path, "eu"), "local-home"
     )
-    assert repository.get_default_storage_destination(eu.id).name == "local-home"
+    assert repository.get_default_storage_destination(eu.id).name == "local-root"
     assert repository.get_default_storage_destination(ua.id).name == "local-home"
     eu_ids = {item.name: item.id for item in repository.list_storage_destinations(eu.id)}
     repository.close()
@@ -571,10 +579,8 @@ def test_storage_destinations_and_defaults_are_independent_per_node(tmp_path):
 def test_storage_api_and_structured_events_are_node_scoped(app, tmp_path):
     eu = app.node
     ua = Node("UA"); app.repository.add_node(ua)
-    for destination in node_destinations(ua, tmp_path, "ua"):
-        app.repository.add_storage_destination(destination)
-    app.repository.sync_storage_destinations(
-        ua.id, app.repository.list_storage_destinations(ua.id), "local-root"
+    app.repository.bootstrap_storage_destinations(
+        ua.id, node_destinations(ua, tmp_path, "ua"), "local-root"
     )
     assert all(item["node_id"] == eu.id for item in app.dispatch("storage.list", {}))
     foreign = app.repository.get_default_storage_destination(ua.id)

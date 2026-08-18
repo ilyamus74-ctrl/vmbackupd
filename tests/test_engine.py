@@ -31,7 +31,7 @@ def advance_to_finalizing(repository, job):
 def add_domain(repository, name, max_incrementals):
     node = Node(name=f"node-{name}")
     repository.add_node(node)
-    destination = StorageDestination("local", "/control", "/data", node.id, is_default=True)
+    destination = StorageDestination("local", "/data", node.id, is_default=True)
     repository.add_storage_destination(destination)
     vm = VM(node_id=node.id, name=name, external_id=name)
     repository.add_vm(vm)

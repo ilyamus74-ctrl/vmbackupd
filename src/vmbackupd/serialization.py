@@ -43,6 +43,7 @@ def run(value: JobRun) -> dict:
 def restore_point(value: RestorePoint) -> dict:
     return {"id": value.id, "chain_id": value.chain_id, "job_run_id": value.job_run_id,
             "kind": value.kind.value, "sequence": value.sequence, "status": value.status.value,
+            "bundle_object_id": value.bundle_object_id,
             "parent_restore_point_id": value.parent_restore_point_id,
             "libvirt_checkpoint_name": value.libvirt_checkpoint_name,
             "created_at": value.created_at.isoformat()}
@@ -57,11 +58,13 @@ def event(value: Event) -> dict:
             "created_at": value.created_at.isoformat()}
 
 
-def storage(value: StorageDestination, *, free_bytes: int | None) -> dict:
+def storage(value: StorageDestination, *, free_bytes: int | None,
+            identity_locked: bool = False) -> dict:
     return {"id": value.id, "name": value.name, "is_default": value.is_default,
             "node_id": value.node_id,
-            "control_root": value.control_root, "backup_data_root": value.backup_data_root,
+            "backup_data_root": value.backup_data_root,
             "backup_data_mode": format(value.backup_data_mode, "04o"),
             "minimum_free_bytes": value.minimum_free_bytes,
             "minimum_free_percent": value.minimum_free_percent,
-            "free_bytes": free_bytes}
+            "free_bytes": free_bytes, "identity_locked": identity_locked,
+            "type": "Local"}

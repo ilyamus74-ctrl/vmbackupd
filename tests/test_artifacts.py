@@ -2,6 +2,7 @@ import sqlite3
 
 import pytest
 
+from vmbackupd.bundle import BundlePathPlanner
 from vmbackupd.models import (
     ArtifactKind, ArtifactState, BackupArtifact, BackupKind, JobRun,
     LibvirtBackupOperation, RunState,
@@ -23,13 +24,33 @@ def finalizing_run(repository, job):
 
 def add_artifacts(repository, run, *, verified=True):
     state = ArtifactState.VERIFIED if verified else ArtifactState.PLANNED
+    job = repository.get_job(run.job_id)
+    vm = repository.get_vm(job.vm_id)
+    destination = repository.get_storage_destination(vm.node_id, run.storage_destination_id)
+    bundle = BundlePathPlanner(destination.backup_data_root).final(
+        vm.id, run.id, run.created_at
+    )
     artifacts = [
         BackupArtifact(job_run_id=run.id, kind=ArtifactKind.DISK, disk_target="vda",
-                       object_id=f"/staging/{run.id}/vda.qcow2", format="qcow2", state=state),
+                       object_id=f"/staging/{run.id}/vda.qcow2",
+                       published_object_id=(str(bundle / "disks/vda.qcow2")
+                                            if verified else None),
+                       format="qcow2", state=state),
         BackupArtifact(job_run_id=run.id, kind=ArtifactKind.DISK, disk_target="vdb",
-                       object_id=f"/staging/{run.id}/vdb.qcow2", format="qcow2", state=state),
+                       object_id=f"/staging/{run.id}/vdb.qcow2",
+                       published_object_id=(str(bundle / "disks/vdb.qcow2")
+                                            if verified else None),
+                       format="qcow2", state=state),
         BackupArtifact(job_run_id=run.id, kind=ArtifactKind.DOMAIN_XML,
-                       object_id=f"/staging/{run.id}/domain.xml", format="xml", state=state),
+                       object_id=f"/staging/{run.id}/domain.xml",
+                       published_object_id=(str(bundle / "metadata/domain.xml")
+                                            if verified else None),
+                       format="xml", state=state),
+        BackupArtifact(job_run_id=run.id, kind=ArtifactKind.MANIFEST,
+                       object_id=f"/staging/{run.id}/manifest.json",
+                       published_object_id=(str(bundle / "metadata/manifest.json")
+                                            if verified else None),
+                       format="json", state=state),
     ]
     for artifact in artifacts:
         repository.add_artifact(artifact)
@@ -48,7 +69,7 @@ def test_multi_disk_artifacts_publish_atomically_and_are_queryable(domain):
     assert result.state is RunState.SUCCESS
     assert [(a.kind, a.disk_target) for a in published] == [
         (ArtifactKind.DISK, "vda"), (ArtifactKind.DISK, "vdb"),
-        (ArtifactKind.DOMAIN_XML, None),
+        (ArtifactKind.DOMAIN_XML, None), (ArtifactKind.MANIFEST, None),
     ]
     assert all(a.state is ArtifactState.PUBLISHED for a in published)
     assert {a.id for a in repository.list_artifacts_for_run(run.id)} == {a.id for a in published}
@@ -76,7 +97,9 @@ def test_publication_failure_rolls_back_and_preserves_verified_artifacts(domain)
         repository.finalize_success(run.id)
     assert repository.get_run(run.id).state is RunState.FINALIZING
     assert repository.list_restore_points(vm.id) == []
-    assert [repository.get_artifact(a.id).state for a in artifacts] == [ArtifactState.VERIFIED] * 3
+    assert [repository.get_artifact(a.id).state for a in artifacts] == [
+        ArtifactState.VERIFIED
+    ] * len(artifacts)
     assert repository.list_chains(vm.id) == []
 
 

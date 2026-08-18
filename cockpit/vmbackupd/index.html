@@ -61,13 +61,17 @@
     </section>
 
     <section aria-labelledby="storage-title">
-      <h2 id="storage-title">Storage</h2>
+      <div class="section-heading">
+        <h2 id="storage-title">Storage</h2>
+        <button id="add-storage" type="button" class="primary-action">Add destination</button>
+      </div>
       <div class="table-scroll">
         <table class="operational-table">
-          <thead><tr><th>Name</th><th>Type</th><th>Default</th><th>Free</th><th>Reserve</th><th>Usable after byte reserve</th><th>Backup data root</th></tr></thead>
+          <thead><tr><th>Name</th><th>Type</th><th>Default</th><th>Free</th><th>Reserve</th><th>Usable after byte reserve</th><th>Backup location</th><th>Actions</th></tr></thead>
           <tbody id="storage"></tbody>
         </table>
       </div>
+      <p id="storage-test-result" class="probe-result" role="status" hidden></p>
       <p class="table-note">Usable space subtracts only the configured byte reserve; VM-specific capacity preflight and percentage reserve still apply.</p>
     </section>
 
@@ -106,6 +110,22 @@
       <label>Minimum full chains<input id="job-minimum-chains" type="number" min="1" value="1" required></label>
       <p id="job-form-error" class="form-error" role="alert"></p>
       <div class="dialog-actions"><button id="job-cancel" type="button">Cancel</button><button class="primary-action" type="submit">Save job</button></div>
+    </form>
+  </dialog>
+  <dialog id="storage-dialog" aria-labelledby="storage-dialog-title">
+    <form id="storage-form">
+      <h2 id="storage-dialog-title">Add destination</h2>
+      <label>Name<input id="storage-name" required maxlength="200"></label>
+      <label>Type<input value="Local" readonly aria-readonly="true"></label>
+      <label class="path-field">Backup location<input id="storage-data-root" required><small>Stores the complete VM backup bundle: disk data and durable restore metadata.</small></label>
+      <p id="storage-identity-note" class="form-note" hidden>This destination is referenced by backup history. Create a new destination to move future backups.</p>
+      <div class="reserve-fields"><label>Minimum free space<input id="storage-minimum-value" type="number" min="0" step="1" value="0" required></label><label>Unit<select id="storage-minimum-unit"><option value="1">Bytes</option><option value="1048576">MiB</option><option value="1073741824">GiB</option></select></label></div>
+      <label>Minimum free percent<input id="storage-minimum-percent" type="number" min="0" max="100" step="0.1" value="5" required></label>
+      <label class="check-label"><input id="storage-default" type="checkbox"> Make default</label>
+      <p id="storage-default-note" class="form-note" hidden>This is the current default. Set another destination as default to change it.</p>
+      <p id="storage-dialog-test-result" class="probe-result" role="status" hidden></p>
+      <p id="storage-form-error" class="form-error" role="alert"></p>
+      <div class="dialog-actions"><button id="storage-cancel" type="button">Cancel</button><button id="storage-test-candidate" type="button">Test</button><button class="primary-action" type="submit">Save destination</button></div>
     </form>
   </dialog>
 </body>

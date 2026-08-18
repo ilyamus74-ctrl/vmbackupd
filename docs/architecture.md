@@ -7,8 +7,9 @@ Cockpit frontend: its validated operational dashboard reads remain read-only,
 and Phase 3E.5 adds only an explicit job-management mutation boundary.
 The shared RPM spec now produces a separate `cockpit-vmbackupd` binary
 subpackage from the same source RPM. Job metadata management and guarded Run
-now are now implemented through explicit API methods. Storage CRUD, remote
-networking, incremental execution, restore
+now are now implemented through explicit API methods. Local storage
+create/update/default/test are implemented; storage deletion, remote storage
+and networking, incremental execution, restore
 execution, retention deletion, additional hypervisor mutations, SELinux
 Enforcing validation, and packaged-account read-write `backup-begin`
 authorization remain pending. This is not a production-readiness claim.
@@ -43,11 +44,28 @@ incremental parent restore-point ID. SQLite-backed repository validation rejects
 entry into `BACKING_UP` without this plan.
 
 Generic transitions cannot produce `SUCCESS`. `finalize_success` is the only
-publication path. In one SQLite transaction it validates the run, job, VM,
+database publication path. Before it runs, a new local backup has been verified
+and its entire `.incoming/<run-id>` directory atomically renamed to its final
+self-contained bundle path on the same filesystem. In one SQLite transaction
+`finalize_success` validates the run, job, VM,
 chain, sequence, kind, and parent relationships; applies chain lifecycle
 changes; creates the `AVAILABLE` restore point; moves the run to `SUCCESS`; and
 records its transition event. Any failure rolls all of this work back, leaving
 the run in `FINALIZING` with no partially published state.
+
+StorageDestination means the user backup destination, not daemon workspace.
+Its Backup location contains new self-contained bundles with `disks/` and
+durable `metadata/domain.xml`, `manifest.json`, and `restore-point.json`.
+`daemon.control_root/<run-id>` holds private execution files such as
+`backup.xml`. An incoming directory is never an AVAILABLE restore point.
+Filesystem publication precedes SQLite publication; if the latter fails, the
+final bundle is preserved as recovery evidence and success is not inferred.
+Artifact `object_id` retains staging identity while `published_object_id`
+records the final durable path. New RestorePoints also store the common final
+bundle root as `bundle_object_id`; their compatibility `backup_object_id`
+continues to identify the first published disk. Existing pre-v4 restore points
+retain a NULL bundle identity and published backups remain valid in their
+legacy in-place layout without being moved.
 
 ## Chain lifecycle
 
@@ -187,9 +205,9 @@ Local `TRANSFERRING` is a no-op pending a peer layer. Verified multi-artifact
 output continues through the existing atomic publication transaction. See
 [`libvirt-execution.md`](libvirt-execution.md).
 
-Phase 3B.1 separates daemon-owned control artifacts from QEMU-created disk data,
-including independently configurable roots and free-space accounting on the
-data filesystem. Data-directory mode and optional ownership are explicit; no
+Phase 3B.1 separates the one daemon-owned control workspace from destination
+disk data and free-space accounting on the destination filesystem.
+Data-directory mode and optional ownership are explicit; no
 QEMU UID/GID is embedded in the backend.
 
 Live integration established that system libvirt may leave a QEMU-created push
@@ -221,8 +239,9 @@ closes SQLite, and removes its socket without claiming external completion.
 `vmbackupctl` is only a versioned JSON-lines UNIX API client. Explicit
 serializers define the public schema. Backup requests atomically create a
 SCHEDULED run after mutation, locality, busy, and quarantine checks, then return
-without driving execution. Persisted StorageDestinations select control/data
-roots and capacity status per job. See [`local-api.md`](local-api.md),
+without driving execution. Persisted StorageDestinations select the Backup
+location and capacity policy per job; the one private control workspace comes
+from `daemon.control_root`. See [`local-api.md`](local-api.md),
 [`cli.md`](cli.md), and [`configuration.md`](configuration.md).
 
 Local control-plane authorization is enforced by UNIX filesystem credentials.
@@ -265,8 +284,8 @@ Unknown, malformed, damaged, or newer schemas fail closed. See
 
 StorageDestination is Node-owned local operational configuration. Names and the
 single default are scoped by `node_id`; job creation and runtime routing enforce
-that VM and destination share a Node. Local configuration synchronization never
-mutates another Node's destinations.
+that VM and destination share a Node. TOML seeding applies only when the local
+Node has no destinations and never mutates another Node's catalog.
 
 Runtime worker health is explicit: `STARTING`, `RUNNING`, `STOPPING`, `STOPPED`,
 or `FAILED`. A fatal tick captures a safe error, conservatively stops runtime,
@@ -365,3 +384,24 @@ FULL remained fixed and Run now remained disabled while libvirt mutation was
 disabled. The edited job was restored to its original name and retention; no
 backup executed and no second job was intentionally persisted. This is not yet
 packaged Phase 3E.5 browser validation or a production-readiness claim.
+
+## Phase 3E.6 Local storage management
+
+TOML destinations seed only an uninitialized local Node; SQLite is the
+operational catalog afterward, so API/Cockpit edits survive restart. Local
+create, update, default, and test operations are explicit daemon methods.
+Roots are lexically absolute and traversal-free. A non-empty Node catalog must
+contain exactly one default; schema validation and bootstrap fail closed rather
+than repairing a missing default.
+Schema v3 locks a destination's physical roots and execution access identity
+once a run references it, while name, reserves, and default remain mutable.
+Moving future work means creating destination B and editing jobs to B;
+historical runs remain bound to A. Default changes never move existing jobs.
+
+The diagnostic test rejects the same complete symlink path chain as staging,
+then uses bounded exclusive probe files in the exact roots and reports daemon
+writability and free/reserve status. It invokes no libvirt, QEMU,
+or backup operation. Destination deletion is absent because jobs, immutable run
+history, restore lineage, and physical objects require an explicit future
+destructive design. Local is the only current type; SSH/rsync and peers remain
+Phase 3F. This is not a production-readiness claim.

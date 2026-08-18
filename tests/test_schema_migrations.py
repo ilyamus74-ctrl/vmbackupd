@@ -27,8 +27,7 @@ def populated_database(path):
     node = Node(name="local")
     repository.add_node(node)
     destination = StorageDestination(
-        node_id=node.id, name="local-root", control_root="/control",
-        backup_data_root="/data", is_default=True,
+        node_id=node.id, name="local-root", backup_data_root="/data", is_default=True,
     )
     repository.add_storage_destination(destination)
     vm = VM(node_id=node.id, name="guest", external_id="guest",
@@ -54,6 +53,11 @@ def make_unversioned(path, *, legacy=False):
     connection.execute("DROP TRIGGER job_runs_destination_required_insert")
     connection.execute("DROP TRIGGER job_runs_destination_required_update")
     connection.execute("DROP TRIGGER job_runs_destination_immutable")
+    connection.execute("DROP TRIGGER storage_destination_identity_immutable_after_run")
+    connection.execute("ALTER TABLE storage_destinations ADD COLUMN control_root TEXT")
+    connection.execute("UPDATE storage_destinations SET control_root = '/control'")
+    connection.execute("ALTER TABLE backup_artifacts DROP COLUMN published_object_id")
+    connection.execute("ALTER TABLE restore_points DROP COLUMN bundle_object_id")
     connection.execute("ALTER TABLE job_runs DROP COLUMN storage_destination_id")
     if legacy:
         connection.execute("ALTER TABLE backup_artifacts DROP COLUMN planned_capacity")

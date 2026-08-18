@@ -23,6 +23,7 @@ from vmbackupd.models import (
     LibvirtExternalState, Node, RetentionPolicy, RunState, StorageDestination, VM,
 )
 from vmbackupd.repository import SQLiteRepository
+from vmbackupd.serialization import restore_point as serialize_restore_point
 
 
 DOMAIN_XML = """<domain type='kvm'><name>guest</name><uuid>domain-uuid</uuid><devices>
@@ -130,8 +131,7 @@ def execution(tmp_path):
     node = Node("local")
     repository.add_node(node)
     destination = StorageDestination(
-        "local", str(tmp_path / "control"), str(tmp_path / "backup-data"),
-        node.id, is_default=True,
+        "local", str(tmp_path / "backup-data"), node.id, is_default=True,
     )
     repository.add_storage_destination(destination)
     vm = VM(node.id, "guest", "guest")
@@ -212,7 +212,7 @@ def test_start_creates_control_files_and_fresh_prepared_disk_targets(execution):
     assert run_dir.is_dir()
     assert (run_dir / "domain.xml").is_file()
     assert (run_dir / "backup.xml").is_file()
-    data_dir = execution[5].data_run_directory(run.id)
+    data_dir = execution[5].data_disks_directory(run.id)
     assert data_dir.is_dir()
     assert (data_dir / "vda.qcow2").is_file()
     assert (data_dir / "vdb.qcow2").is_file()
@@ -394,7 +394,7 @@ def prepare_verification(execution):
     value = complete_healthy(execution)
     value.advance_run(execution[3].id)
     control_dir = execution[5].run_directory(execution[3].id)
-    data_dir = execution[5].data_run_directory(execution[3].id)
+    data_dir = execution[5].data_disks_directory(execution[3].id)
     (data_dir / "vda.qcow2").write_bytes(b"a")
     (data_dir / "vdb.qcow2").write_bytes(b"bb")
     return value, control_dir, data_dir
@@ -438,6 +438,66 @@ def test_manifest_contains_all_disks_and_verified_artifacts_finalize_atomically(
     )
     assert value.advance_run(result.id).state is RunState.SUCCESS
     assert len(execution[0].list_restore_points(execution[1].id)) == 1
+
+
+def test_finalizing_publishes_self_contained_bundle_before_database_success(execution):
+    value, _, _ = prepare_verification(execution)
+    run = execution[3]
+    assert value.advance_run(run.id).state is RunState.FINALIZING
+    before = execution[0].list_artifacts_for_run(run.id)
+    execution_paths = {item.id: item.object_id for item in before}
+    result = value.advance_run(run.id)
+    assert result.state is RunState.SUCCESS
+    artifacts = execution[0].list_artifacts_for_run(run.id)
+    assert all(item.published_object_id for item in artifacts)
+    assert {item.id: item.object_id for item in artifacts} == execution_paths
+    disk = next(item for item in artifacts if item.kind is ArtifactKind.DISK)
+    published = Path(disk.published_object_id)
+    metadata = published.parent.parent / "metadata"
+    restore = json.loads((metadata / "restore-point.json").read_text())
+    assert restore["bundle_id"] == run.id
+    assert restore["vm"]["id"] == execution[1].id
+    assert restore["disks"][0]["relative_path"].startswith("disks/")
+    assert "filesystem_published_at" not in restore
+    assert restore["backup_completed_at"] is not None
+    point = execution[0].list_restore_points(execution[1].id)[0]
+    assert point.bundle_object_id == str(published.parent.parent)
+    assert point.backup_object_id == disk.published_object_id
+    assert serialize_restore_point(point)["bundle_object_id"] == point.bundle_object_id
+
+
+def test_filesystem_publication_failure_never_creates_success(execution):
+    value, _, _ = prepare_verification(execution)
+    run = execution[3]
+    assert value.advance_run(run.id).state is RunState.FINALIZING
+    vm = execution[1]
+    value.bundle_planner.final(vm.id, run.id, run.created_at).mkdir(parents=True)
+    result = value.advance_run(run.id)
+    assert result.state is RunState.FINALIZING
+    assert result.recovery_required is True
+    assert execution[0].list_restore_points(vm.id) == []
+
+
+def test_database_failure_after_bundle_rename_preserves_final_bundle(execution):
+    value, _, _ = prepare_verification(execution)
+    run = execution[3]
+    assert value.advance_run(run.id).state is RunState.FINALIZING
+    execution[0].connection.execute(
+        """CREATE TRIGGER reject_success BEFORE UPDATE OF state ON job_runs
+           WHEN NEW.state='SUCCESS' BEGIN SELECT RAISE(ABORT, 'forced DB failure'); END"""
+    )
+    final = value.bundle_planner.final(execution[1].id, run.id, run.created_at)
+    result = value.advance_run(run.id)
+    assert final.is_dir()
+    assert result.recovery_required is True
+    assert result.state is RunState.FINALIZING
+    assert execution[0].list_restore_points(execution[1].id) == []
+    execution[0].connection.execute("DROP TRIGGER reject_success")
+    execution[0].connection.commit()
+    execution[0].clear_recovery_required(run.id, "operator reconciled", value.clock.now())
+    retried = value.advance_run(run.id)
+    assert retried.state is RunState.SUCCESS
+    assert execution[0].list_restore_points(execution[1].id)[0].bundle_object_id == str(final)
 
 
 def test_mutating_driver_surface_is_exact_argv_with_restricted_reuse_external(tmp_path):
@@ -630,7 +690,7 @@ def test_completed_backup_outputs_still_use_qemu_img_during_verification(executi
     )
     value.advance_run(execution[3].id)
     value.advance_run(execution[3].id)
-    data_dir = execution[5].data_run_directory(execution[3].id)
+    data_dir = execution[5].data_disks_directory(execution[3].id)
     (data_dir / "vda.qcow2").write_bytes(b"a")
     (data_dir / "vdb.qcow2").write_bytes(b"b")
     value.image_inspector = images
@@ -644,7 +704,7 @@ def test_planned_artifacts_separate_control_and_backup_data_roots(execution):
     for artifact in artifacts:
         path = Path(artifact.object_id)
         if artifact.kind is ArtifactKind.DISK:
-            assert path.parent == staging.data_run_directory(execution[3].id)
+            assert path.parent == staging.data_disks_directory(execution[3].id)
         else:
             assert path.parent == staging.run_directory(execution[3].id)
     assert staging.backup_xml_path(execution[3].id).parent == staging.run_directory(
@@ -679,7 +739,8 @@ def test_free_space_is_measured_on_backup_data_root(execution, monkeypatch):
 
 def filesystem_artifacts(control_root, data_root, run_id="safe-run"):
     return [
-        BackupArtifact(run_id, ArtifactKind.DISK, str(data_root / run_id / "sda.qcow2"),
+        BackupArtifact(run_id, ArtifactKind.DISK,
+                       str(data_root / ".incoming" / run_id / "disks" / "sda.qcow2"),
                        disk_target="sda", format="qcow2"),
         BackupArtifact(run_id, ArtifactKind.DOMAIN_XML,
                        str(control_root / run_id / "domain.xml"), format="xml"),
@@ -697,10 +758,13 @@ def test_data_directory_mode_and_optional_ownership_are_explicit(tmp_path):
         chown=lambda path, uid, gid: calls.append((Path(path), uid, gid)),
     )
     staging.prepare_new_run("safe-run", filesystem_artifacts(control, data))
-    data_dir = staging.data_run_directory("safe-run")
+    data_dir = staging.data_disks_directory("safe-run")
     assert data_dir.stat().st_mode & 0o777 == 0o750
     assert staging.run_directory("safe-run").stat().st_mode & 0o777 == 0o700
-    assert calls == [(data_dir, -1, 456)]
+    assert calls == [
+        (staging.data_run_directory("safe-run"), -1, 456),
+        (data_dir, -1, 456),
+    ]
     assert not any(data_dir.iterdir())
 
 
@@ -717,7 +781,7 @@ def test_optional_data_ownership_is_deterministic(tmp_path, uid, gid, expected):
         chown=lambda path, actual_uid, actual_gid: calls.append((actual_uid, actual_gid)),
     )
     staging.prepare_new_run("safe-run", filesystem_artifacts(control, data))
-    assert calls == ([] if expected is None else [expected])
+    assert calls == ([] if expected is None else [expected, expected])
 
 
 def test_data_directory_cannot_be_transferred_to_a_different_user(tmp_path):
@@ -737,7 +801,7 @@ def test_world_writable_data_mode_is_forbidden(tmp_path):
 
 def test_existing_data_directory_is_refused(tmp_path):
     control, data = tmp_path / "control", tmp_path / "data"
-    (data / "safe-run").mkdir(parents=True)
+    (data / ".incoming" / "safe-run").mkdir(parents=True)
     staging = StagingFilesystem(control, data)
     with pytest.raises(LibvirtExecutionSafetyError, match="data run directory"):
         staging.prepare_new_run("safe-run", filesystem_artifacts(control, data))

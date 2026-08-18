@@ -93,7 +93,10 @@ class RetentionPlanner:
             key=lambda artifact: (artifact.restore_point_id or "", artifact.id),
         )
         authoritative_objects = (
-            tuple(artifact.object_id for artifact in selected_artifacts)
+            tuple(
+                artifact.published_object_id or artifact.object_id
+                for artifact in selected_artifacts
+            )
             if artifacts is not None else tuple(legacy_objects)
         )
         return RetentionPlan(

@@ -24,12 +24,17 @@ Responses echo version and ID and contain either `ok: true` plus `result`, or
 oversized requests, unsupported versions, invalid parameters, unknown methods,
 domain rejection, and internal failure are distinct. Tracebacks are never sent.
 
-Methods are: `daemon.status`, `node.list`, `storage.list/show`,
+Methods are: `daemon.status`, `node.list`,
+`storage.list/show/create/update/set_default/test`,
 `vm.discover/list/show/register`, `job.list/show/create/update`, `backup.run`,
 `run.list/show`, `restore_point.list/show`, `recovery.list/show`, and
 `event.list`. `backup.run` only creates a SCHEDULED run and returns immediately.
 The runtime owns execution. Run progress exposes state and nullable byte fields;
 no synthetic percentage is reported.
+
+Restore-point serialization includes nullable `bundle_object_id`. New real v4
+backups set it to the self-contained bundle root; migrated legacy restore points
+remain NULL and retain their existing `backup_object_id`.
 
 Operational methods are scoped to the local Node. Job/run/recovery lists and
 status counts exclude foreign-node objects; show methods reject them. Restore
@@ -37,6 +42,21 @@ points are limited to local VMs. Unfiltered events include local-run events and
 node/daemon/controller events whose persisted identity ties them to this node.
 Storage list/show is also local-node scoped. A local job cannot select or route
 through a foreign Node's destination.
+
+Phase 3E.6 manages the local SQLite storage catalog. Create inherits the
+current default's daemon/QEMU access profile. Update permits name and reserve
+changes, but the Backup location only before any JobRun references the destination.
+`set_default` affects future implicit job selection and moves no existing job.
+`storage.test` uses one bounded exclusive probe file in the exact Local Backup
+location and
+reports daemon writability plus free/reserve state. Roots must be absolute and
+traversal-free, and the test rejects a symlink anywhere in the lexical path
+chain just as staging does. It is not a VM backup or proof of QEMU access. No
+storage delete method exists.
+
+Destination requests never accept `control_root`. The one private workspace is
+`daemon.control_root`; `daemon.status` may expose it diagnostically, but no API
+method mutates it.
 
 Socket paths must be absolute. Symlink parents and non-socket collisions are
 refused. A stale UNIX socket may be replaced only after a connection probe shows

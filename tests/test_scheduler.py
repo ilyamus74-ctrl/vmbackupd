@@ -16,8 +16,7 @@ def scheduled_domain(repository, *, due=START, interval=3600, grace=0, name="sch
     node = Node(name=f"node-{name}")
     repository.add_node(node)
     destination = StorageDestination(
-        node_id=node.id, name="local", control_root="/control",
-        backup_data_root="/data", is_default=True,
+        node_id=node.id, name="local", backup_data_root="/data", is_default=True,
     )
     repository.add_storage_destination(destination)
     vm = VM(node_id=node.id, name=name, external_id=name)

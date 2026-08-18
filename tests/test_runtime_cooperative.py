@@ -19,7 +19,7 @@ def domain():
     repository = SQLiteRepository()
     node = Node(name="cooperative-node")
     repository.add_node(node)
-    destination = StorageDestination("local", "/control", "/data", node.id, is_default=True)
+    destination = StorageDestination("local", "/data", node.id, is_default=True)
     repository.add_storage_destination(destination)
     vm1 = VM(node_id=node.id, name="vm1", external_id="vm1")
     vm2 = VM(node_id=node.id, name="vm2", external_id="vm2")
