@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import json
 import os
 import shutil
@@ -938,8 +940,27 @@ class LibvirtBackupExecutor:
             raise LibvirtExecutionSafetyError("; ".join(
                 f"{issue.code}: {issue.message}" for issue in preflight.errors
             ))
+        previous_full_physical = (
+            self._previous_successful_full_physical(
+                vm.id,
+                tuple(
+                    disk.target_dev
+                    for disk in plan.disks
+                    if disk.backup_enabled
+                ),
+            )
+        )
+
         estimate, capacities = self._capacity_estimate(
-            operation.domain_uuid, plan.disks
+            operation.domain_uuid,
+            plan.disks,
+            previous_full_physical=(
+                previous_full_physical
+            ),
+            margin_percent=(
+                job.retention_policy
+                .backup_size_margin_percent
+            ),
         )
 
         start_capacity = self._ensure_start_capacity(
@@ -1274,29 +1295,211 @@ class LibvirtBackupExecutor:
         self.staging.cleanup_metadata(run_id, self.repository.list_artifacts_for_run(run_id))
         return self.repository.finish_cleanup(run_id)
 
+    def _previous_successful_full_physical(
+        self,
+        vm_id: str,
+        disk_targets: tuple[str, ...],
+    ) -> dict[str, int]:
+        """Return trustworthy per-disk physical bytes from the latest FULL."""
+
+        wanted = tuple(dict.fromkeys(disk_targets))
+        if not wanted:
+            return {}
+
+        try:
+            points = self.repository.list_restore_points(vm_id)
+        except Exception:
+            # Historical sizing is advisory. Failure to read it must not
+            # replace the live/virtual fail-safe estimator.
+            return {}
+
+        previous = None
+
+        for point in reversed(points):
+            if point.kind is not BackupKind.FULL:
+                continue
+            if point.bundle_object_id is None:
+                continue
+
+            try:
+                source_run = self.repository.get_run(
+                    point.job_run_id
+                )
+            except KeyError:
+                continue
+
+            if source_run.state is not RunState.SUCCESS:
+                continue
+
+            previous = point
+            break
+
+        if previous is None:
+            return {}
+
+        try:
+            artifacts = (
+                self.repository.list_artifacts_for_restore_point(
+                    previous.id
+                )
+            )
+        except Exception:
+            return {}
+
+        disk_artifacts: dict[str, BackupArtifact] = {}
+
+        for artifact in artifacts:
+            if artifact.kind is not ArtifactKind.DISK:
+                continue
+
+            target = artifact.disk_target
+            if target is None or target in disk_artifacts:
+                # Ambiguous historical disk membership is not usable.
+                return {}
+
+            disk_artifacts[target] = artifact
+
+        bundle = Path(previous.bundle_object_id)
+        inspector = BundlePhysicalInspector(
+            self.bundle_planner
+        )
+
+        result: dict[str, int] = {}
+
+        for target in wanted:
+            artifact = disk_artifacts.get(target)
+            if artifact is None:
+                continue
+
+            if (
+                artifact.state is not ArtifactState.PUBLISHED
+                or artifact.published_object_id is None
+            ):
+                continue
+
+            expected = (
+                bundle
+                / self.bundle_planner.disk_relative(target)
+            )
+
+            if Path(artifact.published_object_id) != expected:
+                continue
+
+            try:
+                physical_bytes = inspector.inspect_disk(
+                    bundle,
+                    target,
+                )
+            except Exception:
+                # A historical bundle is optional estimator input.
+                # Never fail the current backup because old physical
+                # accounting is unavailable or unsafe.
+                continue
+
+            if physical_bytes > 0:
+                result[target] = physical_bytes
+
+        return result
+
     def _capacity_estimate(
-        self, domain: str, disks: tuple[RunDisk, ...],
+        self,
+        domain: str,
+        disks: tuple[RunDisk, ...],
+        *,
+        previous_full_physical: dict[str, int] | None = None,
+        margin_percent: float = 0.0,
     ) -> tuple[int, dict[str, int]]:
+        if not 0 <= margin_percent <= 100:
+            raise LibvirtExecutionSafetyError(
+                "backup size margin must be between 0 and 100"
+            )
+
+        historical = (
+            {}
+            if previous_full_physical is None
+            else previous_full_physical
+        )
+
         total = 0
         capacities: dict[str, int] = {}
+
         for disk in disks:
             if not disk.backup_enabled:
                 continue
+
             try:
-                info = self.read_driver.domain_block_info(domain, disk.target_dev)
+                info = self.read_driver.domain_block_info(
+                    domain,
+                    disk.target_dev,
+                )
             except Exception as exc:
                 raise LibvirtExecutionSafetyError(
-                    f"block capacity inspection failed for {disk.target_dev}: {exc}"
+                    "block capacity inspection failed for "
+                    f"{disk.target_dev}: {exc}"
                 ) from exc
+
             if info.capacity <= 0:
                 raise LibvirtExecutionSafetyError(
-                    f"block capacity inspection failed for {disk.target_dev}: "
-                    "Capacity must be positive"
+                    "block capacity inspection failed for "
+                    f"{disk.target_dev}: Capacity must be positive"
                 )
-            total += info.capacity
+
+            # Virtual capacity is still required for prepared output images.
             capacities[disk.target_dev] = info.capacity
+
+            current_allocated = None
+
+            if (
+                info.allocation is not None
+                and info.allocation > 0
+            ):
+                current_allocated = info.allocation
+            elif (
+                info.physical is not None
+                and info.physical > 0
+            ):
+                current_allocated = info.physical
+
+            previous_physical = historical.get(
+                disk.target_dev
+            )
+
+            candidates = [
+                value
+                for value in (
+                    current_allocated,
+                    previous_physical,
+                )
+                if value is not None and value > 0
+            ]
+
+            # With no trustworthy allocated/history fact, fall back to the
+            # complete virtual capacity rather than guessing downward.
+            base = (
+                max(candidates)
+                if candidates
+                else info.capacity
+            )
+
+            estimated = math.ceil(
+                base * (
+                    1.0
+                    + margin_percent / 100.0
+                )
+            )
+
+            if estimated <= 0:
+                raise LibvirtExecutionSafetyError(
+                    "backup capacity cannot be estimated safely"
+                )
+
+            total += estimated
+
         if total <= 0:
-            raise LibvirtExecutionSafetyError("backup capacity cannot be estimated safely")
+            raise LibvirtExecutionSafetyError(
+                "backup capacity cannot be estimated safely"
+            )
+
         return total, capacities
 
     @staticmethod

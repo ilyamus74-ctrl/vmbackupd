@@ -497,13 +497,38 @@ def test_space_optimized_executes_reclaim_before_backup_start(
         execution
     )
 
-    repository, _, _, run, _, staging, _ = execution
+    repository, vm, job, run, _, staging, _ = execution
+
+    plan = repository.get_persisted_libvirt_plan(run.id)
+
+    history = value._previous_successful_full_physical(
+        vm.id,
+        tuple(
+            disk.target_dev
+            for disk in plan.disks
+            if disk.backup_enabled
+        ),
+    )
+
+    estimate, _ = value._capacity_estimate(
+        plan.operation.domain_uuid,
+        plan.disks,
+        previous_full_physical=history,
+        margin_percent=(
+            job.retention_policy.backup_size_margin_percent
+        ),
+    )
+
+    # Fixture reserve is 5000 bytes. The success case must provide
+    # measured post-reclaim capacity above the actual smart estimate,
+    # rather than relying on the historical magic value 9000.
+    free_after = estimate + 5000 + 1024
 
     free_values = iter(
         (
             (5000, 100000),
-            (9000, 100000),
-            (9000, 100000),
+            (free_after, 100000),
+            (free_after, 100000),
         )
     )
 
@@ -512,7 +537,7 @@ def test_space_optimized_executes_reclaim_before_backup_start(
         "free_space",
         lambda: next(
             free_values,
-            (9000, 100000),
+            (free_after, 100000),
         ),
     )
 
@@ -527,7 +552,7 @@ def test_space_optimized_executes_reclaim_before_backup_start(
 
     assert operation is not None
     assert operation.state.value == "COMPLETED"
-    assert operation.free_bytes_after == 9000
+    assert operation.free_bytes_after == free_after
 
     assert not old_bundle.exists()
     assert survivor_bundle.is_dir()
@@ -681,11 +706,26 @@ def test_existing_reclaim_operation_is_reused_after_retry(
         execution
     )
 
-    repository, _, job, run, _, staging, _ = execution
+    repository, vm, job, run, _, staging, _ = execution
+
+    plan = repository.get_persisted_libvirt_plan(run.id)
+
+    history = value._previous_successful_full_physical(
+        vm.id,
+        tuple(
+            disk.target_dev
+            for disk in plan.disks
+            if disk.backup_enabled
+        ),
+    )
 
     estimate, _ = value._capacity_estimate(
-        "domain-uuid",
-        repository.get_persisted_libvirt_plan(run.id).disks,
+        plan.operation.domain_uuid,
+        plan.disks,
+        previous_full_physical=history,
+        margin_percent=(
+            job.retention_policy.backup_size_margin_percent
+        ),
     )
 
     capacity_plan = value.capacity_planning.plan_job(
@@ -726,11 +766,13 @@ def test_existing_reclaim_operation_is_reused_after_retry(
 
     operation_id = operation.id
 
+    free_after = estimate + 5000 + 1024
+
     free_values = iter(
         (
             (5000, 100000),
-            (9000, 100000),
-            (9000, 100000),
+            (free_after, 100000),
+            (free_after, 100000),
         )
     )
 
@@ -739,7 +781,7 @@ def test_existing_reclaim_operation_is_reused_after_retry(
         "free_space",
         lambda: next(
             free_values,
-            (9000, 100000),
+            (free_after, 100000),
         ),
     )
 
@@ -755,6 +797,8 @@ def test_existing_reclaim_operation_is_reused_after_retry(
     assert persisted is not None
     assert persisted.id == operation_id
     assert persisted.state.value == "COMPLETED"
+    assert persisted.required_backup_bytes == estimate
+    assert persisted.free_bytes_after == free_after
 
     count = repository.connection.execute(
         """SELECT COUNT(*)
@@ -1396,3 +1440,200 @@ def test_recovery_required_run_cannot_use_fast_completion(execution):
         event.event_type == "LIBVIRT_BACKUP_FAST_COMPLETION_CONFIRMED"
         for event in execution[0].list_events(result.id)
     )
+
+
+def test_smart_capacity_estimate_uses_max_current_and_previous_with_margin(
+    execution,
+):
+    _, _, _, run, driver, *_ = execution
+
+    driver.block_info["vda"] = DomainBlockInfo(
+        1000,
+        allocation=400,
+        physical=700,
+    )
+
+    value, _ = executor(execution)
+    disk = execution[0].list_run_disks(run.id)[0]
+
+    estimate, capacities = value._capacity_estimate(
+        "domain-uuid",
+        (disk,),
+        previous_full_physical={"vda": 600},
+        margin_percent=20.0,
+    )
+
+    # allocation is the preferred current-used value:
+    # max(400, 600) * 1.20 = 720
+    assert estimate == 720
+    assert capacities == {"vda": 1000}
+
+
+def test_smart_capacity_estimate_prefers_allocation_over_physical(
+    execution,
+):
+    _, _, _, run, driver, *_ = execution
+
+    driver.block_info["vda"] = DomainBlockInfo(
+        1000,
+        allocation=400,
+        physical=700,
+    )
+
+    value, _ = executor(execution)
+    disk = execution[0].list_run_disks(run.id)[0]
+
+    estimate, _ = value._capacity_estimate(
+        "domain-uuid",
+        (disk,),
+        margin_percent=20.0,
+    )
+
+    assert estimate == 480
+
+
+def test_smart_capacity_estimate_uses_physical_when_allocation_unavailable(
+    execution,
+):
+    _, _, _, run, driver, *_ = execution
+
+    driver.block_info["vda"] = DomainBlockInfo(
+        1000,
+        allocation=None,
+        physical=500,
+    )
+
+    value, _ = executor(execution)
+    disk = execution[0].list_run_disks(run.id)[0]
+
+    estimate, _ = value._capacity_estimate(
+        "domain-uuid",
+        (disk,),
+        margin_percent=20.0,
+    )
+
+    assert estimate == 600
+
+
+def test_smart_capacity_estimate_uses_virtual_capacity_as_fallback(
+    execution,
+):
+    _, _, _, run, driver, *_ = execution
+
+    driver.block_info["vda"] = DomainBlockInfo(1000)
+
+    value, _ = executor(execution)
+    disk = execution[0].list_run_disks(run.id)[0]
+
+    estimate, capacities = value._capacity_estimate(
+        "domain-uuid",
+        (disk,),
+        margin_percent=20.0,
+    )
+
+    assert estimate == 1200
+    assert capacities == {"vda": 1000}
+
+
+def test_previous_successful_full_physical_uses_latest_valid_bundle(
+    execution,
+):
+    (
+        value,
+        _,
+        _,
+        _,
+        _,
+        _,
+        survivor_bundle,
+    ) = prepare_space_optimized_capacity_reclaim(
+        execution
+    )
+
+    vm = execution[1]
+
+    history = value._previous_successful_full_physical(
+        vm.id,
+        ("vda", "vdb"),
+    )
+
+    survivor_disk = (
+        survivor_bundle
+        / "disks"
+        / "vda.qcow2"
+    )
+
+    assert history["vda"] == (
+        survivor_disk.stat().st_blocks * 512
+    )
+    assert "vdb" not in history
+
+
+def test_smart_capacity_estimate_uses_current_when_larger_than_history(
+    execution,
+):
+    _, _, _, run, driver, *_ = execution
+
+    driver.block_info["vda"] = DomainBlockInfo(
+        1000,
+        allocation=700,
+        physical=500,
+    )
+
+    value, _ = executor(execution)
+    disk = execution[0].list_run_disks(run.id)[0]
+
+    estimate, capacities = value._capacity_estimate(
+        "domain-uuid",
+        (disk,),
+        previous_full_physical={"vda": 600},
+        margin_percent=20.0,
+    )
+
+    # max(current allocation 700, previous FULL 600) * 1.20
+    assert estimate == 840
+    assert capacities == {"vda": 1000}
+
+
+def test_previous_full_physical_inspection_failure_is_advisory(
+    execution,
+    monkeypatch,
+):
+    (
+        value,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+    ) = prepare_space_optimized_capacity_reclaim(
+        execution
+    )
+
+    vm = execution[1]
+
+    def fail_history_inspection(
+        self,
+        bundle_root,
+        target_dev,
+    ):
+        raise RuntimeError(
+            "simulated historical bundle inspection failure"
+        )
+
+    monkeypatch.setattr(
+        "vmbackupd.libvirt_execution."
+        "BundlePhysicalInspector.inspect_disk",
+        fail_history_inspection,
+    )
+
+    history = value._previous_successful_full_physical(
+        vm.id,
+        ("vda",),
+    )
+
+    # Historical sizing is advisory. An unavailable old physical
+    # measurement must fall back to live allocation/virtual capacity
+    # rather than blocking the current backup.
+    assert history == {}

@@ -320,6 +320,47 @@ class BundlePhysicalInspector:
         finally:
             os.close(bundle_fd)
 
+    def inspect_disk(
+        self,
+        bundle_root: str | Path,
+        target_dev: str,
+    ) -> int:
+        """Read physical allocation of one disk from a valid published bundle."""
+
+        # First validate the complete published bundle using the existing
+        # descriptor-safe inspection boundary. Historical size information
+        # is advisory and must never be accepted from a malformed bundle.
+        self.inspect(bundle_root)
+
+        target = BundlePathPlanner._component(
+            target_dev,
+            "disk target",
+        )
+        disk_name = target + ".qcow2"
+
+        bundle = Path(bundle_root)
+        relative = self._validated_relative(bundle)
+
+        BundlePublisher._reject_symlinks(self.planner.root)
+        BundlePublisher._reject_symlinks(bundle)
+
+        bundle_fd = self._open_relative_directory(relative)
+        disks_fd = None
+
+        try:
+            disks_fd = self._open_child_directory(
+                bundle_fd,
+                "disks",
+            )
+            return self._inspect_regular_file(
+                disks_fd,
+                disk_name,
+            )
+        finally:
+            if disks_fd is not None:
+                os.close(disks_fd)
+            os.close(bundle_fd)
+
     def _validated_relative(self, bundle: Path) -> PurePosixPath:
         root = self.planner.root
         if not bundle.is_absolute() or ".." in bundle.parts:
