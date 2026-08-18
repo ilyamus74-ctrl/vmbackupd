@@ -1,4 +1,5 @@
 from __future__ import annotations
+from pathlib import Path
 
 import errno
 import json
@@ -12,6 +13,8 @@ from vmbackupd.bundle import (
     BundlePhysicalInspector,
     BundlePublicationError,
     BundlePublisher,
+    BundlePurgeError,
+    BundlePurger,
     BundleQuarantineError,
     BundleQuarantiner,
 )
@@ -543,3 +546,339 @@ def test_quarantine_rolls_back_source_replacement_race_at_rename(
     # The originally validated bundle was displaced by the simulated
     # concurrent attacker and is deliberately not guessed/moved by recovery.
     assert displaced.is_dir()
+
+
+def quarantined_bundle(tmp_path):
+    planner, final = published_bundle(tmp_path)
+
+    result = BundleQuarantiner(planner).quarantine(
+        source_bundle_object_id=final,
+        operation_id=OPERATION_ID,
+        restore_point_id=RESTORE_POINT_ID,
+    )
+
+    return planner, final, result
+
+
+def test_purge_path_is_deterministic_and_controlled(tmp_path):
+    planner = BundlePathPlanner(tmp_path)
+
+    assert planner.reclaim_purging(
+        OPERATION_ID,
+        RESTORE_POINT_ID,
+    ) == (
+        tmp_path
+        / ".reclaim"
+        / OPERATION_ID
+        / ".purging"
+        / RESTORE_POINT_ID
+    )
+
+
+def test_physical_purge_removes_only_exact_quarantined_bundle(
+    tmp_path,
+):
+    planner, _, quarantine = quarantined_bundle(tmp_path)
+
+    outside = tmp_path / "outside-preserved"
+    outside.write_bytes(b"preserve me")
+
+    result = BundlePurger(planner).purge(
+        quarantine_object_id=quarantine.quarantine_object_id,
+        operation_id=OPERATION_ID,
+        restore_point_id=RESTORE_POINT_ID,
+        expected_physical_bytes=(
+            quarantine.expected_physical_bytes
+        ),
+        source_device=quarantine.source_device,
+        source_inode=quarantine.source_inode,
+    )
+
+    assert not planner.reclaim(
+        OPERATION_ID,
+        RESTORE_POINT_ID,
+    ).exists()
+
+    assert not planner.reclaim_purging(
+        OPERATION_ID,
+        RESTORE_POINT_ID,
+    ).exists()
+
+    assert outside.read_bytes() == b"preserve me"
+    assert result.resumed is False
+    assert (
+        result.observed_physical_bytes_before_purge
+        == quarantine.expected_physical_bytes
+    )
+
+
+def test_physical_purge_refuses_wrong_root_identity_before_deletion(
+    tmp_path,
+):
+    planner, _, quarantine = quarantined_bundle(tmp_path)
+
+    path = Path(quarantine.quarantine_object_id)
+
+    with pytest.raises(
+        BundlePurgeError,
+        match="root identity",
+    ):
+        BundlePurger(planner).purge(
+            quarantine_object_id=path,
+            operation_id=OPERATION_ID,
+            restore_point_id=RESTORE_POINT_ID,
+            expected_physical_bytes=(
+                quarantine.expected_physical_bytes
+            ),
+            source_device=quarantine.source_device,
+            source_inode=quarantine.source_inode + 1,
+        )
+
+    assert path.is_dir()
+
+
+def test_physical_purge_refuses_wrong_physical_snapshot_before_deletion(
+    tmp_path,
+):
+    planner, _, quarantine = quarantined_bundle(tmp_path)
+
+    path = Path(quarantine.quarantine_object_id)
+
+    with pytest.raises(
+        BundlePurgeError,
+        match="physical allocation differs",
+    ):
+        BundlePurger(planner).purge(
+            quarantine_object_id=path,
+            operation_id=OPERATION_ID,
+            restore_point_id=RESTORE_POINT_ID,
+            expected_physical_bytes=(
+                quarantine.expected_physical_bytes + 512
+            ),
+            source_device=quarantine.source_device,
+            source_inode=quarantine.source_inode,
+        )
+
+    assert path.is_dir()
+    assert not planner.reclaim_purging(
+        OPERATION_ID,
+        RESTORE_POINT_ID,
+    ).exists()
+
+
+def test_physical_purge_refuses_symlink_added_after_quarantine(
+    tmp_path,
+):
+    planner, _, quarantine = quarantined_bundle(tmp_path)
+
+    path = Path(quarantine.quarantine_object_id)
+    disk = path / "disks" / "vda.qcow2"
+
+    outside = tmp_path / "outside-purge-target"
+    outside.write_bytes(b"outside")
+
+    disk.unlink()
+    disk.symlink_to(outside)
+
+    with pytest.raises(
+        BundlePurgeError,
+        match="unsafe file",
+    ):
+        BundlePurger(planner).purge(
+            quarantine_object_id=path,
+            operation_id=OPERATION_ID,
+            restore_point_id=RESTORE_POINT_ID,
+            expected_physical_bytes=(
+                quarantine.expected_physical_bytes
+            ),
+            source_device=quarantine.source_device,
+            source_inode=quarantine.source_inode,
+        )
+
+    assert outside.read_bytes() == b"outside"
+    assert path.is_dir()
+    assert not planner.reclaim_purging(
+        OPERATION_ID,
+        RESTORE_POINT_ID,
+    ).exists()
+
+
+def test_physical_purge_refuses_hardlink_added_after_quarantine(
+    tmp_path,
+):
+    planner, _, quarantine = quarantined_bundle(tmp_path)
+
+    path = Path(quarantine.quarantine_object_id)
+    manifest = path / "metadata" / "manifest.json"
+
+    outside = tmp_path / "outside-purge-hardlink"
+    outside.hardlink_to(manifest)
+
+    with pytest.raises(
+        BundlePurgeError,
+        match="hard-linked",
+    ):
+        BundlePurger(planner).purge(
+            quarantine_object_id=path,
+            operation_id=OPERATION_ID,
+            restore_point_id=RESTORE_POINT_ID,
+            expected_physical_bytes=(
+                quarantine.expected_physical_bytes
+            ),
+            source_device=quarantine.source_device,
+            source_inode=quarantine.source_inode,
+        )
+
+    assert outside.is_file()
+    assert path.is_dir()
+
+
+def test_physical_purge_resumes_after_partial_unlink_failure(
+    tmp_path,
+    monkeypatch,
+):
+    planner, _, quarantine = quarantined_bundle(tmp_path)
+
+    real_unlink = os.unlink
+    calls = 0
+
+    def fail_after_first(name, *, dir_fd=None):
+        nonlocal calls
+        calls += 1
+
+        if calls == 2:
+            raise OSError(
+                errno.EIO,
+                "simulated purge interruption",
+            )
+
+        return real_unlink(
+            name,
+            dir_fd=dir_fd,
+        )
+
+    monkeypatch.setattr(
+        "vmbackupd.bundle.os.unlink",
+        fail_after_first,
+    )
+
+    with pytest.raises(
+        BundlePurgeError,
+        match="cannot remove",
+    ):
+        BundlePurger(planner).purge(
+            quarantine_object_id=(
+                quarantine.quarantine_object_id
+            ),
+            operation_id=OPERATION_ID,
+            restore_point_id=RESTORE_POINT_ID,
+            expected_physical_bytes=(
+                quarantine.expected_physical_bytes
+            ),
+            source_device=quarantine.source_device,
+            source_inode=quarantine.source_inode,
+        )
+
+    assert not planner.reclaim(
+        OPERATION_ID,
+        RESTORE_POINT_ID,
+    ).exists()
+
+    staging = planner.reclaim_purging(
+        OPERATION_ID,
+        RESTORE_POINT_ID,
+    )
+    assert staging.is_dir()
+
+    monkeypatch.setattr(
+        "vmbackupd.bundle.os.unlink",
+        real_unlink,
+    )
+
+    resumed = BundlePurger(planner).purge(
+        quarantine_object_id=(
+            quarantine.quarantine_object_id
+        ),
+        operation_id=OPERATION_ID,
+        restore_point_id=RESTORE_POINT_ID,
+        expected_physical_bytes=(
+            quarantine.expected_physical_bytes
+        ),
+        source_device=quarantine.source_device,
+        source_inode=quarantine.source_inode,
+    )
+
+    assert resumed.resumed is True
+    assert (
+        resumed.observed_physical_bytes_before_purge
+        is None
+    )
+    assert not staging.exists()
+
+
+def test_partial_purge_resume_refuses_unexpected_entry(
+    tmp_path,
+):
+    planner, _, quarantine = quarantined_bundle(tmp_path)
+
+    quarantine_path = planner.reclaim(
+        OPERATION_ID,
+        RESTORE_POINT_ID,
+    )
+    staging = planner.reclaim_purging(
+        OPERATION_ID,
+        RESTORE_POINT_ID,
+    )
+
+    staging.parent.mkdir(mode=0o700)
+    quarantine_path.rename(staging)
+
+    outside = tmp_path / "outside-unexpected"
+    outside.write_bytes(b"outside")
+
+    (staging / "unexpected").symlink_to(outside)
+
+    with pytest.raises(
+        BundlePurgeError,
+        match="unexpected entries",
+    ):
+        BundlePurger(planner).purge(
+            quarantine_object_id=(
+                quarantine.quarantine_object_id
+            ),
+            operation_id=OPERATION_ID,
+            restore_point_id=RESTORE_POINT_ID,
+            expected_physical_bytes=(
+                quarantine.expected_physical_bytes
+            ),
+            source_device=quarantine.source_device,
+            source_inode=quarantine.source_inode,
+        )
+
+    assert outside.read_bytes() == b"outside"
+    assert staging.is_dir()
+
+
+def test_physical_purge_refuses_arbitrary_quarantine_identity(
+    tmp_path,
+):
+    planner, _, quarantine = quarantined_bundle(tmp_path)
+
+    with pytest.raises(
+        BundlePurgeError,
+        match="controlled reclaim namespace",
+    ):
+        BundlePurger(planner).purge(
+            quarantine_object_id=tmp_path / "anything",
+            operation_id=OPERATION_ID,
+            restore_point_id=RESTORE_POINT_ID,
+            expected_physical_bytes=(
+                quarantine.expected_physical_bytes
+            ),
+            source_device=quarantine.source_device,
+            source_inode=quarantine.source_inode,
+        )
+
+    assert Path(
+        quarantine.quarantine_object_id
+    ).is_dir()

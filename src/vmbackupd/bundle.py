@@ -66,6 +66,28 @@ class BundlePathPlanner:
         )
         return self.root / ".reclaim" / operation / restore_point
 
+    def reclaim_purging(
+        self,
+        operation_id: str,
+        restore_point_id: str,
+    ) -> Path:
+        """Deterministic in-progress physical purge identity."""
+        operation = self._uuid_component(
+            operation_id,
+            "reclaim operation ID",
+        )
+        restore_point = self._uuid_component(
+            restore_point_id,
+            "restore point ID",
+        )
+        return (
+            self.root
+            / ".reclaim"
+            / operation
+            / ".purging"
+            / restore_point
+        )
+
     def final(self, vm_id: str, run_id: str, created_at: datetime) -> Path:
         vm = self._uuid_component(vm_id, "VM ID")
         run = self._uuid_component(run_id, "run ID")
@@ -848,3 +870,875 @@ class BundleQuarantiner:
             if source_fd is not None:
                 os.close(source_fd)
             os.close(source_parent_fd)
+
+
+class BundlePurgeError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class BundlePurgeResult:
+    quarantine_object_id: str
+    purge_object_id: str
+    expected_physical_bytes: int
+    observed_physical_bytes_before_purge: int | None
+    source_device: int
+    source_inode: int
+    resumed: bool
+
+
+class BundlePurger:
+    """Physically remove one exact bundle from controlled quarantine."""
+
+    _METADATA_FILES = frozenset({
+        "domain.xml",
+        "manifest.json",
+        "restore-point.json",
+    })
+
+    def __init__(self, planner: BundlePathPlanner) -> None:
+        self.planner = planner
+
+    @staticmethod
+    def _open_child_directory(
+        parent_fd: int,
+        name: str,
+        *,
+        label: str,
+    ) -> int:
+        try:
+            return os.open(
+                name,
+                BundlePublisher._directory_flags(),
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise BundlePurgeError(
+                f"{label} is unsafe or missing"
+            ) from exc
+
+    @staticmethod
+    def _open_optional_child_directory(
+        parent_fd: int,
+        name: str,
+        *,
+        label: str,
+    ) -> int | None:
+        try:
+            return os.open(
+                name,
+                BundlePublisher._directory_flags(),
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise BundlePurgeError(
+                f"{label} contains a symlink or non-directory"
+            ) from exc
+
+    @staticmethod
+    def _open_or_create_child_directory(
+        parent_fd: int,
+        name: str,
+        *,
+        label: str,
+    ) -> int:
+        existing = BundlePurger._open_optional_child_directory(
+            parent_fd,
+            name,
+            label=label,
+        )
+        if existing is not None:
+            return existing
+
+        try:
+            os.mkdir(
+                name,
+                mode=0o700,
+                dir_fd=parent_fd,
+            )
+            os.fsync(parent_fd)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise BundlePurgeError(
+                f"cannot safely create {label}"
+            ) from exc
+
+        return BundlePurger._open_child_directory(
+            parent_fd,
+            name,
+            label=label,
+        )
+
+    def _open_operation_directory(
+        self,
+        operation_id: str,
+    ) -> int:
+        operation = BundlePathPlanner._uuid_component(
+            operation_id,
+            "reclaim operation ID",
+        )
+
+        try:
+            BundlePublisher._reject_symlinks(self.planner.root)
+        except BundlePublicationError as exc:
+            raise BundlePurgeError(
+                "backup root contains a symbolic link"
+            ) from exc
+
+        try:
+            root_fd = os.open(
+                self.planner.root,
+                BundlePublisher._directory_flags(),
+            )
+        except OSError as exc:
+            raise BundlePurgeError(
+                "backup root is not a safe directory"
+            ) from exc
+
+        reclaim_fd = None
+        try:
+            reclaim_fd = self._open_child_directory(
+                root_fd,
+                ".reclaim",
+                label="reclaim namespace",
+            )
+
+            return self._open_child_directory(
+                reclaim_fd,
+                operation,
+                label="reclaim operation namespace",
+            )
+        finally:
+            if reclaim_fd is not None:
+                os.close(reclaim_fd)
+            os.close(root_fd)
+
+    @staticmethod
+    def _entry_info(
+        parent_fd: int,
+        name: str,
+    ) -> os.stat_result | None:
+        try:
+            return os.stat(
+                name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise BundlePurgeError(
+                "cannot safely inspect purge namespace entry"
+            ) from exc
+
+    @staticmethod
+    def _require_root_identity(
+        info: os.stat_result,
+        *,
+        expected_device: int,
+        expected_inode: int,
+    ) -> None:
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_dev != expected_device
+            or info.st_ino != expected_inode
+        ):
+            raise BundlePurgeError(
+                "quarantine bundle root identity does not match "
+                "durable reclaim evidence"
+            )
+
+    @staticmethod
+    def _disk_name(name: str) -> bool:
+        suffix = ".qcow2"
+        if not name.endswith(suffix):
+            return False
+
+        target = name[:-len(suffix)]
+        try:
+            BundlePathPlanner._component(
+                target,
+                "disk target",
+            )
+        except ValueError:
+            return False
+
+        return True
+
+    @staticmethod
+    def _validate_file(
+        parent_fd: int,
+        name: str,
+        *,
+        root_device: int,
+    ) -> os.stat_result:
+        descriptor = None
+        try:
+            try:
+                descriptor = os.open(
+                    name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent_fd,
+                )
+            except OSError as exc:
+                raise BundlePurgeError(
+                    "purge tree contains an unsafe file"
+                ) from exc
+
+            info = os.fstat(descriptor)
+
+            if not stat.S_ISREG(info.st_mode):
+                raise BundlePurgeError(
+                    "purge tree contains a non-regular file"
+                )
+
+            if info.st_dev != root_device:
+                raise BundlePurgeError(
+                    "purge tree crosses filesystem identity"
+                )
+
+            if info.st_nlink != 1:
+                raise BundlePurgeError(
+                    "purge tree contains a hard-linked file"
+                )
+
+            if info.st_size <= 0:
+                raise BundlePurgeError(
+                    "purge tree contains an empty file"
+                )
+
+            blocks = getattr(info, "st_blocks", None)
+            if blocks is None or blocks < 0:
+                raise BundlePurgeError(
+                    "purge file physical allocation is unavailable"
+                )
+
+            current = os.stat(
+                name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or current.st_dev != info.st_dev
+                or current.st_ino != info.st_ino
+            ):
+                raise BundlePurgeError(
+                    "purge file identity changed during validation"
+                )
+
+            return info
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def _validate_complete_tree(
+        self,
+        bundle_fd: int,
+        *,
+        root_device: int,
+        expected_physical_bytes: int,
+    ) -> int:
+        try:
+            top = set(os.listdir(bundle_fd))
+        except OSError as exc:
+            raise BundlePurgeError(
+                "cannot enumerate quarantine bundle"
+            ) from exc
+
+        if top != {"disks", "metadata"}:
+            raise BundlePurgeError(
+                "quarantine bundle has unexpected top-level entries"
+            )
+
+        physical_bytes = 0
+
+        disks_fd = self._open_child_directory(
+            bundle_fd,
+            "disks",
+            label="quarantine disk directory",
+        )
+        try:
+            try:
+                disks = sorted(os.listdir(disks_fd))
+            except OSError as exc:
+                raise BundlePurgeError(
+                    "cannot enumerate quarantine disks"
+                ) from exc
+
+            if not disks:
+                raise BundlePurgeError(
+                    "quarantine bundle has no disks"
+                )
+
+            if any(
+                not self._disk_name(name)
+                for name in disks
+            ):
+                raise BundlePurgeError(
+                    "quarantine disk namespace is invalid"
+                )
+
+            for name in disks:
+                info = self._validate_file(
+                    disks_fd,
+                    name,
+                    root_device=root_device,
+                )
+                physical_bytes += info.st_blocks * 512
+        finally:
+            os.close(disks_fd)
+
+        metadata_fd = self._open_child_directory(
+            bundle_fd,
+            "metadata",
+            label="quarantine metadata directory",
+        )
+        try:
+            try:
+                metadata = set(os.listdir(metadata_fd))
+            except OSError as exc:
+                raise BundlePurgeError(
+                    "cannot enumerate quarantine metadata"
+                ) from exc
+
+            if metadata != self._METADATA_FILES:
+                raise BundlePurgeError(
+                    "quarantine metadata namespace is invalid"
+                )
+
+            for name in sorted(metadata):
+                info = self._validate_file(
+                    metadata_fd,
+                    name,
+                    root_device=root_device,
+                )
+                physical_bytes += info.st_blocks * 512
+        finally:
+            os.close(metadata_fd)
+
+        if physical_bytes != expected_physical_bytes:
+            raise BundlePurgeError(
+                "quarantine physical allocation differs from "
+                "durable reclaim evidence"
+            )
+
+        return physical_bytes
+
+    def _validate_remaining_tree(
+        self,
+        bundle_fd: int,
+        *,
+        root_device: int,
+    ) -> None:
+        """Validate a possibly partially purged staging tree."""
+
+        try:
+            top = set(os.listdir(bundle_fd))
+        except OSError as exc:
+            raise BundlePurgeError(
+                "cannot enumerate partial purge tree"
+            ) from exc
+
+        if not top <= {"disks", "metadata"}:
+            raise BundlePurgeError(
+                "partial purge tree contains unexpected entries"
+            )
+
+        if "disks" in top:
+            disks_fd = self._open_child_directory(
+                bundle_fd,
+                "disks",
+                label="partial purge disk directory",
+            )
+            try:
+                names = set(os.listdir(disks_fd))
+                if any(
+                    not self._disk_name(name)
+                    for name in names
+                ):
+                    raise BundlePurgeError(
+                        "partial purge disk namespace is invalid"
+                    )
+
+                for name in names:
+                    self._validate_file(
+                        disks_fd,
+                        name,
+                        root_device=root_device,
+                    )
+            finally:
+                os.close(disks_fd)
+
+        if "metadata" in top:
+            metadata_fd = self._open_child_directory(
+                bundle_fd,
+                "metadata",
+                label="partial purge metadata directory",
+            )
+            try:
+                names = set(os.listdir(metadata_fd))
+                if not names <= self._METADATA_FILES:
+                    raise BundlePurgeError(
+                        "partial purge metadata namespace is invalid"
+                    )
+
+                for name in names:
+                    self._validate_file(
+                        metadata_fd,
+                        name,
+                        root_device=root_device,
+                    )
+            finally:
+                os.close(metadata_fd)
+
+    def _unlink_checked_file(
+        self,
+        parent_fd: int,
+        name: str,
+        *,
+        root_device: int,
+    ) -> None:
+        info = self._validate_file(
+            parent_fd,
+            name,
+            root_device=root_device,
+        )
+
+        current = self._entry_info(
+            parent_fd,
+            name,
+        )
+        if (
+            current is None
+            or not stat.S_ISREG(current.st_mode)
+            or current.st_dev != info.st_dev
+            or current.st_ino != info.st_ino
+        ):
+            raise BundlePurgeError(
+                "purge file identity changed before unlink"
+            )
+
+        try:
+            os.unlink(
+                name,
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise BundlePurgeError(
+                "cannot remove quarantined bundle file"
+            ) from exc
+
+    def _purge_child_directory(
+        self,
+        bundle_fd: int,
+        name: str,
+        *,
+        root_device: int,
+        metadata: bool,
+    ) -> None:
+        child_fd = self._open_optional_child_directory(
+            bundle_fd,
+            name,
+            label=f"purge {name} directory",
+        )
+        if child_fd is None:
+            return
+
+        try:
+            try:
+                entries = sorted(os.listdir(child_fd))
+            except OSError as exc:
+                raise BundlePurgeError(
+                    f"cannot enumerate purge {name} directory"
+                ) from exc
+
+            if metadata:
+                if not set(entries) <= self._METADATA_FILES:
+                    raise BundlePurgeError(
+                        "purge metadata directory contains "
+                        "unexpected entries"
+                    )
+            else:
+                if any(
+                    not self._disk_name(entry)
+                    for entry in entries
+                ):
+                    raise BundlePurgeError(
+                        "purge disk directory contains "
+                        "unexpected entries"
+                    )
+
+            for entry in entries:
+                self._unlink_checked_file(
+                    child_fd,
+                    entry,
+                    root_device=root_device,
+                )
+
+            os.fsync(child_fd)
+        finally:
+            os.close(child_fd)
+
+        try:
+            os.rmdir(
+                name,
+                dir_fd=bundle_fd,
+            )
+            os.fsync(bundle_fd)
+        except OSError as exc:
+            raise BundlePurgeError(
+                f"cannot remove empty purge {name} directory"
+            ) from exc
+
+    def _purge_remaining_tree(
+        self,
+        bundle_fd: int,
+        *,
+        root_device: int,
+    ) -> None:
+        self._purge_child_directory(
+            bundle_fd,
+            "disks",
+            root_device=root_device,
+            metadata=False,
+        )
+        self._purge_child_directory(
+            bundle_fd,
+            "metadata",
+            root_device=root_device,
+            metadata=True,
+        )
+
+        try:
+            remaining = os.listdir(bundle_fd)
+        except OSError as exc:
+            raise BundlePurgeError(
+                "cannot verify empty purge root"
+            ) from exc
+
+        if remaining:
+            raise BundlePurgeError(
+                "purge root contains unexpected remaining entries"
+            )
+
+    def purge(
+        self,
+        *,
+        quarantine_object_id: str | Path,
+        operation_id: str,
+        restore_point_id: str,
+        expected_physical_bytes: int,
+        source_device: int,
+        source_inode: int,
+    ) -> BundlePurgeResult:
+        if expected_physical_bytes < 0:
+            raise ValueError(
+                "expected_physical_bytes must be non-negative"
+            )
+        if source_device < 0:
+            raise ValueError(
+                "source_device must be non-negative"
+            )
+        if source_inode < 0:
+            raise ValueError(
+                "source_inode must be non-negative"
+            )
+
+        quarantine = Path(quarantine_object_id)
+        expected_quarantine = self.planner.reclaim(
+            operation_id,
+            restore_point_id,
+        )
+        purge_object = self.planner.reclaim_purging(
+            operation_id,
+            restore_point_id,
+        )
+
+        if quarantine != expected_quarantine:
+            raise BundlePurgeError(
+                "quarantine object identity does not match "
+                "the controlled reclaim namespace"
+            )
+
+        operation_fd = self._open_operation_directory(
+            operation_id
+        )
+        purging_fd = None
+        bundle_fd = None
+
+        try:
+            restore_point_name = BundlePathPlanner._uuid_component(
+                restore_point_id,
+                "restore point ID",
+            )
+
+            quarantine_info = self._entry_info(
+                operation_fd,
+                restore_point_name,
+            )
+
+            existing_purging_fd = self._open_optional_child_directory(
+                operation_fd,
+                ".purging",
+                label="purging namespace",
+            )
+
+            staging_info = None
+            if existing_purging_fd is not None:
+                staging_info = self._entry_info(
+                    existing_purging_fd,
+                    restore_point_name,
+                )
+
+            if (
+                quarantine_info is not None
+                and staging_info is not None
+            ):
+                if existing_purging_fd is not None:
+                    os.close(existing_purging_fd)
+                raise BundlePurgeError(
+                    "both quarantine and purge staging objects exist"
+                )
+
+            if (
+                quarantine_info is None
+                and staging_info is None
+            ):
+                if existing_purging_fd is not None:
+                    os.close(existing_purging_fd)
+                raise BundlePurgeError(
+                    "quarantine bundle is missing"
+                )
+
+            resumed = quarantine_info is None
+            observed_physical_bytes = None
+
+            if not resumed:
+                self._require_root_identity(
+                    quarantine_info,
+                    expected_device=source_device,
+                    expected_inode=source_inode,
+                )
+
+                try:
+                    bundle_fd = os.open(
+                        restore_point_name,
+                        BundlePublisher._directory_flags(),
+                        dir_fd=operation_fd,
+                    )
+                except OSError as exc:
+                    if existing_purging_fd is not None:
+                        os.close(existing_purging_fd)
+                    raise BundlePurgeError(
+                        "cannot safely open quarantined bundle"
+                    ) from exc
+
+                opened = os.fstat(bundle_fd)
+                self._require_root_identity(
+                    opened,
+                    expected_device=source_device,
+                    expected_inode=source_inode,
+                )
+
+                observed_physical_bytes = (
+                    self._validate_complete_tree(
+                        bundle_fd,
+                        root_device=source_device,
+                        expected_physical_bytes=(
+                            expected_physical_bytes
+                        ),
+                    )
+                )
+
+                if existing_purging_fd is None:
+                    purging_fd = (
+                        self._open_or_create_child_directory(
+                            operation_fd,
+                            ".purging",
+                            label="purging namespace",
+                        )
+                    )
+                else:
+                    purging_fd = existing_purging_fd
+                    existing_purging_fd = None
+
+                if (
+                    os.fstat(operation_fd).st_dev
+                    != os.fstat(purging_fd).st_dev
+                ):
+                    raise BundlePurgeError(
+                        "physical purge staging requires one filesystem"
+                    )
+
+                try:
+                    os.rename(
+                        restore_point_name,
+                        restore_point_name,
+                        src_dir_fd=operation_fd,
+                        dst_dir_fd=purging_fd,
+                    )
+                except OSError as exc:
+                    if exc.errno == errno.EXDEV:
+                        raise BundlePurgeError(
+                            "cross-filesystem purge staging refused"
+                        ) from exc
+                    raise BundlePurgeError(
+                        "cannot atomically claim bundle for purge"
+                    ) from exc
+
+                try:
+                    os.fsync(purging_fd)
+                    os.fsync(operation_fd)
+                except OSError as exc:
+                    # Rename may already be durable on one side. Recovery
+                    # must inspect the deterministic .purging identity.
+                    raise BundlePurgeError(
+                        "purge staging rename is not durably synced"
+                    ) from exc
+
+                claimed = self._entry_info(
+                    purging_fd,
+                    restore_point_name,
+                )
+
+                if claimed is None:
+                    raise BundlePurgeError(
+                        "claimed purge bundle disappeared"
+                    )
+
+                if (
+                    not stat.S_ISDIR(claimed.st_mode)
+                    or claimed.st_dev != source_device
+                    or claimed.st_ino != source_inode
+                ):
+                    source_now = self._entry_info(
+                        operation_fd,
+                        restore_point_name,
+                    )
+
+                    if source_now is None:
+                        try:
+                            os.rename(
+                                restore_point_name,
+                                restore_point_name,
+                                src_dir_fd=purging_fd,
+                                dst_dir_fd=operation_fd,
+                            )
+                            os.fsync(operation_fd)
+                            os.fsync(purging_fd)
+                        except OSError as exc:
+                            raise BundlePurgeError(
+                                "purge root identity changed and "
+                                "safe rollback failed"
+                            ) from exc
+
+                        raise BundlePurgeError(
+                            "purge root identity changed; "
+                            "staging rename rolled back"
+                        )
+
+                    raise BundlePurgeError(
+                        "purge root identity changed and source "
+                        "path is occupied; rollback refused"
+                    )
+
+            else:
+                purging_fd = existing_purging_fd
+                existing_purging_fd = None
+
+                if purging_fd is None or staging_info is None:
+                    raise BundlePurgeError(
+                        "partial purge staging cannot be opened"
+                    )
+
+                self._require_root_identity(
+                    staging_info,
+                    expected_device=source_device,
+                    expected_inode=source_inode,
+                )
+
+                try:
+                    bundle_fd = os.open(
+                        restore_point_name,
+                        BundlePublisher._directory_flags(),
+                        dir_fd=purging_fd,
+                    )
+                except OSError as exc:
+                    raise BundlePurgeError(
+                        "cannot safely open partial purge bundle"
+                    ) from exc
+
+                opened = os.fstat(bundle_fd)
+                self._require_root_identity(
+                    opened,
+                    expected_device=source_device,
+                    expected_inode=source_inode,
+                )
+
+                self._validate_remaining_tree(
+                    bundle_fd,
+                    root_device=source_device,
+                )
+
+            self._purge_remaining_tree(
+                bundle_fd,
+                root_device=source_device,
+            )
+
+            current_root = self._entry_info(
+                purging_fd,
+                restore_point_name,
+            )
+
+            if current_root is None:
+                raise BundlePurgeError(
+                    "purge root disappeared before final removal"
+                )
+
+            self._require_root_identity(
+                current_root,
+                expected_device=source_device,
+                expected_inode=source_inode,
+            )
+
+            try:
+                os.rmdir(
+                    restore_point_name,
+                    dir_fd=purging_fd,
+                )
+                os.fsync(purging_fd)
+            except OSError as exc:
+                raise BundlePurgeError(
+                    "cannot remove empty purge root"
+                ) from exc
+
+            if self._entry_info(
+                purging_fd,
+                restore_point_name,
+            ) is not None:
+                raise BundlePurgeError(
+                    "purge root still exists after removal"
+                )
+
+            return BundlePurgeResult(
+                quarantine_object_id=str(quarantine),
+                purge_object_id=str(purge_object),
+                expected_physical_bytes=expected_physical_bytes,
+                observed_physical_bytes_before_purge=(
+                    observed_physical_bytes
+                ),
+                source_device=source_device,
+                source_inode=source_inode,
+                resumed=resumed,
+            )
+        finally:
+            if bundle_fd is not None:
+                os.close(bundle_fd)
+            if purging_fd is not None:
+                os.close(purging_fd)
+            os.close(operation_fd)
