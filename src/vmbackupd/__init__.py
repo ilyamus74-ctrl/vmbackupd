@@ -15,7 +15,10 @@ from .libvirt_execution import (
 from .models import BackupPolicy, OverlapPolicy, RetentionPolicy, SchedulePolicy
 from .planner import BackupPlanner
 from .repository import SQLiteRepository
-from .retention import RetentionPlan, RetentionPlanner
+from .retention import (
+    CapacityReclaimPlan, CapacityReclaimPlanner, FullChainCapacity,
+    RetentionPlan, RetentionPlanner,
+)
 from .runtime import DaemonRuntime
 from .scheduler import IntervalScheduler
 from .schema import (
@@ -44,6 +47,9 @@ __all__ = [
     "MockBackupEngine",
     "OverlapPolicy",
     "RetentionPlan",
+    "CapacityReclaimPlan",
+    "CapacityReclaimPlanner",
+    "FullChainCapacity",
     "RetentionPlanner",
     "RetentionPolicy",
     "RecoveryEvidence",

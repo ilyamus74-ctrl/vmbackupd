@@ -4,7 +4,9 @@ from vmbackupd.models import (
     ArtifactKind, ArtifactState, BackupArtifact, BackupChain, BackupChainStatus,
     BackupKind, RestorePoint, RetentionPolicy, utcnow,
 )
-from vmbackupd.retention import RetentionPlanner
+from vmbackupd.retention import (
+    CapacityReclaimPlanner, FullChainCapacity, RetentionPlanner,
+)
 
 
 def make_chain(name, length, start_age, status):
@@ -113,3 +115,181 @@ def test_retention_policy_validates_capacity_reclaim_contract():
         RetentionPolicy(7, 1, 2, "INVALID")
     with pytest.raises(ValueError, match="backup_size_margin_percent"):
         RetentionPolicy(7, 1, 2, "SAFE", 101)
+
+
+def capacity_chain(name, age, physical_bytes, status=BackupChainStatus.CLOSED):
+    return FullChainCapacity(
+        chain_id=name,
+        status=status,
+        created_at=utcnow() + timedelta(hours=age),
+        physical_bytes=physical_bytes,
+    )
+
+
+def test_capacity_reclaim_not_required_when_backup_and_reserve_already_fit():
+    chains = [
+        capacity_chain("old", -20, 40),
+        capacity_chain("active", 0, 60, BackupChainStatus.ACTIVE),
+    ]
+    plan = CapacityReclaimPlanner().plan(
+        chains,
+        free_bytes=150,
+        reserve_bytes=20,
+        required_backup_bytes=100,
+        policy=RetentionPolicy(7, 1, 2, "SPACE_OPTIMIZED", 20),
+    )
+
+    assert plan.backup_possible_now
+    assert not plan.reclaim_required
+    assert plan.backup_possible_after_reclaim
+    assert plan.usable_free_bytes == 130
+    assert plan.shortfall_bytes == 0
+    assert plan.selected_reclaim_chain_ids == ()
+    assert plan.selected_reclaim_bytes == 0
+    assert plan.protected_full_chains_remaining == 2
+
+
+def test_safe_mode_reports_candidates_but_never_selects_prebackup_reclaim():
+    chains = [
+        capacity_chain("oldest", -30, 30),
+        capacity_chain("older", -20, 40),
+        capacity_chain("active", 0, 50, BackupChainStatus.ACTIVE),
+    ]
+    plan = CapacityReclaimPlanner().plan(
+        chains,
+        free_bytes=50,
+        reserve_bytes=10,
+        required_backup_bytes=100,
+        policy=RetentionPolicy(7, 1, 2, "SAFE", 20),
+    )
+
+    assert not plan.backup_possible_now
+    assert plan.reclaim_required
+    assert not plan.backup_possible_after_reclaim
+    assert plan.shortfall_bytes == 60
+    assert plan.candidate_chain_ids == ("oldest", "older")
+    assert plan.candidate_reclaim_bytes == 70
+    assert plan.selected_reclaim_chain_ids == ()
+    assert plan.selected_reclaim_bytes == 0
+    assert plan.protected_full_chains_remaining == 3
+
+
+def test_space_optimized_selects_minimal_oldest_first_prefix():
+    chains = [
+        capacity_chain("oldest", -30, 30),
+        capacity_chain("older", -20, 40),
+        capacity_chain("active", 0, 50, BackupChainStatus.ACTIVE),
+    ]
+    plan = CapacityReclaimPlanner().plan(
+        chains,
+        free_bytes=50,
+        reserve_bytes=10,
+        required_backup_bytes=100,
+        policy=RetentionPolicy(7, 1, 3, "SPACE_OPTIMIZED", 20),
+    )
+
+    assert plan.shortfall_bytes == 60
+    assert plan.candidate_chain_ids == ("oldest", "older")
+    assert plan.selected_reclaim_chain_ids == ("oldest", "older")
+    assert plan.selected_reclaim_bytes == 70
+    assert plan.backup_possible_after_reclaim
+    # Capacity mode may temporarily go below desired=3, but never below floor=1.
+    assert plan.protected_full_chains_remaining == 1
+
+
+def test_capacity_reclaim_never_breaks_minimum_full_chain_floor():
+    chains = [
+        capacity_chain("old", -20, 200),
+        capacity_chain("active", 0, 200, BackupChainStatus.ACTIVE),
+    ]
+    plan = CapacityReclaimPlanner().plan(
+        chains,
+        free_bytes=10,
+        reserve_bytes=10,
+        required_backup_bytes=100,
+        policy=RetentionPolicy(7, 2, 2, "SPACE_OPTIMIZED", 20),
+    )
+
+    assert plan.candidate_chain_ids == ()
+    assert plan.candidate_reclaim_bytes == 0
+    assert plan.selected_reclaim_chain_ids == ()
+    assert not plan.backup_possible_after_reclaim
+    assert plan.protected_full_chains_remaining == 2
+
+
+def test_insufficient_total_reclaim_selects_nothing():
+    chains = [
+        capacity_chain("oldest", -30, 20),
+        capacity_chain("older", -20, 25),
+        capacity_chain("active", 0, 100, BackupChainStatus.ACTIVE),
+    ]
+    plan = CapacityReclaimPlanner().plan(
+        chains,
+        free_bytes=30,
+        reserve_bytes=10,
+        required_backup_bytes=100,
+        policy=RetentionPolicy(7, 1, 2, "SPACE_OPTIMIZED", 20),
+    )
+
+    assert plan.shortfall_bytes == 80
+    assert plan.candidate_reclaim_bytes == 45
+    assert plan.candidate_chain_ids == ("oldest", "older")
+    assert plan.selected_reclaim_chain_ids == ()
+    assert plan.selected_reclaim_bytes == 0
+    assert not plan.backup_possible_after_reclaim
+    assert plan.protected_full_chains_remaining == 3
+
+
+def test_capacity_shortfall_includes_missing_reserve_when_free_is_below_floor():
+    chains = [
+        capacity_chain("old", -10, 115),
+        capacity_chain("active", 0, 100, BackupChainStatus.ACTIVE),
+    ]
+    plan = CapacityReclaimPlanner().plan(
+        chains,
+        free_bytes=5,
+        reserve_bytes=20,
+        required_backup_bytes=100,
+        policy=RetentionPolicy(7, 1, 2, "SPACE_OPTIMIZED", 20),
+    )
+
+    assert plan.usable_free_bytes == 0
+    assert plan.shortfall_bytes == 115
+    assert plan.selected_reclaim_chain_ids == ("old",)
+    assert plan.selected_reclaim_bytes == 115
+    assert plan.backup_possible_after_reclaim
+
+
+def test_capacity_reclaim_rejects_invalid_facts():
+    import pytest
+
+    planner = CapacityReclaimPlanner()
+    policy = RetentionPolicy()
+
+    with pytest.raises(ValueError, match="free_bytes"):
+        planner.plan(
+            [], free_bytes=-1, reserve_bytes=0,
+            required_backup_bytes=1, policy=policy,
+        )
+    with pytest.raises(ValueError, match="reserve_bytes"):
+        planner.plan(
+            [], free_bytes=1, reserve_bytes=-1,
+            required_backup_bytes=1, policy=policy,
+        )
+    with pytest.raises(ValueError, match="required_backup_bytes"):
+        planner.plan(
+            [], free_bytes=1, reserve_bytes=0,
+            required_backup_bytes=-1, policy=policy,
+        )
+    with pytest.raises(ValueError, match="physical_bytes"):
+        capacity_chain("bad", 0, -1)
+
+    duplicate = capacity_chain("same", -1, 1)
+    with pytest.raises(ValueError, match="duplicate"):
+        planner.plan(
+            [duplicate, duplicate],
+            free_bytes=1,
+            reserve_bytes=0,
+            required_backup_bytes=2,
+            policy=policy,
+        )
