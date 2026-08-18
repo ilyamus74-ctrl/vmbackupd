@@ -579,7 +579,12 @@
         document.getElementById("job-name").value = job ? job.name : "";
         document.getElementById("job-enabled").checked = job ? job.enabled : true;
         document.getElementById("job-retain").value = job ? job.restore_points_to_retain : 7;
-        document.getElementById("job-minimum-chains").value = job ? job.minimum_full_chains : 1;
+        document.getElementById("job-full-chains").value =
+            job ? job.full_chains_to_retain : 2;
+        document.getElementById("job-minimum-chains").value =
+            job ? job.minimum_full_chains : 1;
+        document.getElementById("job-reclaim-mode").value =
+            job ? job.space_reclaim_mode : "SAFE";
         document.getElementById("job-schedule").value = jobScheduleMode(job);
 
         const interval = intervalParts(job ? job.interval_seconds : 3600);
@@ -634,7 +639,12 @@
             enabled: document.getElementById("job-enabled").checked,
             schedule_enabled: scheduleMode !== "manual",
             restore_points_to_retain: Number(document.getElementById("job-retain").value),
-            minimum_full_chains: Number(document.getElementById("job-minimum-chains").value),
+            full_chains_to_retain:
+                Number(document.getElementById("job-full-chains").value),
+            minimum_full_chains:
+                Number(document.getElementById("job-minimum-chains").value),
+            space_reclaim_mode:
+                document.getElementById("job-reclaim-mode").value,
         };
 
         if (scheduleMode === "interval") {

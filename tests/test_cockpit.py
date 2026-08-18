@@ -207,8 +207,22 @@ def test_cockpit_job_management_is_full_only_and_refreshes_authoritative_data():
     assert "Destination" in html
     assert "Schedule mode" in html
     assert "Restore points to retain" in html
+    assert "Full chains to retain" in html
     assert "Minimum full chains" in html
+    assert "Space reclaim mode" in html
+    assert 'value="SAFE">SAFE</option>' in html
+    assert 'value="SPACE_OPTIMIZED">SPACE_OPTIMIZED</option>' in html
+    assert "never removes a valid backup" in html
+    assert "oldest eligible FULL chain" in html
     assert "Manual" in html and "Interval" in html and "Daily" in html
+
+    assert 'job ? job.full_chains_to_retain : 2' in javascript
+    assert 'job ? job.space_reclaim_mode : "SAFE"' in javascript
+    assert 'full_chains_to_retain:' in javascript
+    assert 'document.getElementById("job-full-chains").value' in javascript
+    assert 'space_reclaim_mode:' in javascript
+    assert 'document.getElementById("job-reclaim-mode").value' in javascript
+
     assert 'max_incrementals_per_chain: 0' in javascript
     assert 'await api.request("job.update"' in javascript
     assert 'await api.request("backup.run"' in javascript

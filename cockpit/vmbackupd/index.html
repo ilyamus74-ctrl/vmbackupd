@@ -116,7 +116,19 @@
       </datalist>
       <p id="job-next-run" class="form-note" hidden></p>
       <label>Restore points to retain<input id="job-retain" type="number" min="0" value="7" required></label>
+      <label>Full chains to retain<input id="job-full-chains" type="number" min="1" value="2" required></label>
       <label>Minimum full chains<input id="job-minimum-chains" type="number" min="1" value="1" required></label>
+      <label>Space reclaim mode
+        <select id="job-reclaim-mode">
+          <option value="SAFE">SAFE</option>
+          <option value="SPACE_OPTIMIZED">SPACE_OPTIMIZED</option>
+        </select>
+      </label>
+      <p class="form-note">
+        SAFE never removes a valid backup before a replacement succeeds.
+        SPACE_OPTIMIZED may reclaim the oldest eligible FULL chain before
+        a backup when space is insufficient, while preserving Minimum full chains.
+      </p>
       <p id="job-form-error" class="form-error" role="alert"></p>
       <div class="dialog-actions"><button id="job-cancel" type="button">Cancel</button><button class="primary-action" type="submit">Save job</button></div>
     </form>
