@@ -1585,11 +1585,148 @@ Acceptance:
 
 ---
 
+# SSH.3b — Cockpit SSH identity and host trust
+
+Status: CLOSED
+
+Implementation commit:
+
+    56046ba — Add Cockpit SSH identity and host trust controls
+
+Cockpit now exposes destination-scoped SSH security setup for SSH storage
+destinations.
+
+Client identity controls:
+
+    Show identity status
+    Show public key
+    Show SHA256 fingerprint
+    Generate Ed25519 identity
+    Rotate Ed25519 identity
+
+The private key remains daemon-owned and is never serialized or displayed
+through Cockpit.
+
+Server host trust controls:
+
+    Show trust status
+    Show canonical endpoint
+    Show key type
+    Show SHA256 fingerprint
+    Show trusted host public key
+    Explicitly add a host public key
+    Explicitly revoke host trust
+
+Host trust remains fail-closed:
+
+- no TOFU;
+- no ssh-keyscan;
+- no automatic host-key acceptance;
+- conflicting trusted keys are not replaced automatically;
+- replacement requires explicit revoke followed by explicit add.
+
+Live acceptance verified the two SSH trust directions independently:
+
+    vmbackupd client identity
+        -> public key intended for receiver authorized_keys
+
+    remote SSH server host identity
+        -> public host key stored in daemon known_hosts
+
+The live acceptance used different Ed25519 key pairs and confirmed distinct
+SHA256 fingerprints for the client identity and server host identity.
+
+Filesystem acceptance verified:
+
+    SSH root                       0700
+    identities root                0700
+    per-destination identity dir   0700
+    private key                    0600
+    public key                     0644
+    known_hosts                    0600
+
+The development Cockpit retained its development UNIX socket path while the
+SSH.3b API methods were added to its allowlist.
+
+Acceptance:
+
+- dedicated SSH.3b Cockpit contract passed;
+- existing Cockpit regression passed;
+- SSH identity and known_hosts backend regression passed;
+- packaging regression passed;
+- complete project pytest regression passed;
+- Python compilation passed;
+- Cockpit JavaScript syntax validation passed;
+- no private key path or private key material was exposed by Cockpit;
+- live Generate key operation succeeded;
+- live client fingerprint/public key were rendered by Cockpit;
+- live explicit server host trust succeeded;
+- canonical non-standard endpoint [backup.example.test]:3322 was rendered;
+- live known_hosts contained the trusted server host key;
+- client and server fingerprints were confirmed to be different;
+- daemon remained RUNNING with no warning-level journal entries;
+- temporary SSH destination, identity state, known_hosts state and test host
+  key were removed after acceptance using the pre-test clean snapshot.
+
+---
+
+# Storage replication roadmap
+
+A backup job will support one primary destination and zero or more replica
+destinations.
+
+The VM is captured only once:
+
+    VM
+      -> one QEMU/libvirt backup
+      -> VERIFY
+      -> primary Restore Point
+          -> replica destination A
+          -> replica destination B
+          -> ...
+
+Replication must not trigger a second simultaneous QEMU/libvirt backup of the
+same VM merely to create another storage copy.
+
+Initial destination types may include:
+
+    LOCAL -> LOCAL
+    LOCAL -> SSH
+    SSH-capable receiver destinations as later transport phases mature
+
+Required replication properties:
+
+- primary backup capture occurs once;
+- primary Restore Point is promoted only after primary verification;
+- replicas are created from an already verified Restore Point;
+- every replica has independent transfer/verification state;
+- a failed replica must never appear as a successful replica Restore Point;
+- retrying one replica must not require recapturing the VM;
+- retention must understand primary/replica relationships;
+- removal of one replica must not invalidate another complete copy;
+- incremental chains, when execution support exists, must replicate their
+  required dependency closure rather than an unusable isolated increment;
+- two jobs targeting the same VM must still be serialized at VM execution
+  level and must never perform concurrent QEMU/libvirt backup operations.
+
+Future job model:
+
+    Primary destination
+        exactly one
+
+    Replica destinations
+        zero or more
+
+This is preferred over creating duplicate backup jobs solely to write the same
+capture to multiple disks or remote receivers.
+
+---
+
 # Current position
 
 Current implementation milestone:
 
-    SSH.3a Cockpit SSH storage destinations — CLOSED
+    SSH.3b Cockpit SSH identity and host trust — CLOSED
 
 Current safety boundary:
 
@@ -1619,5 +1756,8 @@ Current safety boundary:
     explicit host key lifecycle   YES
     non-standard host trust port  YES
     Cockpit SSH storage UI        YES
+    Cockpit SSH identity UI       YES
+    Cockpit SSH host trust UI     YES
     SSH connection preflight      NO
     remote SSH transfer           NO
+    backup replication            ROADMAP
