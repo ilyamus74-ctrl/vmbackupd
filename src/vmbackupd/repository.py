@@ -2461,6 +2461,500 @@ class SQLiteRepository:
 
         return self.get_reclaim_operation(operation_id)
 
+    def retire_reclaim_catalog(
+        self,
+        operation_id: str,
+    ) -> ReclaimOperation:
+        """Atomically retire catalog metadata for a quarantined reclaim."""
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            operation = self._require_reclaim_operation_state(
+                operation_id,
+                ReclaimOperationState.QUARANTINED,
+            )
+
+            reclaim_chains = self.connection.execute(
+                """SELECT *
+                   FROM reclaim_chains
+                   WHERE operation_id = ?
+                   ORDER BY ordinal, chain_id""",
+                (operation_id,),
+            ).fetchall()
+
+            reclaim_bundles = self.connection.execute(
+                """SELECT *
+                   FROM reclaim_bundles
+                   WHERE operation_id = ?
+                   ORDER BY chain_id, restore_point_id""",
+                (operation_id,),
+            ).fetchall()
+
+            if not reclaim_chains or not reclaim_bundles:
+                raise DomainInvariantError(
+                    "reclaim catalog retirement requires a complete snapshot"
+                )
+
+            selected_chain_ids = tuple(
+                row["chain_id"] for row in reclaim_chains
+            )
+            selected_chain_set = set(selected_chain_ids)
+
+            if len(selected_chain_ids) != len(selected_chain_set):
+                raise DomainInvariantError(
+                    "reclaim catalog snapshot contains duplicate chains"
+                )
+
+            selected_point_ids = tuple(
+                row["restore_point_id"] for row in reclaim_bundles
+            )
+            selected_point_set = set(selected_point_ids)
+
+            if len(selected_point_ids) != len(selected_point_set):
+                raise DomainInvariantError(
+                    "reclaim catalog snapshot contains duplicate restore points"
+                )
+
+            for bundle in reclaim_bundles:
+                if (
+                    ReclaimBundleState(bundle["state"])
+                    is not ReclaimBundleState.QUARANTINED
+                    or bundle["quarantine_object_id"] is None
+                    or bundle["expected_physical_bytes"] is None
+                    or bundle["source_device"] is None
+                    or bundle["source_inode"] is None
+                ):
+                    raise DomainInvariantError(
+                        "reclaim catalog retirement requires all bundles "
+                        "QUARANTINED with durable evidence"
+                    )
+
+            invalid_physical_total = self.connection.execute(
+                """SELECT rc.chain_id
+                   FROM reclaim_chains rc
+                   LEFT JOIN reclaim_bundles rb
+                     ON rb.operation_id = rc.operation_id
+                    AND rb.chain_id = rc.chain_id
+                   WHERE rc.operation_id = ?
+                   GROUP BY
+                       rc.operation_id,
+                       rc.chain_id,
+                       rc.expected_physical_bytes
+                   HAVING COUNT(rb.restore_point_id) = 0
+                      OR SUM(
+                           CASE
+                               WHEN rb.state = 'QUARANTINED'
+                               THEN 1 ELSE 0
+                           END
+                         ) != COUNT(rb.restore_point_id)
+                      OR COALESCE(
+                           SUM(rb.expected_physical_bytes),
+                           0
+                         ) != rc.expected_physical_bytes
+                   LIMIT 1""",
+                (operation_id,),
+            ).fetchone()
+
+            if invalid_physical_total is not None:
+                raise DomainInvariantError(
+                    "reclaim catalog physical snapshot is inconsistent"
+                )
+
+            context = self.connection.execute(
+                """SELECT
+                       bj.minimum_full_chains AS minimum_full_chains,
+                       bj.space_reclaim_mode AS space_reclaim_mode,
+                       bj.vm_id AS job_vm_id,
+                       bj.storage_destination_id AS job_destination_id,
+                       jr.job_id AS run_job_id,
+                       jr.storage_destination_id AS run_destination_id,
+                       vm.node_id AS vm_node_id,
+                       sd.node_id AS storage_node_id
+                   FROM job_runs jr
+                   JOIN backup_jobs bj ON bj.id = ?
+                   JOIN vms vm ON vm.id = bj.vm_id
+                   LEFT JOIN storage_destinations sd
+                     ON sd.id = jr.storage_destination_id
+                   WHERE jr.id = ?""",
+                (
+                    operation["job_id"],
+                    operation["job_run_id"],
+                ),
+            ).fetchone()
+
+            if context is None:
+                raise DomainInvariantError(
+                    "reclaim catalog retirement lineage is missing"
+                )
+
+            if (
+                context["run_job_id"] != operation["job_id"]
+                or context["job_vm_id"] != operation["vm_id"]
+                or context["job_destination_id"]
+                    != operation["storage_destination_id"]
+                or context["run_destination_id"]
+                    != operation["storage_destination_id"]
+                or context["storage_node_id"] is None
+                or context["storage_node_id"] != context["vm_node_id"]
+            ):
+                raise DomainInvariantError(
+                    "reclaim catalog retirement lineage changed"
+                )
+
+            if (
+                SpaceReclaimMode(context["space_reclaim_mode"])
+                is not SpaceReclaimMode.SPACE_OPTIMIZED
+            ):
+                raise DomainInvariantError(
+                    "reclaim catalog retirement requires "
+                    "SPACE_OPTIMIZED policy"
+                )
+
+            all_chains = self.connection.execute(
+                """SELECT *
+                   FROM backup_chains
+                   WHERE vm_id = ?
+                   ORDER BY created_at, id""",
+                (operation["vm_id"],),
+            ).fetchall()
+
+            chain_by_id = {
+                row["id"]: row
+                for row in all_chains
+            }
+
+            all_points = self.connection.execute(
+                """SELECT rp.*, jr.state AS source_run_state
+                   FROM restore_points rp
+                   JOIN backup_chains bc ON bc.id = rp.chain_id
+                   JOIN job_runs jr ON jr.id = rp.job_run_id
+                   WHERE bc.vm_id = ?
+                   ORDER BY rp.chain_id, rp.sequence, rp.id""",
+                (operation["vm_id"],),
+            ).fetchall()
+
+            members: dict[str, list[sqlite3.Row]] = {
+                row["id"]: [] for row in all_chains
+            }
+            for point in all_points:
+                members[point["chain_id"]].append(point)
+
+            duplicate_bundles = {
+                row["bundle_object_id"]
+                for row in self.connection.execute(
+                    """SELECT bundle_object_id
+                       FROM restore_points
+                       WHERE bundle_object_id IS NOT NULL
+                       GROUP BY bundle_object_id
+                       HAVING COUNT(*) > 1"""
+                )
+            }
+
+            valid_full_chain_members: dict[str, list[sqlite3.Row]] = {}
+
+            for chain in all_chains:
+                chain_members = sorted(
+                    members[chain["id"]],
+                    key=lambda value: (
+                        value["sequence"],
+                        value["id"],
+                    ),
+                )
+
+                if self._reclaim_chain_problem(
+                    chain_members,
+                    duplicate_bundles,
+                ) is None:
+                    valid_full_chain_members[
+                        chain["id"]
+                    ] = chain_members
+
+            snapshot_by_chain: dict[str, dict[str, str]] = {}
+            for bundle in reclaim_bundles:
+                snapshot_by_chain.setdefault(
+                    bundle["chain_id"],
+                    {},
+                )[bundle["restore_point_id"]] = (
+                    bundle["source_bundle_object_id"]
+                )
+
+            if set(snapshot_by_chain) != selected_chain_set:
+                raise DomainInvariantError(
+                    "reclaim catalog chain membership changed"
+                )
+
+            selected_catalog_points: list[sqlite3.Row] = []
+
+            for chain_id in selected_chain_ids:
+                chain = chain_by_id.get(chain_id)
+
+                if chain is None:
+                    raise DomainInvariantError(
+                        "selected reclaim chain disappeared before "
+                        "catalog retirement"
+                    )
+
+                if (
+                    BackupChainStatus(chain["status"])
+                    is not BackupChainStatus.CLOSED
+                ):
+                    raise DomainInvariantError(
+                        "selected reclaim chain is no longer CLOSED"
+                    )
+
+                current_members = valid_full_chain_members.get(chain_id)
+                if current_members is None:
+                    raise DomainInvariantError(
+                        "selected reclaim chain is no longer "
+                        "a valid populated FULL chain"
+                    )
+
+                current_snapshot = {
+                    point["id"]: point["bundle_object_id"]
+                    for point in current_members
+                }
+
+                if current_snapshot != snapshot_by_chain[chain_id]:
+                    raise DomainInvariantError(
+                        "selected reclaim catalog snapshot changed"
+                    )
+
+                selected_catalog_points.extend(current_members)
+
+            valid_remaining = (
+                len(valid_full_chain_members)
+                - len(selected_chain_set)
+            )
+
+            if valid_remaining < context["minimum_full_chains"]:
+                raise DomainInvariantError(
+                    "reclaim catalog retirement violates "
+                    "minimum_full_chains"
+                )
+
+            if {
+                point["id"]
+                for point in selected_catalog_points
+            } != selected_point_set:
+                raise DomainInvariantError(
+                    "reclaim restore-point membership changed"
+                )
+
+            point_placeholders = ",".join(
+                "?" for _ in selected_point_ids
+            )
+
+            external_point_dependency = self.connection.execute(
+                f"""SELECT id
+                    FROM restore_points
+                    WHERE parent_restore_point_id IN (
+                        {point_placeholders}
+                    )
+                      AND id NOT IN (
+                        {point_placeholders}
+                    )
+                    LIMIT 1""",
+                selected_point_ids + selected_point_ids,
+            ).fetchone()
+
+            if external_point_dependency is not None:
+                raise DomainInvariantError(
+                    "external restore point depends on reclaim catalog"
+                )
+
+            source_run_ids = tuple(
+                point["job_run_id"]
+                for point in selected_catalog_points
+            )
+            source_run_set = set(source_run_ids)
+
+            if len(source_run_ids) != len(source_run_set):
+                raise DomainInvariantError(
+                    "reclaim restore points do not have unique source runs"
+                )
+
+            run_placeholders = ",".join(
+                "?" for _ in source_run_ids
+            )
+
+            external_run_dependency = self.connection.execute(
+                f"""SELECT id
+                    FROM job_runs
+                    WHERE parent_restore_point_id IN (
+                        {point_placeholders}
+                    )
+                      AND id NOT IN (
+                        {run_placeholders}
+                    )
+                    LIMIT 1""",
+                selected_point_ids + source_run_ids,
+            ).fetchone()
+
+            if external_run_dependency is not None:
+                raise DomainInvariantError(
+                    "external job run depends on reclaim catalog"
+                )
+
+            artifacts = self.connection.execute(
+                f"""SELECT *
+                    FROM backup_artifacts
+                    WHERE job_run_id IN ({run_placeholders})
+                    ORDER BY job_run_id, id""",
+                source_run_ids,
+            ).fetchall()
+
+            for artifact in artifacts:
+                if (
+                    artifact["restore_point_id"] not in selected_point_set
+                    or ArtifactState(artifact["state"])
+                        is not ArtifactState.PUBLISHED
+                ):
+                    raise DomainInvariantError(
+                        "source-run artifact catalog does not match "
+                        "reclaim restore points"
+                    )
+
+            artifact_ids = tuple(
+                artifact["id"] for artifact in artifacts
+            )
+
+            if artifact_ids:
+                artifact_placeholders = ",".join(
+                    "?" for _ in artifact_ids
+                )
+
+                self.connection.execute(
+                    f"""UPDATE run_disks
+                        SET planned_artifact_id = NULL
+                        WHERE planned_artifact_id IN (
+                            {artifact_placeholders}
+                        )""",
+                    artifact_ids,
+                )
+
+                self.connection.execute(
+                    f"""DELETE FROM backup_artifacts
+                        WHERE id IN ({artifact_placeholders})""",
+                    artifact_ids,
+                )
+
+            # Historical source runs may reference an earlier restore point
+            # inside the same retired chain. Those references cannot survive
+            # deletion of the restore-point rows.
+            self.connection.execute(
+                f"""UPDATE job_runs
+                    SET parent_restore_point_id = NULL
+                    WHERE id IN ({run_placeholders})
+                      AND parent_restore_point_id IN (
+                          {point_placeholders}
+                      )""",
+                source_run_ids + selected_point_ids,
+            )
+
+            # Delete child incrementals before their parents so immediate
+            # self-referential FK constraints remain satisfied.
+            deletion_order = sorted(
+                selected_catalog_points,
+                key=lambda point: (
+                    point["chain_id"],
+                    point["sequence"],
+                    point["id"],
+                ),
+                reverse=True,
+            )
+
+            for point in deletion_order:
+                cursor = self.connection.execute(
+                    "DELETE FROM restore_points WHERE id = ?",
+                    (point["id"],),
+                )
+                if cursor.rowcount != 1:
+                    raise DomainInvariantError(
+                        "selected restore point changed during "
+                        "catalog retirement"
+                    )
+
+            for chain_id in selected_chain_ids:
+                cursor = self.connection.execute(
+                    "DELETE FROM backup_chains WHERE id = ?",
+                    (chain_id,),
+                )
+                if cursor.rowcount != 1:
+                    raise DomainInvariantError(
+                        "selected backup chain changed during "
+                        "catalog retirement"
+                    )
+
+            remaining_point = self.connection.execute(
+                f"""SELECT 1
+                    FROM restore_points
+                    WHERE id IN ({point_placeholders})
+                    LIMIT 1""",
+                selected_point_ids,
+            ).fetchone()
+
+            if remaining_point is not None:
+                raise DomainInvariantError(
+                    "reclaim restore points remain after retirement"
+                )
+
+            chain_placeholders = ",".join(
+                "?" for _ in selected_chain_ids
+            )
+
+            remaining_chain = self.connection.execute(
+                f"""SELECT 1
+                    FROM backup_chains
+                    WHERE id IN ({chain_placeholders})
+                    LIMIT 1""",
+                selected_chain_ids,
+            ).fetchone()
+
+            if remaining_chain is not None:
+                raise DomainInvariantError(
+                    "reclaim chains remain after retirement"
+                )
+
+            journal_chain_count = self.connection.execute(
+                """SELECT COUNT(*)
+                   FROM reclaim_chains
+                   WHERE operation_id = ?""",
+                (operation_id,),
+            ).fetchone()[0]
+
+            journal_bundle_count = self.connection.execute(
+                """SELECT COUNT(*)
+                   FROM reclaim_bundles
+                   WHERE operation_id = ?""",
+                (operation_id,),
+            ).fetchone()[0]
+
+            if (
+                journal_chain_count != len(reclaim_chains)
+                or journal_bundle_count != len(reclaim_bundles)
+            ):
+                raise DomainInvariantError(
+                    "durable reclaim journal changed during "
+                    "catalog retirement"
+                )
+
+            self._set_reclaim_operation_state(
+                operation,
+                ReclaimOperationState.CATALOG_REMOVED,
+            )
+
+            self.connection.commit()
+        except sqlite3.IntegrityError as exc:
+            self.connection.rollback()
+            raise DomainInvariantError(
+                f"reclaim catalog retirement rejected: {exc}"
+            ) from exc
+        except Exception:
+            self.connection.rollback()
+            raise
+
+        return self.get_reclaim_operation(operation_id)
+
     def mark_reclaim_catalog_removed(
         self,
         operation_id: str,

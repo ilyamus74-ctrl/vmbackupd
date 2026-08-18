@@ -1294,3 +1294,374 @@ def test_recovery_resume_rejects_incompatible_database_evidence(
         still_recovery.recovery_from_state
         is ReclaimOperationState.RETIRING
     )
+
+
+def make_quarantined_reclaim(
+    repository,
+    job,
+    vm,
+    target_run,
+    *,
+    points=1,
+    physical_bytes=100,
+):
+    operation, chain, restore_points = make_planned_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+        points=points,
+        physical_bytes=physical_bytes,
+    )
+
+    repository.begin_reclaim_retirement(operation.id)
+
+    base = physical_bytes // points
+    remaining = physical_bytes
+
+    for index, point in enumerate(restore_points):
+        amount = (
+            remaining
+            if index == len(restore_points) - 1
+            else base
+        )
+        remaining -= amount
+
+        repository.mark_reclaim_bundle_quarantined(
+            operation.id,
+            point.id,
+            quarantine_object_id=(
+                f"/reclaim/{operation.id}/{point.id}"
+            ),
+            expected_physical_bytes=amount,
+            source_device=100,
+            source_inode=2000 + index,
+        )
+
+    operation = repository.mark_reclaim_quarantined(
+        operation.id
+    )
+
+    return operation, chain, restore_points
+
+
+def test_atomic_catalog_retirement_preserves_reclaim_journal(
+    tmp_path,
+):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "catalog-retirement.db"
+    )
+
+    operation, chain, points = make_quarantined_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+        points=2,
+        physical_bytes=100,
+    )
+
+    journal_chains_before = repository.list_reclaim_chains(
+        operation.id
+    )
+    journal_bundles_before = repository.list_reclaim_bundles(
+        operation.id
+    )
+
+    operation = repository.retire_reclaim_catalog(
+        operation.id
+    )
+
+    assert (
+        operation.state
+        is ReclaimOperationState.CATALOG_REMOVED
+    )
+
+    assert repository.connection.execute(
+        "SELECT COUNT(*) FROM restore_points WHERE chain_id = ?",
+        (chain.id,),
+    ).fetchone()[0] == 0
+
+    assert repository.connection.execute(
+        "SELECT COUNT(*) FROM backup_chains WHERE id = ?",
+        (chain.id,),
+    ).fetchone()[0] == 0
+
+    assert repository.list_reclaim_chains(
+        operation.id
+    ) == journal_chains_before
+
+    assert repository.list_reclaim_bundles(
+        operation.id
+    ) == journal_bundles_before
+
+    for point in points:
+        assert repository.connection.execute(
+            "SELECT COUNT(*) FROM job_runs WHERE id = ?",
+            (point.job_run_id,),
+        ).fetchone()[0] == 1
+
+
+def test_catalog_retirement_refuses_external_run_dependency_atomically(
+    tmp_path,
+):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "external-run-dependency.db"
+    )
+
+    operation, chain, points = make_quarantined_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+    )
+
+    repository.connection.execute(
+        """UPDATE job_runs
+           SET parent_restore_point_id = ?
+           WHERE id = ?""",
+        (
+            points[0].id,
+            target_run.id,
+        ),
+    )
+    repository.connection.commit()
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="external job run depends",
+    ):
+        repository.retire_reclaim_catalog(operation.id)
+
+    assert (
+        repository.get_reclaim_operation(operation.id).state
+        is ReclaimOperationState.QUARANTINED
+    )
+
+    assert repository.connection.execute(
+        "SELECT COUNT(*) FROM restore_points WHERE id = ?",
+        (points[0].id,),
+    ).fetchone()[0] == 1
+
+    assert repository.connection.execute(
+        "SELECT COUNT(*) FROM backup_chains WHERE id = ?",
+        (chain.id,),
+    ).fetchone()[0] == 1
+
+
+def test_catalog_retirement_refuses_snapshot_drift_atomically(
+    tmp_path,
+):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "catalog-drift.db"
+    )
+
+    operation, chain, points = make_quarantined_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+    )
+
+    repository.connection.execute(
+        """UPDATE restore_points
+           SET bundle_object_id = ?
+           WHERE id = ?""",
+        (
+            "/changed/after/quarantine",
+            points[0].id,
+        ),
+    )
+    repository.connection.commit()
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="snapshot changed",
+    ):
+        repository.retire_reclaim_catalog(operation.id)
+
+    assert repository.connection.execute(
+        "SELECT COUNT(*) FROM restore_points WHERE id = ?",
+        (points[0].id,),
+    ).fetchone()[0] == 1
+
+    assert repository.connection.execute(
+        "SELECT COUNT(*) FROM backup_chains WHERE id = ?",
+        (chain.id,),
+    ).fetchone()[0] == 1
+
+
+def test_catalog_retirement_revalidates_minimum_full_chain_floor(
+    tmp_path,
+):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "catalog-floor.db",
+        minimum_full_chains=1,
+    )
+
+    operation, chain, _ = make_quarantined_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+    )
+
+    survivor = repository.connection.execute(
+        """SELECT bc.id
+           FROM backup_chains bc
+           WHERE bc.vm_id = ?
+             AND bc.id != ?
+           ORDER BY bc.created_at DESC
+           LIMIT 1""",
+        (
+            vm.id,
+            chain.id,
+        ),
+    ).fetchone()
+
+    assert survivor is not None
+
+    repository.connection.execute(
+        "DELETE FROM restore_points WHERE chain_id = ?",
+        (survivor["id"],),
+    )
+    repository.connection.commit()
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="minimum_full_chains",
+    ):
+        repository.retire_reclaim_catalog(operation.id)
+
+    assert (
+        repository.get_reclaim_operation(operation.id).state
+        is ReclaimOperationState.QUARANTINED
+    )
+
+
+def test_catalog_retirement_deletes_artifacts_and_detaches_run_disk(
+    tmp_path,
+):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "catalog-artifacts.db"
+    )
+
+    operation, _, points = make_quarantined_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+    )
+
+    source_run_id = points[0].job_run_id
+    artifact_id = "catalog-retire-artifact"
+
+    repository.connection.execute(
+        """INSERT INTO backup_artifacts (
+               id,
+               job_run_id,
+               restore_point_id,
+               kind,
+               disk_target,
+               object_id,
+               format,
+               state,
+               created_at,
+               published_object_id
+           )
+           VALUES (?, ?, ?, 'DISK', 'vdb', ?, 'qcow2',
+                   'PUBLISHED', ?, ?)""",
+        (
+            artifact_id,
+            source_run_id,
+            points[0].id,
+            "/published/catalog-retire-artifact",
+            points[0].created_at.isoformat(),
+            "/published/catalog-retire-artifact",
+        ),
+    )
+
+    repository.connection.execute(
+        """INSERT INTO run_disks (
+               run_id,
+               target_dev,
+               source_type,
+               source_path,
+               source_format,
+               backup_enabled,
+               planned_artifact_id
+           )
+           VALUES (?, 'vdb', 'file', '/source/vdb',
+                   'qcow2', 1, ?)""",
+        (
+            source_run_id,
+            artifact_id,
+        ),
+    )
+
+    repository.connection.commit()
+
+    repository.retire_reclaim_catalog(operation.id)
+
+    assert repository.connection.execute(
+        "SELECT COUNT(*) FROM backup_artifacts WHERE id = ?",
+        (artifact_id,),
+    ).fetchone()[0] == 0
+
+    assert repository.connection.execute(
+        """SELECT planned_artifact_id
+           FROM run_disks
+           WHERE run_id = ?
+             AND target_dev = 'vdb'""",
+        (source_run_id,),
+    ).fetchone()[0] is None
+
+
+def test_catalog_retirement_rolls_back_every_catalog_change_on_failure(
+    tmp_path,
+):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "catalog-rollback.db"
+    )
+
+    operation, chain, points = make_quarantined_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+    )
+
+    repository.connection.execute(
+        f"""CREATE TRIGGER refuse_reclaim_chain_delete
+            BEFORE DELETE ON backup_chains
+            WHEN OLD.id = '{chain.id}'
+            BEGIN
+                SELECT RAISE(ABORT, 'simulated catalog failure');
+            END"""
+    )
+    repository.connection.commit()
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="simulated catalog failure",
+    ):
+        repository.retire_reclaim_catalog(operation.id)
+
+    assert (
+        repository.get_reclaim_operation(operation.id).state
+        is ReclaimOperationState.QUARANTINED
+    )
+
+    assert repository.connection.execute(
+        "SELECT COUNT(*) FROM restore_points WHERE id = ?",
+        (points[0].id,),
+    ).fetchone()[0] == 1
+
+    assert repository.connection.execute(
+        "SELECT COUNT(*) FROM backup_chains WHERE id = ?",
+        (chain.id,),
+    ).fetchone()[0] == 1
+
+    assert len(
+        repository.list_reclaim_bundles(operation.id)
+    ) == 1
