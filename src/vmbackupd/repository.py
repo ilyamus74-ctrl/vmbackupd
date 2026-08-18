@@ -26,6 +26,9 @@ class DomainInvariantError(ValueError):
     pass
 
 
+_STORAGE_UNSET = object()
+
+
 class SQLiteRepository:
     def __init__(self, database: str | Path = ":memory:") -> None:
         self.connection = sqlite3.connect(str(database))
@@ -366,20 +369,50 @@ class SQLiteRepository:
         backup_data_root: str | None = None,
         minimum_free_bytes: int | None = None,
         minimum_free_percent: float | None = None, make_default: bool = False,
+        storage_type=_STORAGE_UNSET,
+        ssh_host=_STORAGE_UNSET, ssh_port=_STORAGE_UNSET,
+        ssh_user=_STORAGE_UNSET, ssh_remote_root=_STORAGE_UNSET,
     ) -> StorageDestination:
         try:
             self.connection.execute("BEGIN IMMEDIATE")
             current = self.get_storage_destination(node_id, destination_id)
+
+            target_type = (
+                current.storage_type
+                if storage_type is _STORAGE_UNSET
+                else StorageType(storage_type)
+            )
+            if target_type is not current.storage_type:
+                raise DomainInvariantError(
+                    "STORAGE_DESTINATION_TYPE_IMMUTABLE"
+                )
+
             updated = StorageDestination(
                 id=current.id, node_id=current.node_id, created_at=current.created_at,
                 name=current.name if name is None else name,
                 backup_data_root=(current.backup_data_root if backup_data_root is None
                                   else backup_data_root),
-                storage_type=current.storage_type,
-                ssh_host=current.ssh_host,
-                ssh_port=current.ssh_port,
-                ssh_user=current.ssh_user,
-                ssh_remote_root=current.ssh_remote_root,
+                storage_type=target_type,
+                ssh_host=(
+                    current.ssh_host
+                    if ssh_host is _STORAGE_UNSET
+                    else ssh_host
+                ),
+                ssh_port=(
+                    current.ssh_port
+                    if ssh_port is _STORAGE_UNSET
+                    else ssh_port
+                ),
+                ssh_user=(
+                    current.ssh_user
+                    if ssh_user is _STORAGE_UNSET
+                    else ssh_user
+                ),
+                ssh_remote_root=(
+                    current.ssh_remote_root
+                    if ssh_remote_root is _STORAGE_UNSET
+                    else ssh_remote_root
+                ),
                 backup_data_mode=current.backup_data_mode,
                 backup_data_uid=current.backup_data_uid,
                 backup_data_gid=current.backup_data_gid,
@@ -393,8 +426,15 @@ class SQLiteRepository:
             self._validate_storage_fields(updated)
             if self.storage_destination_identity_locked(node_id, destination_id) and (
                 updated.backup_data_root != current.backup_data_root
+                or updated.storage_type != current.storage_type
+                or updated.ssh_host != current.ssh_host
+                or updated.ssh_port != current.ssh_port
+                or updated.ssh_user != current.ssh_user
+                or updated.ssh_remote_root != current.ssh_remote_root
             ):
-                raise DomainInvariantError("STORAGE_DESTINATION_IDENTITY_LOCKED")
+                raise DomainInvariantError(
+                    "STORAGE_DESTINATION_IDENTITY_LOCKED"
+                )
             self._validate_storage_uniqueness(
                 node_id, updated.name, updated.backup_data_root,
                 exclude_id=destination_id,
@@ -405,11 +445,25 @@ class SQLiteRepository:
                 )
             self.connection.execute(
                 """UPDATE storage_destinations SET name = ?,
-                   backup_data_root = ?, minimum_free_bytes = ?, minimum_free_percent = ?,
+                   backup_data_root = ?,
+                   storage_type = ?, ssh_host = ?, ssh_port = ?,
+                   ssh_user = ?, ssh_remote_root = ?,
+                   minimum_free_bytes = ?, minimum_free_percent = ?,
                    is_default = ? WHERE id = ? AND node_id = ?""",
-                (updated.name, updated.backup_data_root,
-                 updated.minimum_free_bytes, updated.minimum_free_percent,
-                 int(updated.is_default), destination_id, node_id),
+                (
+                    updated.name,
+                    updated.backup_data_root,
+                    updated.storage_type.value,
+                    updated.ssh_host,
+                    updated.ssh_port,
+                    updated.ssh_user,
+                    updated.ssh_remote_root,
+                    updated.minimum_free_bytes,
+                    updated.minimum_free_percent,
+                    int(updated.is_default),
+                    destination_id,
+                    node_id,
+                ),
             )
             self.connection.commit()
         except sqlite3.IntegrityError as exc:
@@ -446,9 +500,13 @@ class SQLiteRepository:
         if value.storage_destination_id is None:
             raise DomainInvariantError("STORAGE_DESTINATION_REQUIRED")
         try:
-            self.get_storage_destination(vm.node_id, value.storage_destination_id)
+            destination = self.get_storage_destination(
+                vm.node_id, value.storage_destination_id
+            )
         except KeyError as exc:
             raise DomainInvariantError("STORAGE_DESTINATION_NOT_LOCAL") from exc
+        if destination.storage_type is StorageType.SSH:
+            raise DomainInvariantError("REMOTE_TRANSPORT_NOT_IMPLEMENTED")
         self.connection.execute(
             """INSERT INTO backup_jobs (
                    id, vm_id, name, storage_destination_id, enabled,
@@ -499,15 +557,24 @@ class SQLiteRepository:
                 raise DomainInvariantError("JOB_NOT_LOCAL")
             destination_id = current.storage_destination_id
             if storage_destination_id is not None:
-                destination_id = self.get_storage_destination(
+                destination = self.get_storage_destination(
                     local_node_id, storage_destination_id
-                ).id
+                )
+                if destination.storage_type is StorageType.SSH:
+                    raise DomainInvariantError(
+                        "REMOTE_TRANSPORT_NOT_IMPLEMENTED"
+                    )
+                destination_id = destination.id
             elif storage_destination is not None:
                 destination = self.get_storage_destination_by_name(
                     local_node_id, storage_destination
                 )
                 if destination is None:
                     raise KeyError(storage_destination)
+                if destination.storage_type is StorageType.SSH:
+                    raise DomainInvariantError(
+                        "REMOTE_TRANSPORT_NOT_IMPLEMENTED"
+                    )
                 destination_id = destination.id
             if destination_id is None:
                 raise DomainInvariantError("STORAGE_DESTINATION_REQUIRED")

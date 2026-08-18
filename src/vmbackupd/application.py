@@ -11,6 +11,7 @@ from . import serialization
 from .clock import Clock
 from .models import (
     BackupJob, BackupPolicy, RetentionPolicy, SchedulePolicy, StorageDestination,
+    StorageType,
 )
 from .repository import DomainInvariantError, SQLiteRepository
 from .storage import LocalStorageTester, lexical_storage_path, storage_path_has_symlink
@@ -68,6 +69,8 @@ class VmbackupApplication:
             raise ApplicationError("INVALID_PARAMS", str(exc)) from None
 
     def _free(self, destination: StorageDestination) -> int | None:
+        if destination.storage_type is StorageType.SSH:
+            return None
         try:
             path = lexical_storage_path(destination.backup_data_root)
             if storage_path_has_symlink(path) or not path.is_dir():
@@ -147,13 +150,26 @@ class VmbackupApplication:
 
     def storage_create(self, name, backup_data_root,
                        minimum_free_bytes=0, minimum_free_percent=5,
-                       make_default=False):
+                       make_default=False, storage_type="LOCAL",
+                       ssh_host=None, ssh_port=None, ssh_user=None,
+                       ssh_remote_root=None):
         if not isinstance(make_default, bool):
             raise ApplicationError("INVALID_PARAMS", "make_default must be boolean")
         name, backup_data_root, free_bytes, free_percent = (
             self._validate_storage_values(name, backup_data_root,
                                           minimum_free_bytes, minimum_free_percent)
         )
+        if not isinstance(storage_type, str):
+            raise ApplicationError(
+                "INVALID_PARAMS", "storage_type must be LOCAL or SSH"
+            )
+        try:
+            transport = StorageType(storage_type.strip().upper())
+        except ValueError:
+            raise ApplicationError(
+                "INVALID_PARAMS", "storage_type must be LOCAL or SSH"
+            ) from None
+
         profile = self._seed_access_profile()
         value = StorageDestination(
             node_id=self.node.id, name=name,
@@ -161,7 +177,13 @@ class VmbackupApplication:
             backup_data_mode=profile.backup_data_mode,
             backup_data_uid=profile.backup_data_uid,
             backup_data_gid=profile.backup_data_gid,
-            minimum_free_bytes=free_bytes, minimum_free_percent=free_percent,
+            minimum_free_bytes=free_bytes,
+            minimum_free_percent=free_percent,
+            storage_type=transport,
+            ssh_host=ssh_host,
+            ssh_port=ssh_port,
+            ssh_user=ssh_user,
+            ssh_remote_root=ssh_remote_root,
         )
         return self._serialize_storage(
             self.repository.create_storage_destination(value, make_default=make_default)
@@ -169,32 +191,86 @@ class VmbackupApplication:
 
     def storage_update(self, id, name=None, backup_data_root=None,
                        minimum_free_bytes=None, minimum_free_percent=None,
-                       make_default=False):
+                       make_default=False, storage_type=_UNSET,
+                       ssh_host=_UNSET, ssh_port=_UNSET,
+                       ssh_user=_UNSET, ssh_remote_root=_UNSET):
         if not isinstance(make_default, bool):
             raise ApplicationError("INVALID_PARAMS", "make_default must be boolean")
         if name is not None and (not isinstance(name, str) or not name.strip()):
             raise ApplicationError("INVALID_PARAMS", "storage name must not be empty")
-        for root in (backup_data_root,):
-            if root is not None:
-                try:
-                    lexical_storage_path(root)
-                except ValueError:
-                    raise ApplicationError(
-                        "INVALID_PARAMS", "storage roots must be absolute and traversal-free"
-                    ) from None
+
+        current = self.repository.get_storage_destination(self.node.id, id)
+
+        if storage_type is not _UNSET:
+            if not isinstance(storage_type, str):
+                raise ApplicationError(
+                    "INVALID_PARAMS", "storage_type must be LOCAL or SSH"
+                )
+            try:
+                requested_type = StorageType(storage_type.strip().upper())
+            except ValueError:
+                raise ApplicationError(
+                    "INVALID_PARAMS", "storage_type must be LOCAL or SSH"
+                ) from None
+            if requested_type is not current.storage_type:
+                raise ApplicationError(
+                    "STORAGE_TYPE_IMMUTABLE",
+                    "storage destination type cannot be changed; "
+                    "create a new destination",
+                )
+
+        if backup_data_root is not None:
+            try:
+                lexical_storage_path(backup_data_root)
+            except ValueError:
+                raise ApplicationError(
+                    "INVALID_PARAMS",
+                    "storage roots must be absolute and traversal-free",
+                ) from None
+
+        if ssh_remote_root is not _UNSET and ssh_remote_root is not None:
+            try:
+                lexical_storage_path(ssh_remote_root)
+            except ValueError:
+                raise ApplicationError(
+                    "INVALID_PARAMS",
+                    "ssh_remote_root must be absolute and traversal-free",
+                ) from None
+
         if minimum_free_bytes is not None and int(minimum_free_bytes) < 0:
-            raise ApplicationError("INVALID_PARAMS", "minimum_free_bytes must be non-negative")
+            raise ApplicationError(
+                "INVALID_PARAMS", "minimum_free_bytes must be non-negative"
+            )
         if (minimum_free_percent is not None
                 and not 0 <= float(minimum_free_percent) <= 100):
-            raise ApplicationError("INVALID_PARAMS", "minimum_free_percent is outside valid range")
+            raise ApplicationError(
+                "INVALID_PARAMS",
+                "minimum_free_percent is outside valid range",
+            )
+
+        transport_patch = {}
+        for key, candidate in (
+            ("ssh_host", ssh_host),
+            ("ssh_port", ssh_port),
+            ("ssh_user", ssh_user),
+            ("ssh_remote_root", ssh_remote_root),
+        ):
+            if candidate is not _UNSET:
+                transport_patch[key] = candidate
+
         value = self.repository.update_storage_destination(
-            self.node.id, id, name=None if name is None else name.strip(),
+            self.node.id,
+            id,
+            name=None if name is None else name.strip(),
             backup_data_root=backup_data_root,
-            minimum_free_bytes=(None if minimum_free_bytes is None
-                                else int(minimum_free_bytes)),
-            minimum_free_percent=(None if minimum_free_percent is None
-                                  else float(minimum_free_percent)),
+            minimum_free_bytes=(
+                None if minimum_free_bytes is None else int(minimum_free_bytes)
+            ),
+            minimum_free_percent=(
+                None if minimum_free_percent is None else float(minimum_free_percent)
+            ),
             make_default=make_default,
+            **transport_patch,
         )
         return self._serialize_storage(value)
 
@@ -211,6 +287,11 @@ class VmbackupApplication:
             )):
                 raise ApplicationError("INVALID_PARAMS", "test by ID or candidate, not both")
             value = self.repository.get_storage_destination(self.node.id, id)
+            if value.storage_type is StorageType.SSH:
+                raise ApplicationError(
+                    "REMOTE_TRANSPORT_NOT_IMPLEMENTED",
+                    "SSH destination connection testing is not implemented yet",
+                )
             backup_data_root = value.backup_data_root
             minimum_free_bytes = value.minimum_free_bytes
             minimum_free_percent = value.minimum_free_percent
@@ -275,6 +356,14 @@ class VmbackupApplication:
                 raise ApplicationError("NOT_FOUND", "storage destination not found")
         else:
             destination = self.repository.get_default_storage_destination(self.node.id)
+
+        if destination.storage_type is StorageType.SSH:
+            raise ApplicationError(
+                "REMOTE_TRANSPORT_NOT_IMPLEMENTED",
+                "SSH destinations cannot be assigned to backup jobs "
+                "until remote transport is implemented",
+            )
+
         try:
             schedule = SchedulePolicy(
                 int(interval_seconds),
@@ -327,6 +416,32 @@ class VmbackupApplication:
             raise ApplicationError("INVALID_PARAMS", "job name must not be empty")
         if storage_destination_id and storage_destination:
             raise ApplicationError("INVALID_PARAMS", "select destination by ID or name, not both")
+
+        if storage_destination_id:
+            candidate = self.repository.get_storage_destination(
+                self.node.id, storage_destination_id
+            )
+            if candidate.storage_type is StorageType.SSH:
+                raise ApplicationError(
+                    "REMOTE_TRANSPORT_NOT_IMPLEMENTED",
+                    "SSH destinations cannot be assigned to backup jobs "
+                    "until remote transport is implemented",
+                )
+        elif storage_destination:
+            candidate = self.repository.get_storage_destination_by_name(
+                self.node.id, storage_destination
+            )
+            if candidate is None:
+                raise ApplicationError(
+                    "NOT_FOUND", "storage destination not found"
+                )
+            if candidate.storage_type is StorageType.SSH:
+                raise ApplicationError(
+                    "REMOTE_TRANSPORT_NOT_IMPLEMENTED",
+                    "SSH destinations cannot be assigned to backup jobs "
+                    "until remote transport is implemented",
+                )
+
         return serialization.job(self.repository.update_job(
             id, self.node.id, self.clock.now(), name=name, enabled=enabled,
             storage_destination_id=storage_destination_id,
@@ -363,7 +478,26 @@ class VmbackupApplication:
             raise ApplicationError("RUNTIME_UNAVAILABLE", "runtime worker is not RUNNING")
         if not self.config.libvirt.allow_mutation:
             raise ApplicationError("MUTATION_DISABLED", "libvirt mutation is disabled")
-        value = self.repository.create_manual_run(job_id, self.node.id, self.clock.now())
+
+        job = self.repository.get_job(job_id)
+        self._require_local_job(job)
+        if job.storage_destination_id is None:
+            raise ApplicationError(
+                "STORAGE_DESTINATION_REQUIRED",
+                "backup job has no storage destination",
+            )
+        destination = self.repository.get_storage_destination(
+            self.node.id, job.storage_destination_id
+        )
+        if destination.storage_type is StorageType.SSH:
+            raise ApplicationError(
+                "REMOTE_TRANSPORT_NOT_IMPLEMENTED",
+                "SSH backup execution is not implemented yet",
+            )
+
+        value = self.repository.create_manual_run(
+            job_id, self.node.id, self.clock.now()
+        )
         return {"run_id": value.id, "state": value.state.value}
 
     def run_list(self): return [serialization.run(x) for x in self.repository.list_runs_for_node(self.node.id)]

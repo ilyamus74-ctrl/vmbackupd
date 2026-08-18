@@ -32,12 +32,29 @@ def _parser():
             if group == "storage" and command == "create":
                 item.add_argument("--name", required=True)
                 item.add_argument("--backup-data-root", required=True)
+                item.add_argument(
+                    "--storage-type",
+                    choices=("LOCAL", "SSH"),
+                    default="LOCAL",
+                )
+                item.add_argument("--ssh-host")
+                item.add_argument("--ssh-port", type=int)
+                item.add_argument("--ssh-user")
+                item.add_argument("--ssh-remote-root")
                 item.add_argument("--minimum-free-bytes", type=int, default=0)
                 item.add_argument("--minimum-free-percent", type=float, default=5)
                 item.add_argument("--default", action="store_true")
             if group == "storage" and command == "update":
                 item.add_argument("id"); item.add_argument("--name")
                 item.add_argument("--backup-data-root")
+                item.add_argument(
+                    "--storage-type",
+                    choices=("LOCAL", "SSH"),
+                )
+                item.add_argument("--ssh-host")
+                item.add_argument("--ssh-port", type=int)
+                item.add_argument("--ssh-user")
+                item.add_argument("--ssh-remote-root")
                 item.add_argument("--minimum-free-bytes", type=int)
                 item.add_argument("--minimum-free-percent", type=float)
                 item.add_argument("--default", action="store_true")
@@ -113,12 +130,29 @@ def _request(args):
                   "minimum_free_bytes": args.minimum_free_bytes,
                   "minimum_free_percent": args.minimum_free_percent,
                   "make_default": args.default}
+        if args.storage_type == "SSH":
+            params.update({
+                "storage_type": args.storage_type,
+                "ssh_host": args.ssh_host,
+                "ssh_port": args.ssh_port,
+                "ssh_user": args.ssh_user,
+                "ssh_remote_root": args.ssh_remote_root,
+            })
     elif args.group == "storage" and args.command == "update":
         params = {"id": args.id, "name": args.name,
                   "backup_data_root": args.backup_data_root,
                   "minimum_free_bytes": args.minimum_free_bytes,
                   "minimum_free_percent": args.minimum_free_percent,
                   "make_default": args.default}
+        for key, value in (
+            ("storage_type", args.storage_type),
+            ("ssh_host", args.ssh_host),
+            ("ssh_port", args.ssh_port),
+            ("ssh_user", args.ssh_user),
+            ("ssh_remote_root", args.ssh_remote_root),
+        ):
+            if value is not None:
+                params[key] = value
     elif args.group == "storage" and args.command in {"set-default", "test"}:
         params = {"id": args.id}
     elif args.group == "vm" and args.command == "register":

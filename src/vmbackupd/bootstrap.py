@@ -48,6 +48,8 @@ class StorageRoutingExecutor:
         )
         if destination.node_id != vm.node_id:
             raise DomainInvariantError("STORAGE_DESTINATION_NOT_LOCAL")
+        if destination.storage_type.value == "SSH":
+            raise DomainInvariantError("REMOTE_TRANSPORT_NOT_IMPLEMENTED")
         cached = self.executors.get(destination.id)
         if cached is None or cached[0] != destination:
             cached = (destination, self.factory(destination))
@@ -213,6 +215,13 @@ def compose(config: AppConfig) -> Components:
         backup_data_uid=item.backup_data_uid, backup_data_gid=item.backup_data_gid,
         minimum_free_bytes=item.minimum_free_bytes,
         minimum_free_percent=item.minimum_free_percent,
+        storage_type=item.storage_type,
+        ssh_host=item.ssh_host,
+        ssh_port=item.ssh_port,
+        ssh_user=item.ssh_user,
+        ssh_remote_root=(
+            None if item.ssh_remote_root is None else str(item.ssh_remote_root)
+        ),
         is_default=item.name == config.storage.default_destination,
     ) for item in config.storage.destinations]
     repository.bootstrap_storage_destinations(

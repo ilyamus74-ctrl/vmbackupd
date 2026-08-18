@@ -136,8 +136,8 @@ def test_storage_transport_identity_is_immutable_after_first_run():
         ssh_port=3322,
         ssh_user="vmbackupd-transfer",
         ssh_remote_root="/srv/vmbackupd",
+        is_default=True,
     )
-
     repository.create_storage_destination(
         destination,
         make_default=True,
@@ -150,18 +150,41 @@ def test_storage_transport_identity_is_immutable_after_first_run():
     )
     repository.add_vm(vm)
 
+    # Supported API/repository paths now correctly refuse assigning
+    # an SSH destination before remote transport exists.
+    #
+    # This test specifically verifies the independent SQLite identity
+    # trigger for a legacy/pre-existing database state. Create a valid
+    # LOCAL job first, then model an already-existing SSH assignment.
+    local_destination = StorageDestination(
+        name="local-for-job",
+        backup_data_root="/staging/local",
+        node_id=node.id,
+    )
+    repository.create_storage_destination(local_destination)
+
     job = BackupJob(
         vm_id=vm.id,
         name="ssh-job",
-        storage_destination_id=destination.id,
+        storage_destination_id=local_destination.id,
     )
     repository.add_job(job)
 
-    repository.create_manual_run(
+    repository.connection.execute(
+        """UPDATE backup_jobs
+           SET storage_destination_id = ?
+           WHERE id = ?""",
+        (destination.id, job.id),
+    )
+    repository.connection.commit()
+
+    run = repository.create_manual_run(
         job.id,
         node.id,
         NOW,
     )
+
+    assert run.storage_destination_id == destination.id
 
     with pytest.raises(
         sqlite3.IntegrityError,
@@ -180,7 +203,6 @@ def test_storage_transport_identity_is_immutable_after_first_run():
         node.id,
         destination.id,
     )
-
     assert persisted.ssh_port == 3322
 
     repository.close()

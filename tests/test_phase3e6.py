@@ -605,3 +605,40 @@ def test_cli_storage_management_maps_only_api_requests():
     assert _request(parser.parse_args([
         "storage", "test", "destination",
     ])) == ("storage.test", {"id": "destination"})
+
+    method, params = _request(parser.parse_args([
+        "storage", "create",
+        "--name", "remote",
+        "--backup-data-root", "/staging",
+        "--storage-type", "SSH",
+        "--ssh-host", "backup.example.test",
+        "--ssh-port", "3322",
+        "--ssh-user", "vmbackupd-transfer",
+        "--ssh-remote-root", "/srv/vmbackupd",
+    ]))
+    assert method == "storage.create"
+    assert params == {
+        "name": "remote",
+        "backup_data_root": "/staging",
+        "minimum_free_bytes": 0,
+        "minimum_free_percent": 5,
+        "make_default": False,
+        "storage_type": "SSH",
+        "ssh_host": "backup.example.test",
+        "ssh_port": 3322,
+        "ssh_user": "vmbackupd-transfer",
+        "ssh_remote_root": "/srv/vmbackupd",
+    }
+
+    method, params = _request(parser.parse_args([
+        "storage", "update", "destination",
+        "--ssh-host", "backup2.example.test",
+        "--ssh-port", "4422",
+    ]))
+    assert method == "storage.update"
+    assert params["id"] == "destination"
+    assert params["ssh_host"] == "backup2.example.test"
+    assert params["ssh_port"] == 4422
+    assert "ssh_user" not in params
+    assert "ssh_remote_root" not in params
+    assert "storage_type" not in params

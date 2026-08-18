@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from .models import StorageType
+
 
 DEFAULT_CONFIG_PATH = Path("/etc/vmbackupd/vmbackupd.toml")
 
@@ -46,6 +48,11 @@ class StorageConfig:
     backup_data_gid: int | None = None
     minimum_free_bytes: int = 0
     minimum_free_percent: float = 5
+    storage_type: StorageType = StorageType.LOCAL
+    ssh_host: str | None = None
+    ssh_port: int | None = None
+    ssh_user: str | None = None
+    ssh_remote_root: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +146,57 @@ def load_config(
                     "storage.destinations[].control_root is obsolete; "
                     "configure daemon.control_root instead"
                 )
+            try:
+                storage_type = StorageType(
+                    str(item.get("storage_type", "LOCAL")).strip().upper()
+                )
+            except ValueError:
+                raise ConfigError(
+                    f"storage.destinations[{index}].storage_type "
+                    "must be LOCAL or SSH"
+                ) from None
+
+            ssh_host = item.get("ssh_host")
+            ssh_port = item.get("ssh_port")
+            ssh_user = item.get("ssh_user")
+            ssh_remote_root_raw = item.get("ssh_remote_root")
+
+            if storage_type is StorageType.LOCAL:
+                if any(value is not None for value in (
+                    ssh_host, ssh_port, ssh_user, ssh_remote_root_raw,
+                )):
+                    raise ConfigError(
+                        f"storage.destinations[{index}] LOCAL destination "
+                        "must not define SSH fields"
+                    )
+                normalized_ssh_host = None
+                normalized_ssh_port = None
+                normalized_ssh_user = None
+                normalized_ssh_remote_root = None
+            else:
+                if (
+                    not isinstance(ssh_host, str)
+                    or not ssh_host.strip()
+                    or not isinstance(ssh_port, int)
+                    or isinstance(ssh_port, bool)
+                    or not 1 <= ssh_port <= 65535
+                    or not isinstance(ssh_user, str)
+                    or not ssh_user.strip()
+                    or ssh_remote_root_raw is None
+                ):
+                    raise ConfigError(
+                        f"storage.destinations[{index}] SSH destination "
+                        "requires ssh_host, explicit ssh_port 1..65535, "
+                        "ssh_user, and ssh_remote_root"
+                    )
+                normalized_ssh_host = ssh_host.strip()
+                normalized_ssh_port = ssh_port
+                normalized_ssh_user = ssh_user.strip()
+                normalized_ssh_remote_root = _absolute(
+                    ssh_remote_root_raw,
+                    f"storage.destinations[{index}].ssh_remote_root",
+                )
+
             user, group = item.get("backup_data_user"), item.get("backup_data_group")
             try:
                 uid = int(user_lookup(str(user)).pw_uid) if user is not None else None
@@ -161,6 +219,11 @@ def load_config(
                 backup_data_uid=uid, backup_data_gid=gid,
                 minimum_free_bytes=int(item.get("minimum_free_bytes", 0)),
                 minimum_free_percent=float(item.get("minimum_free_percent", 5)),
+                storage_type=storage_type,
+                ssh_host=normalized_ssh_host,
+                ssh_port=normalized_ssh_port,
+                ssh_user=normalized_ssh_user,
+                ssh_remote_root=normalized_ssh_remote_root,
             )
             if not destination.name:
                 raise ConfigError("storage destination name cannot be empty")

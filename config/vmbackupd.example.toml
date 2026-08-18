@@ -32,3 +32,19 @@ backup_data_root = "/home/user/backups/vmbackupd"
 backup_data_mode = "0750"
 minimum_free_bytes = 0
 minimum_free_percent = 5
+
+# SSH destination example.
+# Transport execution remains fail-closed until the SSH transport phases.
+#
+# [[storage.destinations]]
+# name = "remote-backup"
+# storage_type = "SSH"
+# backup_data_root = "/var/lib/libvirt/images/vmbackupd-remote"
+# backup_data_mode = "0750"
+# backup_data_group = "qemu"
+# minimum_free_bytes = 0
+# minimum_free_percent = 5
+# ssh_host = "backup.example.net"
+# ssh_port = 3322
+# ssh_user = "vmbackupd-transfer"
+# ssh_remote_root = "/srv/vmbackupd"

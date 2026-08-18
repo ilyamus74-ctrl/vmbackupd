@@ -1,4 +1,6 @@
 d /run/vmbackupd 2750 vmbackupd vmbackupd-admin -
 d /var/lib/vmbackupd 0750 vmbackupd vmbackupd -
 d /var/lib/vmbackupd/control 0750 vmbackupd vmbackupd -
+d /var/lib/vmbackupd/ssh 0700 vmbackupd vmbackupd -
+d /var/lib/vmbackupd/ssh/identities 0700 vmbackupd vmbackupd -
 d /var/lib/libvirt/images/vmbackupd 0750 vmbackupd qemu -
