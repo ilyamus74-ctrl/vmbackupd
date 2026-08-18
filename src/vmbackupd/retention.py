@@ -27,7 +27,7 @@ class FullChainCapacity:
     chain_id: str
     status: BackupChainStatus
     created_at: datetime
-    physical_bytes: int
+    physical_bytes: int | None
 
     def __post_init__(self) -> None:
         if not self.chain_id:
@@ -37,7 +37,7 @@ class FullChainCapacity:
         except ValueError as exc:
             raise ValueError("invalid backup chain status") from exc
         object.__setattr__(self, "status", status)
-        if self.physical_bytes < 0:
+        if self.physical_bytes is not None and self.physical_bytes < 0:
             raise ValueError("physical_bytes must be non-negative")
 
 
@@ -107,13 +107,20 @@ class CapacityReclaimPlanner:
             (
                 chain
                 for chain in full_chains
-                if chain.status is BackupChainStatus.CLOSED
+                if (
+                    chain.status is BackupChainStatus.CLOSED
+                    and chain.physical_bytes is not None
+                )
             ),
             key=lambda chain: (chain.created_at, chain.chain_id),
         )
         candidates = closed_oldest_first[:deletable_count]
         candidate_ids = tuple(chain.chain_id for chain in candidates)
-        candidate_bytes = sum(chain.physical_bytes for chain in candidates)
+        candidate_bytes = sum(
+            chain.physical_bytes
+            for chain in candidates
+            if chain.physical_bytes is not None
+        )
 
         if possible_now:
             return CapacityReclaimPlan(
@@ -160,6 +167,7 @@ class CapacityReclaimPlanner:
         reclaimed = 0
         for chain in candidates:
             selected.append(chain)
+            assert chain.physical_bytes is not None
             reclaimed += chain.physical_bytes
             if reclaimed >= shortfall:
                 break

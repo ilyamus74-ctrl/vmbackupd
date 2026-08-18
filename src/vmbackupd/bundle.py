@@ -7,6 +7,7 @@ import os
 import re
 import stat
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
@@ -210,3 +211,268 @@ class BundlePublisher:
                 raise BundlePublicationError("published disk identity changed")
             paths[target] = path
         return final, paths
+
+
+class BundleInspectionError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class BundlePhysicalUsage:
+    bundle_root: str
+    physical_bytes: int
+    regular_file_count: int
+
+
+class BundlePhysicalInspector:
+    """Read physical allocation of one published bundle without following links."""
+
+    _METADATA_FILES = frozenset({
+        "domain.xml",
+        "manifest.json",
+        "restore-point.json",
+    })
+
+    def __init__(self, planner: BundlePathPlanner) -> None:
+        self.planner = planner
+
+    def inspect(self, bundle_root: str | Path) -> BundlePhysicalUsage:
+        bundle = Path(bundle_root)
+        relative = self._validated_relative(bundle)
+
+        # Reuse the publication boundary's symlink-chain validation and
+        # directory-open flags. The actual descent below backup_data_root is
+        # descriptor-relative and O_NOFOLLOW.
+        BundlePublisher._reject_symlinks(self.planner.root)
+        BundlePublisher._reject_symlinks(bundle)
+
+        bundle_fd = self._open_relative_directory(relative)
+        try:
+            try:
+                top_level = set(os.listdir(bundle_fd))
+            except OSError as exc:
+                raise BundleInspectionError(
+                    "cannot enumerate published bundle"
+                ) from exc
+
+            if top_level != {"disks", "metadata"}:
+                raise BundleInspectionError(
+                    "published bundle has unexpected top-level entries"
+                )
+
+            disks_fd = self._open_child_directory(bundle_fd, "disks")
+            try:
+                disk_bytes, disk_count = self._inspect_disks(disks_fd)
+            finally:
+                os.close(disks_fd)
+
+            metadata_fd = self._open_child_directory(bundle_fd, "metadata")
+            try:
+                metadata_bytes, metadata_count = self._inspect_metadata(
+                    metadata_fd
+                )
+            finally:
+                os.close(metadata_fd)
+
+            return BundlePhysicalUsage(
+                bundle_root=str(bundle),
+                physical_bytes=disk_bytes + metadata_bytes,
+                regular_file_count=disk_count + metadata_count,
+            )
+        finally:
+            os.close(bundle_fd)
+
+    def _validated_relative(self, bundle: Path) -> PurePosixPath:
+        root = self.planner.root
+        if not bundle.is_absolute() or ".." in bundle.parts:
+            raise BundleInspectionError(
+                "published bundle path must be absolute and traversal-free"
+            )
+        try:
+            relative = bundle.relative_to(root)
+        except ValueError as exc:
+            raise BundleInspectionError(
+                "published bundle is outside backup root"
+            ) from exc
+
+        parts = relative.parts
+        if len(parts) != 5 or parts[0] != "vms":
+            raise BundleInspectionError(
+                "published bundle is outside the final bundle namespace"
+            )
+
+        timestamp_text, separator, run_id = parts[4].partition("_")
+        if not separator:
+            raise BundleInspectionError("published bundle name is invalid")
+        try:
+            timestamp = datetime.strptime(
+                timestamp_text, "%Y%m%dT%H%M%SZ"
+            ).replace(tzinfo=timezone.utc)
+            expected = self.planner.final(parts[1], run_id, timestamp)
+        except ValueError as exc:
+            raise BundleInspectionError(
+                "published bundle identity is invalid"
+            ) from exc
+
+        if expected != bundle:
+            raise BundleInspectionError(
+                "published bundle path does not match its identity"
+            )
+
+        return PurePosixPath(*parts)
+
+    def _open_relative_directory(self, relative: PurePosixPath) -> int:
+        try:
+            descriptor = os.open(
+                self.planner.root,
+                BundlePublisher._directory_flags(),
+            )
+        except OSError as exc:
+            raise BundleInspectionError(
+                "backup root is not a safe directory"
+            ) from exc
+
+        try:
+            for component in relative.parts:
+                try:
+                    child = os.open(
+                        component,
+                        BundlePublisher._directory_flags(),
+                        dir_fd=descriptor,
+                    )
+                except OSError as exc:
+                    raise BundleInspectionError(
+                        "published bundle hierarchy is unsafe or missing"
+                    ) from exc
+                os.close(descriptor)
+                descriptor = child
+            return descriptor
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    @staticmethod
+    def _open_child_directory(parent_fd: int, name: str) -> int:
+        try:
+            return os.open(
+                name,
+                BundlePublisher._directory_flags(),
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise BundleInspectionError(
+                f"published bundle {name} directory is unsafe"
+            ) from exc
+
+    def _inspect_metadata(self, directory_fd: int) -> tuple[int, int]:
+        try:
+            names = set(os.listdir(directory_fd))
+        except OSError as exc:
+            raise BundleInspectionError(
+                "cannot enumerate bundle metadata"
+            ) from exc
+        if names != self._METADATA_FILES:
+            raise BundleInspectionError(
+                "published bundle metadata set is incomplete or unexpected"
+            )
+        return self._inspect_files(directory_fd, sorted(names))
+
+    def _inspect_disks(self, directory_fd: int) -> tuple[int, int]:
+        try:
+            names = sorted(os.listdir(directory_fd))
+        except OSError as exc:
+            raise BundleInspectionError(
+                "cannot enumerate bundle disks"
+            ) from exc
+        if not names:
+            raise BundleInspectionError("published bundle has no disks")
+
+        for name in names:
+            if not name.endswith(".qcow2"):
+                raise BundleInspectionError(
+                    "published bundle contains an unexpected disk entry"
+                )
+            target = name[:-6]
+            try:
+                BundlePathPlanner._component(target, "disk target")
+            except ValueError as exc:
+                raise BundleInspectionError(
+                    "published bundle contains an unsafe disk entry"
+                ) from exc
+
+        return self._inspect_files(directory_fd, names)
+
+    def _inspect_files(
+        self, directory_fd: int, names: list[str],
+    ) -> tuple[int, int]:
+        physical_bytes = 0
+
+        for name in names:
+            physical_bytes += self._inspect_regular_file(
+                directory_fd, name
+            )
+
+        return physical_bytes, len(names)
+
+    @staticmethod
+    def _inspect_regular_file(parent_fd: int, name: str) -> int:
+        try:
+            before = os.stat(
+                name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise BundleInspectionError(
+                f"cannot stat published bundle file {name}"
+            ) from exc
+
+        if not stat.S_ISREG(before.st_mode):
+            raise BundleInspectionError(
+                f"published bundle entry {name} is not a regular file"
+            )
+
+        descriptor = None
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+            info = os.fstat(descriptor)
+        except OSError as exc:
+            raise BundleInspectionError(
+                f"cannot safely open published bundle file {name}"
+            ) from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or (before.st_dev, before.st_ino) != (info.st_dev, info.st_ino)
+        ):
+            raise BundleInspectionError(
+                f"published bundle file identity changed for {name}"
+            )
+
+        # A hard-linked file may remain allocated after deleting this bundle,
+        # so its st_blocks value is not safe reclaimable capacity.
+        if info.st_nlink != 1:
+            raise BundleInspectionError(
+                f"published bundle file {name} has multiple hard links"
+            )
+
+        if info.st_size <= 0:
+            raise BundleInspectionError(
+                f"published bundle file {name} is empty"
+            )
+
+        blocks = getattr(info, "st_blocks", None)
+        if blocks is None or blocks < 0:
+            raise BundleInspectionError(
+                f"physical allocation is unavailable for {name}"
+            )
+
+        # POSIX st_blocks is expressed in 512-byte units.
+        return int(blocks) * 512
