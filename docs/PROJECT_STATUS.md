@@ -614,14 +614,98 @@ must be followed separately by the durable reclaim bundle/state transitions.
 
 Status: IN_PROGRESS
 
+The orchestration layer is split so that destructive per-bundle intent is
+durable before the filesystem executor is allowed to remove data.
+
+#### 3E.8b.2d.1 — Durable per-bundle purge intent
+
+Status: CLOSED
+
+Closing commit:
+
+    45f9233
+
+Schema version:
+
+    8
+
+Implemented a durable intermediate reclaim bundle state:
+
+    PLANNED
+        -> QUARANTINED
+        -> PURGING
+        -> PURGED
+
+The PURGING bundle state closes the crash window between physical bundle
+deletion and persistence of PURGED.
+
+Implemented repository API:
+
+    begin_reclaim_bundle_purge(operation_id, restore_point_id)
+
+The API requires:
+
+- reclaim operation state PURGING;
+- reclaim bundle state QUARANTINED;
+- durable quarantine object identity;
+- expected physical byte count;
+- source device;
+- source inode.
+
+It atomically persists:
+
+    QUARANTINED -> PURGING
+
+before any physical unlink or rmdir is authorized.
+
+mark_reclaim_bundle_purged() now requires:
+
+    PURGING -> PURGED
+
+and can no longer transition directly from QUARANTINED.
+
+PURGING operation recovery accepts bundle states:
+
+- QUARANTINED — physical purge has not yet been authorized for this bundle;
+- PURGING — destructive bundle intent is durable and purge may be in progress
+  or may have completed before a crash;
+- PURGED — physical completion is already durable.
+
+Schema migration 7 -> 8 rebuilds reclaim_bundles with the new PURGING state.
+
+Historical schema behavior remains fail-safe:
+
+- frozen schema v6 remains unchanged;
+- normal v7 databases migrate to v8 without data loss;
+- a v7 database containing an operation already in PURGING is refused because
+  it has no durable per-bundle purge intent;
+- a v7 RECOVERY_REQUIRED operation whose recovery_from_state is PURGING is
+  refused for the same reason;
+- failed ambiguous migration leaves the database at schema v7.
+
+This phase performs no filesystem mutation and no catalog deletion.
+
+---
+
+#### 3E.8b.2d.2 — Reclaim executor orchestration and recovery
+
+Status: IN_PROGRESS
+
 Target scope:
 
-- connect repository reclaim state transitions to quarantine/catalog/purge
-  primitives;
-- reconcile crashes between filesystem and database steps;
-- perform actual free-space remeasurement after purge;
-- refuse backup start unless measured free space is sufficient;
-- preserve RECOVERY_REQUIRED on ambiguous destructive states.
+- execute the durable reclaim operation state machine;
+- connect BundleQuarantiner to RETIRING;
+- reconcile a completed quarantine rename before its DB bundle transition;
+- atomically retire catalog metadata after all bundles are QUARANTINED;
+- enter operation PURGING;
+- persist per-bundle PURGING before invoking BundlePurger;
+- resume partially completed .purging trees;
+- reconcile physical deletion completed before bundle PURGED persistence;
+- mark every bundle PURGED and seal operation PURGED;
+- re-read actual filesystem free space after physical purge;
+- complete the reclaim operation with measured free_bytes_after;
+- refuse backup continuation when measured free space is still insufficient;
+- move ambiguous destructive states to RECOVERY_REQUIRED.
 
 ---
 
