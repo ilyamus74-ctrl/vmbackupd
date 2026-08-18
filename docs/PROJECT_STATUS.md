@@ -422,19 +422,117 @@ The combined 3E.8b.1c durable recovery/transition layer is complete:
 
 ## 3E.8b.2 — Safe filesystem reclaim executor
 
+Status: IN_PROGRESS
+
+The filesystem reclaim executor is split into independently closed safety
+boundaries.
+
+### 3E.8b.2a — Safe bundle quarantine primitive
+
+Status: CLOSED
+
+Closing commit:
+
+    7d3c604
+
+Implemented a descriptor-relative quarantine primitive for validated published
+backup bundles.
+
+Implemented:
+
+- deterministic controlled quarantine namespace:
+
+      .reclaim/<operation-id>/<restore-point-id>
+
+- strict UUID component validation;
+- reuse of the existing published-bundle namespace validator;
+- descriptor-relative directory traversal;
+- O_NOFOLLOW directory opening;
+- complete bundle physical inspection before mutation;
+- symlink rejection;
+- hard-link rejection;
+- source directory device/inode capture;
+- source identity revalidation before rename;
+- destination collision refusal;
+- same-filesystem enforcement;
+- atomic descriptor-relative rename;
+- fsync of both source and destination parent namespaces;
+- post-rename device/inode identity verification;
+- safe rollback when a source-directory replacement race is detected after
+  rename.
+
+The primitive returns durable quarantine evidence:
+
+- source bundle object identity;
+- quarantine object identity;
+- physical allocation bytes;
+- source device;
+- source inode.
+
+No automatic deletion is performed.
+
+This phase contains no:
+
+- unlink;
+- recursive removal;
+- physical purge;
+- restore-point deletion;
+- backup-chain deletion;
+- artifact deletion;
+- repository state transition;
+- backup executor integration.
+
+If rename succeeds but a later durability or reconciliation step fails, the
+primitive does not guess that the operation completed successfully. Durable
+reclaim recovery must reconcile the deterministic source and quarantine
+identities.
+
+---
+
+### 3E.8b.2b — Atomic catalog retirement
+
+Status: IN_PROGRESS
+
+Target scope:
+
+- remove selected restore-point catalog records only after all bundles are
+  durably QUARANTINED;
+- retire selected backup chains atomically;
+- preserve reclaim journal rows after source catalog rows are removed;
+- reject partial or mismatched catalog retirement;
+- transaction rollback on any catalog invariant failure;
+- no filesystem purge.
+
+---
+
+### 3E.8b.2c — Safe physical purge primitive
+
 Status: PLANNED
 
 Target scope:
 
-- checked descriptor-relative quarantine;
-- atomic same-filesystem rename;
+- descriptor-relative traversal of the controlled quarantine namespace;
+- exact quarantine device/inode validation;
+- O_NOFOLLOW containment;
+- controlled leaf-first removal;
 - directory fsync;
-- catalog retirement;
-- controlled physical purge;
-- crash recovery;
-- actual free-space remeasurement.
+- no naive shutil.rmtree();
+- no traversal outside the quarantine object.
 
-Direct naive recursive deletion of a published bundle is forbidden.
+---
+
+### 3E.8b.2d — Reclaim executor orchestration and recovery
+
+Status: PLANNED
+
+Target scope:
+
+- connect repository reclaim state transitions to quarantine/catalog/purge
+  primitives;
+- reconcile crashes between filesystem and database steps;
+- perform actual free-space remeasurement after purge;
+- refuse backup start unless measured free space is sufficient;
+- preserve RECOVERY_REQUIRED on ambiguous destructive states.
 
 ---
 
