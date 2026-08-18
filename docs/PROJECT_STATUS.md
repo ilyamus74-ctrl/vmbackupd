@@ -1193,11 +1193,87 @@ remote capacity inspection, file transfer, remote verification, or promotion.
 
 ---
 
+# SSH.1b — API, configuration, and package persistence
+
+Status: CLOSED
+
+Implementation commit:
+
+    34946e6 — Expose SSH storage destination configuration
+
+Extended the schema-v10 SSH storage identity through the supported
+configuration and management surfaces.
+
+Implemented:
+
+- TOML configuration for LOCAL and SSH storage destinations;
+- backward-compatible LOCAL behavior when storage_type is omitted;
+- explicit SSH host, port, user, and remote root configuration;
+- non-standard SSH ports as persisted first-class destination identity;
+- bootstrap persistence of SSH destination configuration;
+- local API create/show/update serialization for SSH destinations;
+- vmbackupctl SSH destination create/update options;
+- SSH identity editing before the destination acquires run history;
+- immutable storage type; LOCAL <-> SSH conversion requires a new destination;
+- persistent package state directories for future SSH identities.
+
+Package-managed directory preparation now includes:
+
+    /var/lib/vmbackupd/ssh
+    /var/lib/vmbackupd/ssh/identities
+
+with mode 0700 and ownership vmbackupd:vmbackupd.
+
+SSH private/public keys and known_hosts contents are not RPM payload.
+The package continues to preserve:
+
+    /etc/vmbackupd/vmbackupd.toml      via %config(noreplace)
+    /var/lib/vmbackupd/state.db        outside RPM payload
+    /var/lib/vmbackupd/ssh/*           outside RPM payload
+
+Remote transport execution is deliberately fail-closed at this stage.
+
+Until the later SSH transport phases, the system refuses:
+
+- SSH storage.test;
+- assigning an SSH destination to a new backup job;
+- switching an existing backup job to SSH;
+- manual SSH backup execution;
+- scheduled/legacy SSH execution at StorageRoutingExecutor.
+
+The runtime routing guard prevents an SSH destination from falling through
+the current local TRANSFERRING -> VERIFYING path before real remote transfer
+exists.
+
+No openssh or rsync runtime dependency is introduced in this phase because
+no external SSH command is executed yet.
+
+Acceptance coverage includes:
+
+- SSH configuration parsing and validation;
+- explicit non-standard port persistence;
+- LOCAL backward compatibility;
+- API create/show/update;
+- vmbackupctl request mapping;
+- package persistence directory policy;
+- repository and runtime fail-closed boundaries;
+- historical storage identity trigger behavior;
+- complete pytest regression;
+- Python compilation;
+- Cockpit JavaScript syntax validation;
+- git diff validation.
+
+This phase does not generate SSH keys, maintain known_hosts entries, test
+network connectivity, transfer backup data, verify remote bundles, or
+perform remote atomic promotion.
+
+---
+
 # Current position
 
 Current implementation milestone:
 
-    SSH.1a storage transport identity — CLOSED
+    SSH.1b API, configuration, and package persistence — CLOSED
 
 Current safety boundary:
 
@@ -1218,4 +1294,8 @@ Current safety boundary:
     Cockpit reclaim controls      YES
     SSH destination schema        YES
     SSH transport identity        YES
-    remote SSH transfer           NO
+    SSH API/configuration         YES
+    SSH persistent state dirs     YES
+    SSH key management            NO
+    SSH connection preflight      NO
+    remote SSH transfer           NO\n
