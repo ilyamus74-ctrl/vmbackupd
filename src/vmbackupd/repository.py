@@ -2225,6 +2225,11 @@ class SQLiteRepository:
             vm_id=row["vm_id"],
             storage_destination_id=row["storage_destination_id"],
             state=ReclaimOperationState(row["state"]),
+            recovery_from_state=(
+                ReclaimOperationState(row["recovery_from_state"])
+                if row["recovery_from_state"] is not None
+                else None
+            ),
             required_backup_bytes=row["required_backup_bytes"],
             free_bytes_before=row["free_bytes_before"],
             reserve_bytes=row["reserve_bytes"],

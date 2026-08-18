@@ -6,7 +6,8 @@ import pytest
 
 from vmbackupd.models import (
     BackupChain, BackupChainStatus, BackupJob, BackupKind, JobRun, Node,
-    ReclaimBundleState, ReclaimOperationState, RestorePoint, RetentionPolicy,
+    ReclaimBundleState, ReclaimOperation, ReclaimOperationState,
+    RestorePoint, RetentionPolicy,
     RunState, SpaceReclaimMode, StorageDestination, VM,
 )
 from vmbackupd.repository import DomainInvariantError, SQLiteRepository
@@ -208,6 +209,7 @@ def test_planned_reclaim_snapshot_is_atomic_durable_and_complete(tmp_path):
     )
 
     assert operation.state is ReclaimOperationState.PLANNED
+    assert operation.recovery_from_state is None
     assert operation.job_run_id == target_run.id
     assert operation.job_id == job.id
     assert operation.vm_id == vm.id
@@ -503,3 +505,56 @@ def test_reclaim_snapshot_requires_real_shortfall_and_sufficient_selection(
         )
 
     assert journal_counts(repository) == (0, 0, 0)
+
+
+def test_reclaim_operation_model_requires_exact_recovery_provenance():
+    base = dict(
+        job_run_id="run",
+        job_id="job",
+        vm_id="vm",
+        storage_destination_id="storage",
+        required_backup_bytes=1,
+        free_bytes_before=0,
+        reserve_bytes=0,
+        expected_reclaim_bytes=1,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="RECOVERY_REQUIRED requires recovery_from_state",
+    ):
+        ReclaimOperation(
+            **base,
+            state=ReclaimOperationState.RECOVERY_REQUIRED,
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="recovery_from_state requires RECOVERY_REQUIRED",
+    ):
+        ReclaimOperation(
+            **base,
+            state=ReclaimOperationState.PLANNED,
+            recovery_from_state=ReclaimOperationState.RETIRING,
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="invalid reclaim recovery source state",
+    ):
+        ReclaimOperation(
+            **base,
+            state=ReclaimOperationState.RECOVERY_REQUIRED,
+            recovery_from_state=ReclaimOperationState.PLANNED,
+        )
+
+    operation = ReclaimOperation(
+        **base,
+        state=ReclaimOperationState.RECOVERY_REQUIRED,
+        recovery_from_state=ReclaimOperationState.PURGING,
+    )
+
+    assert (
+        operation.recovery_from_state
+        is ReclaimOperationState.PURGING
+    )

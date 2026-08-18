@@ -10,7 +10,8 @@ from vmbackupd.models import (
 )
 from vmbackupd.repository import SQLiteRepository
 from vmbackupd.schema import (
-    CURRENT_COLUMNS, CURRENT_SCHEMA_VERSION, SchemaMigrationError,
+    CURRENT_COLUMNS, CURRENT_SCHEMA_VERSION, MIGRATIONS,
+    SchemaMigrationError,
     UnsupportedSchemaError, ensure_current_schema, get_schema_version,
 )
 
@@ -19,6 +20,12 @@ def drop_v6_reclaim_tables(connection):
     connection.execute("DROP TABLE reclaim_bundles")
     connection.execute("DROP TABLE reclaim_chains")
     connection.execute("DROP TABLE reclaim_operations")
+
+
+def drop_v7_recovery_provenance(connection):
+    connection.execute(
+        "ALTER TABLE reclaim_operations DROP COLUMN recovery_from_state"
+    )
 
 
 EXPECTED_INDEXES = {
@@ -397,7 +404,7 @@ def test_v5_to_v6_adds_durable_reclaim_journal_without_data_loss(tmp_path):
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 6
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 7
     assert {
         "reclaim_operations",
         "reclaim_chains",
@@ -472,3 +479,152 @@ def test_reclaim_bundle_composite_foreign_key_is_complete(tmp_path):
     assert {row[1] for row in composite_rows} == {0, 1}
 
     repository.close()
+
+
+def test_v6_to_v7_adds_recovery_provenance_without_data_loss(tmp_path):
+    path = tmp_path / "v6-to-v7.db"
+    values = populated_database(path)
+
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA foreign_keys = OFF")
+    drop_v7_recovery_provenance(connection)
+    connection.execute(
+        "UPDATE schema_version SET version = 6 WHERE id = 1"
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = SQLiteRepository(path)
+
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 7
+    assert "recovery_from_state" in table_columns(
+        migrated.connection,
+        "reclaim_operations",
+    )
+
+    node, destination, vm, job, run, point, artifact_ids = values
+    assert migrated.get_node(node.id).id == node.id
+    assert (
+        migrated.get_storage_destination(node.id, destination.id).id
+        == destination.id
+    )
+    assert migrated.get_vm(vm.id).id == vm.id
+    assert migrated.get_job(job.id).id == job.id
+    assert migrated.get_run(run.id).id == run.id
+    assert migrated.get_restore_point(point.id).id == point.id
+    assert [
+        item.id for item in migrated.list_artifacts_for_run(run.id)
+    ] == artifact_ids
+    assert list(
+        migrated.connection.execute("PRAGMA foreign_key_check")
+    ) == []
+
+    migrated.close()
+
+
+def test_v6_recovery_required_without_provenance_refuses_migration(
+    tmp_path,
+):
+    path = tmp_path / "ambiguous-v6.db"
+    values = populated_database(path)
+
+    node, destination, vm, job, run, _, _ = values
+    created = "2026-08-18T10:00:00+00:00"
+
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA foreign_keys = OFF")
+
+    connection.execute(
+        """INSERT INTO reclaim_operations (
+               id, job_run_id, job_id, vm_id, storage_destination_id,
+               state, required_backup_bytes, free_bytes_before,
+               reserve_bytes, expected_reclaim_bytes,
+               free_bytes_after, error, recovery_from_state,
+               created_at, updated_at
+           ) VALUES (
+               'ambiguous', ?, ?, ?, ?,
+               'RECOVERY_REQUIRED', 1, 0,
+               0, 1,
+               NULL, 'legacy ambiguous recovery', 'RETIRING',
+               ?, ?
+           )""",
+        (
+            run.id,
+            job.id,
+            vm.id,
+            destination.id,
+            created,
+            created,
+        ),
+    )
+    connection.execute(
+        """INSERT INTO reclaim_chains (
+               operation_id, chain_id, ordinal, expected_physical_bytes
+           ) VALUES ('ambiguous', 'legacy-chain', 0, 1)"""
+    )
+
+    drop_v7_recovery_provenance(connection)
+    connection.execute(
+        "UPDATE schema_version SET version = 6 WHERE id = 1"
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(
+        SchemaMigrationError,
+        match="no durable recovery provenance",
+    ):
+        SQLiteRepository(path)
+
+    raw = sqlite3.connect(path)
+    assert raw.execute(
+        "SELECT version FROM schema_version WHERE id = 1"
+    ).fetchone()[0] == 6
+    assert "recovery_from_state" not in table_columns(
+        raw,
+        "reclaim_operations",
+    )
+    raw.close()
+
+
+def test_v5_to_v6_step_uses_frozen_historical_reclaim_schema(tmp_path):
+    path = tmp_path / "exact-v6-step.db"
+    populated_database(path)
+
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA foreign_keys = OFF")
+    drop_v6_reclaim_tables(connection)
+    connection.execute(
+        "UPDATE schema_version SET version = 5 WHERE id = 1"
+    )
+    connection.commit()
+
+    MIGRATIONS[5](connection)
+
+    tables = {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+
+    assert {
+        "reclaim_operations",
+        "reclaim_chains",
+        "reclaim_bundles",
+    } <= tables
+
+    assert "recovery_from_state" not in table_columns(
+        connection,
+        "reclaim_operations",
+    )
+
+    # Ordered migration functions change schema only. The driver owns
+    # schema_version stamping after target validation succeeds.
+    assert connection.execute(
+        "SELECT version FROM schema_version WHERE id = 1"
+    ).fetchone()[0] == 5
+
+    connection.rollback()
+    connection.close()

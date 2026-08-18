@@ -261,6 +261,7 @@ class ReclaimOperation:
     reserve_bytes: int
     expected_reclaim_bytes: int
     state: ReclaimOperationState = ReclaimOperationState.PLANNED
+    recovery_from_state: ReclaimOperationState | None = None
     free_bytes_after: int | None = None
     error: str | None = None
     id: str = field(default_factory=new_id)
@@ -283,6 +284,44 @@ class ReclaimOperation:
         except ValueError as exc:
             raise ValueError("invalid reclaim operation state") from exc
         object.__setattr__(self, "state", state)
+
+        recovery_from_state = self.recovery_from_state
+        if recovery_from_state is not None:
+            try:
+                recovery_from_state = ReclaimOperationState(
+                    recovery_from_state
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "invalid reclaim recovery_from_state"
+                ) from exc
+
+            allowed_recovery_sources = {
+                ReclaimOperationState.RETIRING,
+                ReclaimOperationState.QUARANTINED,
+                ReclaimOperationState.CATALOG_REMOVED,
+                ReclaimOperationState.PURGING,
+                ReclaimOperationState.PURGED,
+            }
+            if recovery_from_state not in allowed_recovery_sources:
+                raise ValueError(
+                    "invalid reclaim recovery source state"
+                )
+            object.__setattr__(
+                self,
+                "recovery_from_state",
+                recovery_from_state,
+            )
+
+        if state is ReclaimOperationState.RECOVERY_REQUIRED:
+            if recovery_from_state is None:
+                raise ValueError(
+                    "RECOVERY_REQUIRED requires recovery_from_state"
+                )
+        elif recovery_from_state is not None:
+            raise ValueError(
+                "recovery_from_state requires RECOVERY_REQUIRED"
+            )
 
 
 @dataclass(frozen=True, slots=True)
