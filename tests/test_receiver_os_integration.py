@@ -117,20 +117,23 @@ def test_receiver_session_does_not_claim_transport_readiness():
     assert '"preflight_ready": False' in value
 
 
-def test_receiver_rpm_is_separate_and_depends_on_server():
+def test_receiver_is_part_of_unified_package():
     spec = text(PACKAGING / "vmbackupd.spec")
 
-    assert "%package -n vmbackupd-receiver" in spec
+    assert "%package -n vmbackupd-receiver" not in spec
     assert "Requires:       openssh-server" in spec
+    assert "Requires:       cockpit-bridge >= 215" in spec
+
+    assert "Provides:       vmbackupd-receiver" in spec
+    assert "Obsoletes:      vmbackupd-receiver" in spec
+
     assert (
         "%config(noreplace) "
         "%{_sysconfdir}/vmbackupd/receiver_sshd_config"
         in spec
     )
-    assert (
-        "%{_unitdir}/vmbackupd-receiver-sshd.service"
-        in spec
-    )
+    assert "%{_unitdir}/vmbackupd-receiver-sshd.service" in spec
+    assert "%{_datadir}/cockpit/vmbackupd/" in spec
 
 
 def test_receiver_scripts_are_root_owned_package_payloads():

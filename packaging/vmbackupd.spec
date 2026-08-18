@@ -2,7 +2,7 @@
 
 Name:           vmbackupd
 Version:        %{upstream_version}
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Local KVM/libvirt backup management daemon
 License:        LicenseRef-Proprietary
 Source0:        %{name}-%{version}.tar.gz
@@ -17,6 +17,8 @@ BuildRequires:  pyproject-rpm-macros
 BuildRequires:  systemd-rpm-macros
 Requires:       python3
 Requires:       openssh-clients
+Requires:       openssh-server
+Requires:       cockpit-bridge >= 215
 Requires:       libvirt-client
 Requires:       qemu-img
 Requires:       libvirt-daemon-driver-qemu
@@ -29,38 +31,16 @@ Requires(post): systemd
 Requires(preun): systemd
 Requires(postun): systemd
 
+Provides:       vmbackupd-receiver = %{version}-%{release}
+Obsoletes:      vmbackupd-receiver < %{version}-%{release}
+Provides:       cockpit-vmbackupd = %{version}-%{release}
+Obsoletes:      cockpit-vmbackupd < %{version}-%{release}
+
 %description
 vmbackupd is a persistent local daemon and UNIX-socket control plane for
 conservative KVM/libvirt backup orchestration. The package includes the
 vmbackupctl console client. The optional Cockpit frontend is shipped as the
 separate cockpit-vmbackupd binary package from this source build.
-
-%package -n cockpit-vmbackupd
-Summary:        Cockpit frontend for vmbackupd
-Requires:       cockpit-bridge >= 215
-Requires:       vmbackupd = %{version}-%{release}
-
-%description -n cockpit-vmbackupd
-cockpit-vmbackupd provides the read-only Cockpit frontend for the vmbackupd
-local control API. The vmbackupd daemon package remains independently
-installable for headless operation.
-
-%package -n vmbackupd-receiver
-Summary:        Restricted OpenSSH receiver for vmbackupd
-Requires:       vmbackupd = %{version}-%{release}
-Requires:       openssh-server
-Requires:       openssh-clients
-Requires:       systemd
-Requires(pre):  systemd
-Requires(pre):  shadow-utils
-Requires(post): systemd
-Requires(preun): systemd
-Requires(postun): systemd
-
-%description -n vmbackupd-receiver
-vmbackupd-receiver provides a dedicated restricted OpenSSH endpoint for
-receiving vmbackupd traffic. It does not modify or reuse the host's normal
-sshd service configuration.
 
 %prep
 %autosetup -p1
@@ -102,52 +82,51 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-sshd.service \
 
 %pre
 %sysusers_create_compat %{SOURCE2}
+%sysusers_create_compat packaging/receiver/vmbackupd-receiver.sysusers
 
 %post
 %systemd_post vmbackupd.service
+%systemd_post vmbackupd-receiver-sshd.service
+
 %tmpfiles_create %{_tmpfilesdir}/vmbackupd.conf
+%tmpfiles_create %{_tmpfilesdir}/vmbackupd-receiver.conf
 
 %preun
 %systemd_preun vmbackupd.service
+%systemd_preun vmbackupd-receiver-sshd.service
 
 %postun
 %systemd_postun vmbackupd.service
-
-%pre -n vmbackupd-receiver
-%sysusers_create_compat packaging/receiver/vmbackupd-receiver.sysusers
-
-%post -n vmbackupd-receiver
-%systemd_post vmbackupd-receiver-sshd.service
-%tmpfiles_create %{_tmpfilesdir}/vmbackupd-receiver.conf
-
-%preun -n vmbackupd-receiver
-%systemd_preun vmbackupd-receiver-sshd.service
-
-%postun -n vmbackupd-receiver
 %systemd_postun vmbackupd-receiver-sshd.service
 
 %files -f %{pyproject_files}
 %doc docs/*.md
+
 %{_bindir}/vmbackupd
 %{_bindir}/vmbackupctl
+
 %config(noreplace) %{_sysconfdir}/vmbackupd/vmbackupd.toml
+%config(noreplace) %{_sysconfdir}/vmbackupd/receiver_sshd_config
+
 %{_unitdir}/vmbackupd.service
+%{_unitdir}/vmbackupd-receiver-sshd.service
+
 %{_sysusersdir}/vmbackupd.conf
+%{_sysusersdir}/vmbackupd-receiver.conf
+
 %{_tmpfilesdir}/vmbackupd.conf
+%{_tmpfilesdir}/vmbackupd-receiver.conf
 
-%files -n cockpit-vmbackupd
-%{_datadir}/cockpit/vmbackupd/
-
-%files -n vmbackupd-receiver
 %{_libexecdir}/vmbackupd-authorized-keys
 %{_libexecdir}/vmbackupd-transfer-shell
 %{_libexecdir}/vmbackupd-receiver-session
 %{_libexecdir}/vmbackupd-receiver-hostkey
-%{_sysusersdir}/vmbackupd-receiver.conf
-%{_tmpfilesdir}/vmbackupd-receiver.conf
-%config(noreplace) %{_sysconfdir}/vmbackupd/receiver_sshd_config
-%{_unitdir}/vmbackupd-receiver-sshd.service
+
+%{_datadir}/cockpit/vmbackupd/
 
 %changelog
+* Tue Aug 18 2026 vmbackupd packagers <packagers@example.invalid> - 0.1.0-2
+- Merge daemon, Cockpit frontend, and SSH receiver into one RPM
+
 * Mon Aug 17 2026 vmbackupd packagers <packagers@example.invalid> - 0.1.0-1
 - Initial Fedora-style package
