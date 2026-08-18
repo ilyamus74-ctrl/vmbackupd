@@ -491,23 +491,61 @@ identities.
 
 ### 3E.8b.2b — Atomic catalog retirement
 
-Status: IN_PROGRESS
+Status: CLOSED
 
-Target scope:
+Closing commit:
 
-- remove selected restore-point catalog records only after all bundles are
-  durably QUARANTINED;
-- retire selected backup chains atomically;
-- preserve reclaim journal rows after source catalog rows are removed;
-- reject partial or mismatched catalog retirement;
-- transaction rollback on any catalog invariant failure;
-- no filesystem purge.
+    974aa04
+
+Implemented atomic retirement of catalog metadata for a reclaim operation
+whose bundles are already durably QUARANTINED.
+
+The retirement boundary executes under one SQLite BEGIN IMMEDIATE transaction.
+
+Before catalog mutation it revalidates:
+
+- reclaim operation state is QUARANTINED;
+- reclaim chain and bundle snapshots are complete;
+- every reclaim bundle is QUARANTINED;
+- every bundle has durable quarantine identity, physical size, device and inode;
+- per-chain physical totals match their durable reclaim snapshot;
+- job/run/VM/storage lineage is unchanged;
+- policy remains SPACE_OPTIMIZED;
+- selected chains remain CLOSED valid populated FULL chains;
+- exact restore-point membership and bundle identities still match the
+  durable reclaim snapshot;
+- minimum_full_chains is still protected;
+- no restore point outside the reclaim set depends on a selected restore point;
+- no external job run depends on a selected restore point;
+- source-run artifacts are PUBLISHED and belong to selected restore points.
+
+Catalog retirement performs, in transaction order:
+
+- detachment of run_disks.planned_artifact_id references to selected artifacts;
+- deletion of selected backup_artifacts;
+- clearing historical source-run parent_restore_point_id references that point
+  inside the same retired chain;
+- child-before-parent deletion of selected restore_points;
+- deletion of selected backup_chains;
+- verification that selected restore points and chains are absent;
+- verification that reclaim_operations, reclaim_chains and reclaim_bundles
+  remain intact;
+- transition of the reclaim operation to CATALOG_REMOVED.
+
+Any SQLite integrity error or invariant failure rolls back the complete catalog
+transaction.
+
+The durable reclaim journal intentionally survives removal of the source
+restore-point and backup-chain metadata.
+
+This phase performs no filesystem operation and no physical purge. Quarantined
+bundle data remains under the controlled .reclaim namespace.
 
 ---
 
 ### 3E.8b.2c — Safe physical purge primitive
 
-Status: PLANNED
+Status: IN_PROGRESS
 
 Target scope:
 
