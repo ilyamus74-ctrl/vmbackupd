@@ -1059,11 +1059,65 @@ Acceptance coverage proves:
 
 ---
 
+# Cockpit reclaim policy controls
+
+Status: CLOSED
+
+Implementation commit:
+
+    6e2f3ac — Add reclaim controls to Cockpit
+
+Cockpit Backup Job settings now expose the capacity/reclaim policy that was
+already implemented by the backend.
+
+Job controls include:
+
+    Restore points to retain
+    Full chains to retain
+    Minimum full chains
+    Space reclaim mode
+
+Supported reclaim modes:
+
+    SAFE
+        Never removes a valid backup before a replacement succeeds.
+
+    SPACE_OPTIMIZED
+        May reclaim the oldest eligible CLOSED FULL chain before starting a
+        backup when measured free space is insufficient, while preserving the
+        configured minimum_full_chains floor.
+
+Cockpit loads the persisted backend values when editing an existing job and
+sends the following authoritative policy fields through job.update/job.create:
+
+    restore_points_to_retain
+    full_chains_to_retain
+    minimum_full_chains
+    space_reclaim_mode
+
+The frontend does not implement reclaim selection or deletion logic. Capacity
+planning, chain eligibility, durable reclaim transactions, filesystem
+quarantine/purge, catalog retirement, crash recovery, and post-reclaim
+free-space verification remain backend responsibilities.
+
+Acceptance coverage proves:
+
+- SAFE and SPACE_OPTIMIZED are exposed explicitly;
+- full_chains_to_retain is editable in Cockpit;
+- minimum_full_chains remains editable;
+- persisted reclaim values are restored into the edit dialog;
+- reclaim policy fields are sent to the backend;
+- Cockpit test suite passes;
+- complete project regression suite passes;
+- Python compilation, JavaScript syntax checks, and git diff checks pass.
+
+---
+
 # Current position
 
 Current implementation milestone:
 
-    Calendar DAILY backup scheduling — CLOSED
+    Cockpit reclaim policy controls — CLOSED
 
 Current safety boundary:
 
@@ -1081,4 +1135,5 @@ Current safety boundary:
     DAILY IANA timezone           YES
     DAILY DST-safe scheduling     YES
     Cockpit DAILY controls        YES
+    Cockpit reclaim controls      YES
     remote SSH transfer           NO
