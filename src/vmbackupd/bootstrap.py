@@ -20,6 +20,7 @@ from .models import StorageDestination
 from .repository import DomainInvariantError, SQLiteRepository
 from .runtime import DaemonRuntime
 from .ssh_identity import SSHIdentityManager
+from .ssh_known_hosts import SSHKnownHostsManager
 from .version import __version__
 
 
@@ -230,13 +231,18 @@ def compose(config: AppConfig) -> Components:
     )
     read_driver = VirshLibvirtDriver(SubprocessCommandRunner(), config.libvirt.uri)
     runtime = RuntimeWorker(config, node.id)
+    ssh_root = config.daemon.database_path.parent / "ssh"
     ssh_identity_manager = SSHIdentityManager(
-        config.daemon.database_path.parent / "ssh",
+        ssh_root,
         SubprocessCommandRunner(),
+    )
+    ssh_known_hosts_manager = SSHKnownHostsManager(
+        ssh_root,
     )
     application = VmbackupApplication(
         repository, runtime, read_driver, config, node, clock, __version__,
         ssh_identity_manager=ssh_identity_manager,
+        ssh_known_hosts_manager=ssh_known_hosts_manager,
     )
     server = ApiServer(application, config.daemon.socket_path, config.daemon.socket_mode)
     return Components(config, repository, runtime, application, server)

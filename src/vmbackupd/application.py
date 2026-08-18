@@ -15,6 +15,7 @@ from .models import (
 )
 from .repository import DomainInvariantError, SQLiteRepository
 from .ssh_identity import SSHIdentityError
+from .ssh_known_hosts import SSHKnownHostsError
 from .storage import LocalStorageTester, lexical_storage_path, storage_path_has_symlink
 
 
@@ -29,11 +30,13 @@ class ApplicationError(RuntimeError):
 
 class VmbackupApplication:
     def __init__(self, repository: SQLiteRepository, runtime, driver, config, node, clock: Clock,
-                 version: str, storage_tester=None, ssh_identity_manager=None) -> None:
+                 version: str, storage_tester=None, ssh_identity_manager=None,
+                 ssh_known_hosts_manager=None) -> None:
         self.repository, self.runtime, self.driver = repository, runtime, driver
         self.config, self.node, self.clock, self.version = config, node, clock, version
         self.storage_tester = storage_tester or LocalStorageTester()
         self.ssh_identity_manager = ssh_identity_manager
+        self.ssh_known_hosts_manager = ssh_known_hosts_manager
 
     def dispatch(self, method: str, params: dict) -> object:
         handlers = {
@@ -45,6 +48,9 @@ class VmbackupApplication:
             "ssh.identity.show": self.ssh_identity_show,
             "ssh.identity.generate": self.ssh_identity_generate,
             "ssh.identity.rotate": self.ssh_identity_rotate,
+            "ssh.hostkey.show": self.ssh_hostkey_show,
+            "ssh.hostkey.add": self.ssh_hostkey_add,
+            "ssh.hostkey.revoke": self.ssh_hostkey_revoke,
             "vm.discover": self.vm_discover, "vm.list": self.vm_list,
             "vm.show": self.vm_show, "vm.register": self.vm_register,
             "job.list": self.job_list, "job.show": self.job_show,
@@ -69,6 +75,8 @@ class VmbackupApplication:
             code = str(exc) if str(exc).isupper() else "DOMAIN_ERROR"
             raise ApplicationError(code, str(exc)) from None
         except SSHIdentityError as exc:
+            raise ApplicationError(exc.code, str(exc)) from None
+        except SSHKnownHostsError as exc:
             raise ApplicationError(exc.code, str(exc)) from None
         except TypeError as exc:
             raise ApplicationError("INVALID_PARAMS", str(exc)) from None
@@ -341,6 +349,75 @@ class VmbackupApplication:
     def ssh_identity_rotate(self, destination_id):
         self._require_ssh_identity_destination(destination_id)
         return self.ssh_identity_manager.rotate(destination_id)
+
+    def _require_ssh_hostkey_destination(self, destination_id):
+        destination = self.repository.get_storage_destination(
+            self.node.id, destination_id
+        )
+        if destination.storage_type is not StorageType.SSH:
+            raise ApplicationError(
+                "SSH_DESTINATION_REQUIRED",
+                "SSH host key operations require an SSH storage destination",
+            )
+        if self.ssh_known_hosts_manager is None:
+            raise ApplicationError(
+                "SSH_HOSTKEY_UNAVAILABLE",
+                "SSH known_hosts manager is not configured",
+            )
+        if destination.ssh_host is None or destination.ssh_port is None:
+            raise ApplicationError(
+                "SSH_DESTINATION_INVALID",
+                "SSH destination endpoint is incomplete",
+            )
+        return destination
+
+    @staticmethod
+    def _serialize_ssh_hostkey(destination, value):
+        return {
+            "destination_id": destination.id,
+            "destination_name": destination.name,
+            **value,
+        }
+
+    def ssh_hostkey_show(self, destination_id):
+        destination = self._require_ssh_hostkey_destination(
+            destination_id
+        )
+        value = self.ssh_known_hosts_manager.show(
+            destination.ssh_host,
+            destination.ssh_port,
+        )
+        return self._serialize_ssh_hostkey(
+            destination,
+            value,
+        )
+
+    def ssh_hostkey_add(self, destination_id, key):
+        destination = self._require_ssh_hostkey_destination(
+            destination_id
+        )
+        value = self.ssh_known_hosts_manager.add(
+            destination.ssh_host,
+            destination.ssh_port,
+            key,
+        )
+        return self._serialize_ssh_hostkey(
+            destination,
+            value,
+        )
+
+    def ssh_hostkey_revoke(self, destination_id):
+        destination = self._require_ssh_hostkey_destination(
+            destination_id
+        )
+        value = self.ssh_known_hosts_manager.revoke(
+            destination.ssh_host,
+            destination.ssh_port,
+        )
+        return self._serialize_ssh_hostkey(
+            destination,
+            value,
+        )
 
     def vm_discover(self): return list(self.driver.discover_domains())
     def vm_list(self): return [serialization.vm(x) for x in self.repository.list_vms(self.node.id)]
