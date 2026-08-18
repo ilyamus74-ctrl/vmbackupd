@@ -27,6 +27,21 @@ def drop_v6_reclaim_tables(connection):
     connection.execute("DROP TABLE reclaim_operations")
 
 
+def drop_v9_schedule_columns(connection):
+    """Restore the exact pre-v9 backup_jobs schedule shape."""
+
+    # schedule_type owns the cross-column CHECK, so remove it first.
+    connection.execute(
+        "ALTER TABLE backup_jobs DROP COLUMN schedule_type"
+    )
+    connection.execute(
+        "ALTER TABLE backup_jobs DROP COLUMN daily_time"
+    )
+    connection.execute(
+        "ALTER TABLE backup_jobs DROP COLUMN schedule_timezone"
+    )
+
+
 def catalog(repository):
     node = Node("EU")
     repository.add_node(node)
@@ -57,6 +72,7 @@ def version_one_database(path):
     repository.close()
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = OFF")
+    drop_v9_schedule_columns(connection)
     drop_v6_reclaim_tables(connection)
     connection.execute("DROP TRIGGER job_runs_destination_required_insert")
     connection.execute("DROP TRIGGER job_runs_destination_required_update")
@@ -436,9 +452,170 @@ def test_cli_job_create_and_update_map_schedule_enable_and_destination_options()
         "space_reclaim_mode": "SPACE_OPTIMIZED",
         "backup_size_margin_percent": 25.5,
         "interval_seconds": None,
-        "misfire_grace_seconds": None, "enabled": True, "schedule_enabled": False,
+        "misfire_grace_seconds": None,
+        "schedule_type": None,
+        "daily_time": None,
+        "schedule_timezone": None,
+        "enabled": True, "schedule_enabled": False,
     }
     with pytest.raises(SystemExit):
         parser.parse_args([
             "job", "update", "job-id", "--storage", "id", "--storage-name", "name",
         ])
+
+
+def test_job_api_creates_and_updates_daily_calendar_schedule():
+    repository = SQLiteRepository()
+    node, first, _, vm = catalog(repository)
+
+    clock = FakeClock(NOW)
+    app = application(repository, node, clock)
+
+    created = app.dispatch(
+        "job.create",
+        {
+            "vm_id": vm.id,
+            "name": "daily",
+            "storage_destination_id": first.id,
+            "schedule_type": "DAILY",
+            "daily_time": "01:00",
+            "schedule_timezone": "Europe/Berlin",
+            "schedule_enabled": True,
+        },
+    )
+
+    assert created["schedule_type"] == "DAILY"
+    assert created["daily_time"] == "01:00"
+    assert created["schedule_timezone"] == "Europe/Berlin"
+
+    # NOW = 2026-08-17 12:00 UTC = 14:00 Europe/Berlin.
+    assert created["next_run_at"] == (
+        "2026-08-18T01:00:00+02:00"
+    )
+
+    updated = app.dispatch(
+        "job.update",
+        {
+            "id": created["id"],
+            "daily_time": "02:15",
+            "schedule_timezone": "Europe/Berlin",
+        },
+    )
+
+    assert updated["schedule_type"] == "DAILY"
+    assert updated["daily_time"] == "02:15"
+    assert updated["schedule_timezone"] == "Europe/Berlin"
+    assert updated["next_run_at"] == (
+        "2026-08-18T02:15:00+02:00"
+    )
+
+    interval = app.dispatch(
+        "job.update",
+        {
+            "id": created["id"],
+            "schedule_type": "INTERVAL",
+            "interval_seconds": 7200,
+        },
+    )
+
+    assert interval["schedule_type"] == "INTERVAL"
+    assert interval["daily_time"] is None
+    assert interval["schedule_timezone"] is None
+    assert interval["next_run_at"] == (
+        NOW + timedelta(hours=2)
+    ).isoformat()
+
+
+def test_cli_maps_daily_calendar_schedule_options():
+    parser = _parser()
+
+    method, params = _request(
+        parser.parse_args(
+            [
+                "job",
+                "create",
+                "--vm",
+                "vm",
+                "--name",
+                "daily",
+                "--schedule",
+                "--schedule-type",
+                "DAILY",
+                "--daily-time",
+                "01:00",
+                "--schedule-timezone",
+                "Europe/Berlin",
+            ]
+        )
+    )
+
+    assert method == "job.create"
+    assert params["schedule_enabled"] is True
+    assert params["schedule_type"] == "DAILY"
+    assert params["daily_time"] == "01:00"
+    assert params["schedule_timezone"] == "Europe/Berlin"
+
+    method, params = _request(
+        parser.parse_args(
+            [
+                "job",
+                "update",
+                "job-id",
+                "--schedule",
+                "--schedule-type",
+                "DAILY",
+                "--daily-time",
+                "02:30",
+                "--schedule-timezone",
+                "Europe/Berlin",
+            ]
+        )
+    )
+
+    assert method == "job.update"
+    assert params["schedule_enabled"] is True
+    assert params["schedule_type"] == "DAILY"
+    assert params["daily_time"] == "02:30"
+    assert params["schedule_timezone"] == "Europe/Berlin"
+
+
+def test_daily_schedule_rejects_invalid_wall_time_and_timezone():
+    repository = SQLiteRepository()
+    node, first, _, vm = catalog(repository)
+    app = application(
+        repository,
+        node,
+        FakeClock(NOW),
+    )
+
+    with pytest.raises(
+        ApplicationError,
+        match="HH:MM",
+    ):
+        app.dispatch(
+            "job.create",
+            {
+                "vm_id": vm.id,
+                "name": "bad-time",
+                "storage_destination_id": first.id,
+                "schedule_type": "DAILY",
+                "daily_time": "25:00",
+                "schedule_timezone": "Europe/Berlin",
+            },
+        )
+
+    with pytest.raises(
+        ApplicationError,
+        match="IANA timezone",
+    ):
+        app.dispatch(
+            "job.create",
+            {
+                "vm_id": vm.id,
+                "name": "bad-zone",
+                "storage_destination_id": first.id,
+                "schedule_type": "DAILY",
+                "daily_time": "01:00",
+                "schedule_timezone": "Not/AZone",
+            },
+        )

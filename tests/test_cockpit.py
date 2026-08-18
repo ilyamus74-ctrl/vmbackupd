@@ -208,7 +208,7 @@ def test_cockpit_job_management_is_full_only_and_refreshes_authoritative_data():
     assert "Schedule mode" in html
     assert "Restore points to retain" in html
     assert "Minimum full chains" in html
-    assert "Manual" in html and "Interval" in html
+    assert "Manual" in html and "Interval" in html and "Daily" in html
     assert 'max_incrementals_per_chain: 0' in javascript
     assert 'await api.request("job.update"' in javascript
     assert 'await api.request("backup.run"' in javascript
@@ -269,6 +269,42 @@ def test_cockpit_interval_editor_round_trips_without_truncation():
     assert "return { amount: seconds, unit: 1 };" in javascript
     assert "Number(document.getElementById(\"job-interval\").value) *" in javascript
     assert "Number(document.getElementById(\"job-interval-unit\").value)" in javascript
+
+def test_cockpit_daily_calendar_schedule_is_backend_authoritative():
+    html = source("index.html")
+    javascript = source("vmbackupd.js")
+
+    assert '<option value="daily">Daily</option>' in html
+    assert 'id="daily-fields"' in html
+    assert 'id="job-daily-time" type="time" value="01:00"' in html
+    assert 'id="job-schedule-timezone"' in html
+    assert 'list="job-timezone-options"' in html
+    assert '<option value="Europe/Berlin"></option>' in html
+    assert '<option value="UTC"></option>' in html
+    assert 'id="job-next-run"' in html
+
+    assert "function browserTimezone()" in javascript
+    assert "Intl.DateTimeFormat().resolvedOptions().timeZone" in javascript
+    assert "function jobScheduleMode(job)" in javascript
+    assert 'job.schedule_type === "DAILY" ? "daily" : "interval"' in javascript
+    assert "function updateScheduleFields()" in javascript
+
+    assert 'schedule_enabled: scheduleMode !== "manual"' in javascript
+    assert 'params.schedule_type = "INTERVAL";' in javascript
+    assert 'params.schedule_type = "DAILY";' in javascript
+    assert 'params.daily_time =' in javascript
+    assert 'params.schedule_timezone =' in javascript
+
+    assert "job && job.daily_time ? job.daily_time : \"01:00\"" in javascript
+    assert "job && job.schedule_timezone ?" in javascript
+
+    # The browser displays the persisted daemon cursor. It deliberately
+    # does not duplicate calendar/DST scheduling calculations.
+    assert "job.next_run_at" in javascript
+    assert "Current next run:" in javascript
+    assert "Recalculated after save." in javascript
+    assert "localTimestamp(job.next_run_at)" in javascript
+
 
 def test_cockpit_live_refresh_uses_one_shot_polling():
     javascript = source("vmbackupd.js")

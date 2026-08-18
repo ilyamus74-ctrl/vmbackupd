@@ -28,6 +28,9 @@ def job(value: BackupJob) -> dict:
                 value.retention_policy.backup_size_margin_percent,
             "interval_seconds": value.schedule_policy.interval_seconds,
             "misfire_grace_seconds": value.schedule_policy.misfire_grace_seconds,
+            "schedule_type": value.schedule_policy.schedule_type.value,
+            "daily_time": value.schedule_policy.daily_time,
+            "schedule_timezone": value.schedule_policy.schedule_timezone,
             "next_run_at": value.next_run_at.isoformat() if value.next_run_at else None,
             "created_at": value.created_at.isoformat()}
 

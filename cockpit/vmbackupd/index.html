@@ -101,11 +101,20 @@
       <label>Destination<select id="job-storage" required></select></label>
       <label>Backup mode<input value="Full" readonly aria-readonly="true"></label>
       <label class="check-label"><input id="job-enabled" type="checkbox" checked> Enabled</label>
-      <label>Schedule mode<select id="job-schedule"><option value="manual">Manual</option><option value="interval">Interval</option></select></label>
+      <label>Schedule mode<select id="job-schedule"><option value="manual">Manual</option><option value="interval">Interval</option><option value="daily">Daily</option></select></label>
       <div id="interval-fields" class="inline-fields" hidden>
-        <label>Every<input id="job-interval" type="number" min="1" value="60" required></label>
+        <label>Every<input id="job-interval" type="number" min="1" value="60"></label>
         <label>Unit<select id="job-interval-unit"><option value="1">seconds</option><option value="60">minutes</option><option value="3600">hours</option><option value="86400">days</option></select></label>
       </div>
+      <div id="daily-fields" class="inline-fields" hidden>
+        <label>Time<input id="job-daily-time" type="time" value="01:00"></label>
+        <label>Timezone<input id="job-schedule-timezone" list="job-timezone-options" value="Europe/Berlin" autocomplete="off"></label>
+      </div>
+      <datalist id="job-timezone-options">
+        <option value="Europe/Berlin"></option>
+        <option value="UTC"></option>
+      </datalist>
+      <p id="job-next-run" class="form-note" hidden></p>
       <label>Restore points to retain<input id="job-retain" type="number" min="0" value="7" required></label>
       <label>Minimum full chains<input id="job-minimum-chains" type="number" min="1" value="1" required></label>
       <p id="job-form-error" class="form-error" role="alert"></p>

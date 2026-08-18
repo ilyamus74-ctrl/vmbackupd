@@ -81,6 +81,46 @@
         return { amount: 60, unit: 60 };
     }
 
+    function browserTimezone() {
+        try {
+            const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+            return timezone || "UTC";
+        } catch (_error) {
+            return "UTC";
+        }
+    }
+
+    function jobScheduleMode(job) {
+        if (!job || !job.next_run_at)
+            return "manual";
+        return job.schedule_type === "DAILY" ? "daily" : "interval";
+    }
+
+    function updateScheduleFields() {
+        const mode = document.getElementById("job-schedule").value;
+        const intervalFields = document.getElementById("interval-fields");
+        const dailyFields = document.getElementById("daily-fields");
+        const intervalInput = document.getElementById("job-interval");
+        const intervalUnit = document.getElementById("job-interval-unit");
+        const dailyTime = document.getElementById("job-daily-time");
+        const timezone = document.getElementById("job-schedule-timezone");
+
+        const intervalEnabled = mode === "interval";
+        const dailyEnabled = mode === "daily";
+
+        intervalFields.hidden = !intervalEnabled;
+        dailyFields.hidden = !dailyEnabled;
+
+        intervalInput.disabled = !intervalEnabled;
+        intervalUnit.disabled = !intervalEnabled;
+        intervalInput.required = intervalEnabled;
+
+        dailyTime.disabled = !dailyEnabled;
+        timezone.disabled = !dailyEnabled;
+        dailyTime.required = dailyEnabled;
+        timezone.required = dailyEnabled;
+    }
+
     function runDuration(run, now) {
         const end = TERMINAL_STATES.has(run.state) ? run.updated_at : now.toISOString();
         return durationBetween(run.created_at, end);
@@ -540,12 +580,24 @@
         document.getElementById("job-enabled").checked = job ? job.enabled : true;
         document.getElementById("job-retain").value = job ? job.restore_points_to_retain : 7;
         document.getElementById("job-minimum-chains").value = job ? job.minimum_full_chains : 1;
-        const scheduled = Boolean(job && job.next_run_at);
-        document.getElementById("job-schedule").value = scheduled ? "interval" : "manual";
+        document.getElementById("job-schedule").value = jobScheduleMode(job);
+
         const interval = intervalParts(job ? job.interval_seconds : 3600);
         document.getElementById("job-interval").value = interval.amount;
         document.getElementById("job-interval-unit").value = String(interval.unit);
-        document.getElementById("interval-fields").hidden = !scheduled;
+
+        document.getElementById("job-daily-time").value =
+            job && job.daily_time ? job.daily_time : "01:00";
+        document.getElementById("job-schedule-timezone").value =
+            job && job.schedule_timezone ?
+                job.schedule_timezone : browserTimezone();
+
+        const nextRun = document.getElementById("job-next-run");
+        nextRun.hidden = !(job && job.next_run_at);
+        nextRun.textContent = job && job.next_run_at ?
+            `Current next run: ${localTimestamp(job.next_run_at)}. Recalculated after save.` : "";
+
+        updateScheduleFields();
         document.getElementById("job-form-error").textContent = "";
         jobDialog.showModal();
     }
@@ -575,17 +627,28 @@
         event.preventDefault();
         const errorNode = document.getElementById("job-form-error");
         errorNode.textContent = "";
-        const interval = Number(document.getElementById("job-interval").value) *
-            Number(document.getElementById("job-interval-unit").value);
+        const scheduleMode = document.getElementById("job-schedule").value;
         const params = {
             name: document.getElementById("job-name").value.trim(),
             storage_destination_id: document.getElementById("job-storage").value,
             enabled: document.getElementById("job-enabled").checked,
-            schedule_enabled: document.getElementById("job-schedule").value === "interval",
-            interval_seconds: interval,
+            schedule_enabled: scheduleMode !== "manual",
             restore_points_to_retain: Number(document.getElementById("job-retain").value),
             minimum_full_chains: Number(document.getElementById("job-minimum-chains").value),
         };
+
+        if (scheduleMode === "interval") {
+            params.schedule_type = "INTERVAL";
+            params.interval_seconds =
+                Number(document.getElementById("job-interval").value) *
+                Number(document.getElementById("job-interval-unit").value);
+        } else if (scheduleMode === "daily") {
+            params.schedule_type = "DAILY";
+            params.daily_time =
+                document.getElementById("job-daily-time").value;
+            params.schedule_timezone =
+                document.getElementById("job-schedule-timezone").value.trim();
+        }
         let registeredVm = null;
         try {
             if (editingJobId) {
@@ -738,9 +801,7 @@
     addStorageButton.addEventListener("click", () => openStorageDialog());
     document.getElementById("job-cancel").addEventListener("click", () => jobDialog.close());
     document.getElementById("job-vm").addEventListener("change", updateRegistrationNote);
-    document.getElementById("job-schedule").addEventListener("change", event => {
-        document.getElementById("interval-fields").hidden = event.target.value !== "interval";
-    });
+    document.getElementById("job-schedule").addEventListener("change", updateScheduleFields);
     jobForm.addEventListener("submit", saveJob);
     document.getElementById("storage-cancel").addEventListener("click", () => storageDialog.close());
     document.getElementById("storage-test-candidate").addEventListener("click", testStorageCandidate);

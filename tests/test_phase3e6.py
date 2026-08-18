@@ -30,6 +30,20 @@ def drop_v6_reclaim_tables(connection):
     connection.execute("DROP TABLE reclaim_operations")
 
 
+def drop_v9_schedule_columns(connection):
+    """Restore the exact pre-v9 backup_jobs schedule shape."""
+
+    connection.execute(
+        "ALTER TABLE backup_jobs DROP COLUMN schedule_type"
+    )
+    connection.execute(
+        "ALTER TABLE backup_jobs DROP COLUMN daily_time"
+    )
+    connection.execute(
+        "ALTER TABLE backup_jobs DROP COLUMN schedule_timezone"
+    )
+
+
 def catalog(repository, tmp_path):
     node = Node("local")
     repository.add_node(node)
@@ -60,6 +74,7 @@ def version_three_database(path, tmp_path):
     ))
     repository.close()
     connection = sqlite3.connect(path)
+    drop_v9_schedule_columns(connection)
     drop_v6_reclaim_tables(connection)
     connection.execute("DROP TRIGGER storage_destination_identity_immutable_after_run")
     connection.execute("ALTER TABLE storage_destinations ADD COLUMN control_root TEXT")
@@ -96,6 +111,7 @@ def published_version_three_database(path, tmp_path):
     }
     repository.close()
     connection = sqlite3.connect(path)
+    drop_v9_schedule_columns(connection)
     drop_v6_reclaim_tables(connection)
     connection.execute("DROP TRIGGER storage_destination_identity_immutable_after_run")
     connection.execute("ALTER TABLE storage_destinations ADD COLUMN control_root TEXT")

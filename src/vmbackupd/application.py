@@ -254,6 +254,8 @@ class VmbackupApplication:
                    full_chains_to_retain=2, space_reclaim_mode="SAFE",
                    backup_size_margin_percent=20.0,
                    interval_seconds=3600, misfire_grace_seconds=0,
+                   schedule_type="INTERVAL", daily_time=None,
+                   schedule_timezone=None,
                    storage_destination_id=None, storage_destination=None,
                    schedule_enabled=False, enabled=True):
         if not isinstance(schedule_enabled, bool) or not isinstance(enabled, bool):
@@ -273,6 +275,20 @@ class VmbackupApplication:
                 raise ApplicationError("NOT_FOUND", "storage destination not found")
         else:
             destination = self.repository.get_default_storage_destination(self.node.id)
+        try:
+            schedule = SchedulePolicy(
+                int(interval_seconds),
+                int(misfire_grace_seconds),
+                schedule_type=schedule_type,
+                daily_time=daily_time,
+                schedule_timezone=schedule_timezone,
+            )
+        except ValueError as exc:
+            raise ApplicationError(
+                "INVALID_PARAMS",
+                str(exc),
+            ) from exc
+
         value = BackupJob(
             vm_id=vm_id, name=name, storage_destination_id=destination.id,
             backup_policy=BackupPolicy(int(max_incrementals_per_chain)),
@@ -283,9 +299,12 @@ class VmbackupApplication:
                 space_reclaim_mode,
                 float(backup_size_margin_percent),
             ),
-            schedule_policy=SchedulePolicy(int(interval_seconds), int(misfire_grace_seconds)),
-            next_run_at=(self.clock.now() + timedelta(seconds=int(interval_seconds))
-                         if schedule_enabled else None),
+            schedule_policy=schedule,
+            next_run_at=(
+                schedule.next_run_after(self.clock.now())
+                if schedule_enabled
+                else None
+            ),
             enabled=enabled,
         )
         self.repository.add_job(value)
@@ -297,6 +316,8 @@ class VmbackupApplication:
                    full_chains_to_retain=None, space_reclaim_mode=None,
                    backup_size_margin_percent=None,
                    interval_seconds=None, misfire_grace_seconds=None,
+                   schedule_type=None, daily_time=None,
+                   schedule_timezone=None,
                    schedule_enabled=None):
         if enabled is not None and not isinstance(enabled, bool):
             raise ApplicationError("INVALID_PARAMS", "enabled must be boolean")
@@ -321,9 +342,17 @@ class VmbackupApplication:
                 None if backup_size_margin_percent is None
                 else float(backup_size_margin_percent)
             ),
-            interval_seconds=(None if interval_seconds is None else int(interval_seconds)),
-            misfire_grace_seconds=(None if misfire_grace_seconds is None
-                                   else int(misfire_grace_seconds)),
+            interval_seconds=(
+                None if interval_seconds is None
+                else int(interval_seconds)
+            ),
+            misfire_grace_seconds=(
+                None if misfire_grace_seconds is None
+                else int(misfire_grace_seconds)
+            ),
+            schedule_type=schedule_type,
+            daily_time=daily_time,
+            schedule_timezone=schedule_timezone,
             schedule_enabled=schedule_enabled,
         ))
 

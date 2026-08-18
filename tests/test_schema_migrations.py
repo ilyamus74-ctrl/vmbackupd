@@ -22,6 +22,22 @@ def drop_v6_reclaim_tables(connection):
     connection.execute("DROP TABLE reclaim_operations")
 
 
+def drop_v9_schedule_columns(connection):
+    """Restore the exact pre-v9 backup_jobs schedule shape."""
+
+    # Drop schedule_type first because its CHECK references the two
+    # DAILY-only columns.
+    connection.execute(
+        "ALTER TABLE backup_jobs DROP COLUMN schedule_type"
+    )
+    connection.execute(
+        "ALTER TABLE backup_jobs DROP COLUMN daily_time"
+    )
+    connection.execute(
+        "ALTER TABLE backup_jobs DROP COLUMN schedule_timezone"
+    )
+
+
 def drop_v7_recovery_provenance(connection):
     connection.execute(
         "ALTER TABLE reclaim_operations DROP COLUMN recovery_from_state"
@@ -62,6 +78,7 @@ def make_unversioned(path, *, legacy=False):
     values = populated_database(path)
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = OFF")
+    drop_v9_schedule_columns(connection)
     drop_v6_reclaim_tables(connection)
     connection.execute("DROP TABLE schema_version")
     connection.execute("DROP TRIGGER job_runs_destination_required_insert")
@@ -339,6 +356,7 @@ def test_v4_to_v5_backfills_capacity_retention_policy(tmp_path):
     repository.close()
 
     connection = sqlite3.connect(path)
+    drop_v9_schedule_columns(connection)
     connection.execute("ALTER TABLE backup_jobs DROP COLUMN backup_size_margin_percent")
     connection.execute("ALTER TABLE backup_jobs DROP COLUMN space_reclaim_mode")
     connection.execute("ALTER TABLE backup_jobs DROP COLUMN full_chains_to_retain")
@@ -395,6 +413,7 @@ def test_v5_to_v6_adds_durable_reclaim_journal_without_data_loss(tmp_path):
 
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = OFF")
+    drop_v9_schedule_columns(connection)
     drop_v6_reclaim_tables(connection)
     connection.execute(
         "UPDATE schema_version SET version = 5 WHERE id = 1"
@@ -404,7 +423,7 @@ def test_v5_to_v6_adds_durable_reclaim_journal_without_data_loss(tmp_path):
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 8
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 9
     assert {
         "reclaim_operations",
         "reclaim_chains",
@@ -487,6 +506,7 @@ def test_v6_to_v7_adds_recovery_provenance_without_data_loss(tmp_path):
 
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = OFF")
+    drop_v9_schedule_columns(connection)
     drop_v7_recovery_provenance(connection)
     connection.execute(
         "UPDATE schema_version SET version = 6 WHERE id = 1"
@@ -496,7 +516,7 @@ def test_v6_to_v7_adds_recovery_provenance_without_data_loss(tmp_path):
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 8
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 9
     assert "recovery_from_state" in table_columns(
         migrated.connection,
         "reclaim_operations",
@@ -533,6 +553,7 @@ def test_v6_recovery_required_without_provenance_refuses_migration(
 
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = OFF")
+    drop_v9_schedule_columns(connection)
 
     connection.execute(
         """INSERT INTO reclaim_operations (
@@ -593,6 +614,7 @@ def test_v5_to_v6_step_uses_frozen_historical_reclaim_schema(tmp_path):
 
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = OFF")
+    drop_v9_schedule_columns(connection)
     drop_v6_reclaim_tables(connection)
     connection.execute(
         "UPDATE schema_version SET version = 5 WHERE id = 1"
@@ -697,6 +719,7 @@ def test_v7_to_v8_adds_bundle_purging_state_without_data_loss(
 
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = OFF")
+    drop_v9_schedule_columns(connection)
     rebuild_reclaim_bundles_as_v7(connection)
     connection.execute(
         "UPDATE schema_version SET version = 7 WHERE id = 1"
@@ -706,7 +729,7 @@ def test_v7_to_v8_adds_bundle_purging_state_without_data_loss(
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 8
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 9
 
     bundle_sql = migrated.connection.execute(
         """SELECT sql
@@ -766,6 +789,7 @@ def test_v7_ambiguous_purge_state_refuses_v8_migration(
 
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = OFF")
+    drop_v9_schedule_columns(connection)
     rebuild_reclaim_bundles_as_v7(connection)
 
     created = "2026-08-18T12:00:00+00:00"
@@ -836,3 +860,87 @@ def test_v7_ambiguous_purge_state_refuses_v8_migration(
     assert "'PURGING'" not in bundle_sql
 
     raw.close()
+
+
+def test_v8_to_v9_adds_calendar_schedule_without_changing_interval_cursor(
+    tmp_path,
+):
+    path = tmp_path / "v8-to-v9-calendar.db"
+
+    values = populated_database(path)
+    _, _, _, job, _, _, _ = values
+
+    preserved_cursor = "2026-08-19T01:23:45+00:00"
+
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA foreign_keys = OFF")
+
+    connection.execute(
+        """UPDATE backup_jobs
+           SET next_run_at = ?
+           WHERE id = ?""",
+        (
+            preserved_cursor,
+            job.id,
+        ),
+    )
+
+    drop_v9_schedule_columns(connection)
+
+    connection.execute(
+        "UPDATE schema_version SET version = 8 WHERE id = 1"
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = SQLiteRepository(path)
+
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 9
+
+    columns = table_columns(
+        migrated.connection,
+        "backup_jobs",
+    )
+
+    assert {
+        "schedule_type",
+        "daily_time",
+        "schedule_timezone",
+    } <= columns
+
+    persisted = migrated.get_job(job.id)
+
+    assert persisted.schedule_policy.schedule_type.value == "INTERVAL"
+    assert persisted.schedule_policy.daily_time is None
+    assert persisted.schedule_policy.schedule_timezone is None
+    assert persisted.schedule_policy.interval_seconds == 3600
+
+    assert (
+        persisted.next_run_at.isoformat()
+        == preserved_cursor
+    )
+
+    row = migrated.connection.execute(
+        """SELECT schedule_type,
+                  daily_time,
+                  schedule_timezone,
+                  next_run_at
+           FROM backup_jobs
+           WHERE id = ?""",
+        (job.id,),
+    ).fetchone()
+
+    assert tuple(row) == (
+        "INTERVAL",
+        None,
+        None,
+        preserved_cursor,
+    )
+
+    assert list(
+        migrated.connection.execute(
+            "PRAGMA foreign_key_check"
+        )
+    ) == []
+
+    migrated.close()

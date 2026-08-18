@@ -63,6 +63,13 @@ def _parser():
                 )
                 item.add_argument("--interval", type=int, default=3600)
                 item.add_argument("--misfire-grace", type=int, default=0)
+                item.add_argument(
+                    "--schedule-type",
+                    choices=("INTERVAL", "DAILY"),
+                    default="INTERVAL",
+                )
+                item.add_argument("--daily-time")
+                item.add_argument("--schedule-timezone")
                 item.add_argument("--schedule", action="store_true")
                 item.add_argument("--disabled", action="store_true")
             if group == "job" and command == "update":
@@ -79,6 +86,12 @@ def _parser():
                 item.add_argument("--backup-size-margin-percent", type=float)
                 item.add_argument("--interval", type=int)
                 item.add_argument("--misfire-grace", type=int)
+                item.add_argument(
+                    "--schedule-type",
+                    choices=("INTERVAL", "DAILY"),
+                )
+                item.add_argument("--daily-time")
+                item.add_argument("--schedule-timezone")
                 enabled = item.add_mutually_exclusive_group()
                 enabled.add_argument("--enable", action="store_true")
                 enabled.add_argument("--disable", action="store_true")
@@ -122,6 +135,9 @@ def _request(args):
                   "backup_size_margin_percent": args.backup_size_margin_percent,
                   "interval_seconds": args.interval,
                   "misfire_grace_seconds": args.misfire_grace,
+                  "schedule_type": args.schedule_type,
+                  "daily_time": args.daily_time,
+                  "schedule_timezone": args.schedule_timezone,
                   "schedule_enabled": args.schedule,
                   "enabled": not args.disabled}
     elif args.group == "job" and args.command == "update":
@@ -135,6 +151,9 @@ def _request(args):
                   "backup_size_margin_percent": args.backup_size_margin_percent,
                   "interval_seconds": args.interval,
                   "misfire_grace_seconds": args.misfire_grace,
+                  "schedule_type": args.schedule_type,
+                  "daily_time": args.daily_time,
+                  "schedule_timezone": args.schedule_timezone,
                   "enabled": True if args.enable else False if args.disable else None,
                   "schedule_enabled": True if args.schedule else False if args.manual else None}
     elif args.group == "backup": params = {"job_id": args.job_id}

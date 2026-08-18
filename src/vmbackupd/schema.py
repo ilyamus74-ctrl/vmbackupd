@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from zoneinfo import ZoneInfo as _SchemaZoneInfo
+from zoneinfo import ZoneInfoNotFoundError as _SchemaZoneInfoNotFoundError
+
 import sqlite3
 from collections.abc import Callable, Mapping
 
 
-CURRENT_SCHEMA_VERSION = 8
+CURRENT_SCHEMA_VERSION = 9
 
 
 class SchemaError(RuntimeError):
@@ -195,6 +198,27 @@ CURRENT_SCHEMA_STATEMENTS = (
         misfire_grace_seconds INTEGER NOT NULL CHECK(misfire_grace_seconds >= 0),
         catch_up_mode TEXT NOT NULL CHECK(catch_up_mode = 'RUN_ONCE'),
         overlap_policy TEXT NOT NULL CHECK(overlap_policy = 'SKIP_IF_BUSY'),
+        daily_time TEXT,
+        schedule_timezone TEXT,
+        schedule_type TEXT NOT NULL DEFAULT 'INTERVAL'
+            CHECK(
+                (
+                    schedule_type = 'INTERVAL'
+                    AND daily_time IS NULL
+                    AND schedule_timezone IS NULL
+                )
+                OR
+                (
+                    schedule_type = 'DAILY'
+                    AND daily_time IS NOT NULL
+                    AND length(daily_time) = 5
+                    AND daily_time GLOB '[0-2][0-9]:[0-5][0-9]'
+                    AND CAST(substr(daily_time, 1, 2) AS INTEGER)
+                        BETWEEN 0 AND 23
+                    AND schedule_timezone IS NOT NULL
+                    AND length(trim(schedule_timezone)) > 0
+                )
+            ),
         next_run_at TEXT, created_at TEXT NOT NULL
     )""",
     """CREATE TABLE backup_chains (
@@ -320,7 +344,9 @@ CURRENT_COLUMNS = {
                     "full_chains_to_retain", "minimum_full_chains",
                     "space_reclaim_mode", "backup_size_margin_percent",
                     "interval_seconds", "misfire_grace_seconds",
-                    "catch_up_mode", "overlap_policy", "next_run_at", "created_at"},
+                    "catch_up_mode", "overlap_policy",
+                    "schedule_type", "daily_time", "schedule_timezone",
+                    "next_run_at", "created_at"},
     "job_runs": {"id", "job_id", "storage_destination_id", "state", "planned_kind", "planned_chain_id",
                  "planned_sequence", "parent_restore_point_id", "error", "cleanup_error",
                  "cleanup_attempts", "scheduled_for", "is_catch_up", "missed_schedule_slots",
@@ -366,8 +392,17 @@ CURRENT_COLUMNS = {
     },
 }
 
-VERSION_7_COLUMNS = {
+VERSION_8_COLUMNS = {
     name: set(columns) for name, columns in CURRENT_COLUMNS.items()
+}
+VERSION_8_COLUMNS["backup_jobs"] -= {
+    "schedule_type",
+    "daily_time",
+    "schedule_timezone",
+}
+
+VERSION_7_COLUMNS = {
+    name: set(columns) for name, columns in VERSION_8_COLUMNS.items()
 }
 
 VERSION_6_COLUMNS = {
@@ -792,6 +827,50 @@ def validate_current_schema(connection: sqlite3.Connection) -> None:
     ).fetchone():
         raise UnsupportedSchemaError("backup job retention policy is invalid")
 
+    invalid_schedule = connection.execute(
+        """SELECT 1
+           FROM backup_jobs
+           WHERE (
+               schedule_type = 'INTERVAL'
+               AND (
+                   daily_time IS NOT NULL
+                   OR schedule_timezone IS NOT NULL
+               )
+           ) OR (
+               schedule_type = 'DAILY'
+               AND (
+                   daily_time IS NULL
+                   OR length(daily_time) != 5
+                   OR daily_time NOT GLOB '[0-2][0-9]:[0-5][0-9]'
+                   OR CAST(substr(daily_time, 1, 2) AS INTEGER) > 23
+                   OR schedule_timezone IS NULL
+                   OR length(trim(schedule_timezone)) = 0
+               )
+           ) OR schedule_type NOT IN ('INTERVAL', 'DAILY')
+           LIMIT 1"""
+    ).fetchone()
+
+    if invalid_schedule:
+        raise UnsupportedSchemaError(
+            "backup job schedule policy is invalid"
+        )
+
+    for row in connection.execute(
+        """SELECT DISTINCT schedule_timezone
+           FROM backup_jobs
+           WHERE schedule_type = 'DAILY'"""
+    ):
+        try:
+            _SchemaZoneInfo(row[0])
+        except (
+            _SchemaZoneInfoNotFoundError,
+            ValueError,
+            TypeError,
+        ) as exc:
+            raise UnsupportedSchemaError(
+                "backup job schedule timezone is invalid"
+            ) from exc
+
     invalid_reclaim_lineage = connection.execute(
         """SELECT ro.id
            FROM reclaim_operations ro
@@ -1076,6 +1155,42 @@ def migrate_7_to_8(connection: sqlite3.Connection) -> None:
     )
 
 
+
+def migrate_8_to_9(connection: sqlite3.Connection) -> None:
+    """Add persisted calendar DAILY scheduling without changing old jobs."""
+
+    connection.execute(
+        """ALTER TABLE backup_jobs
+           ADD COLUMN daily_time TEXT"""
+    )
+    connection.execute(
+        """ALTER TABLE backup_jobs
+           ADD COLUMN schedule_timezone TEXT"""
+    )
+    connection.execute(
+        """ALTER TABLE backup_jobs
+           ADD COLUMN schedule_type TEXT NOT NULL DEFAULT 'INTERVAL'
+           CHECK(
+               (
+                   schedule_type = 'INTERVAL'
+                   AND daily_time IS NULL
+                   AND schedule_timezone IS NULL
+               )
+               OR
+               (
+                   schedule_type = 'DAILY'
+                   AND daily_time IS NOT NULL
+                   AND length(daily_time) = 5
+                   AND daily_time GLOB '[0-2][0-9]:[0-5][0-9]'
+                   AND CAST(substr(daily_time, 1, 2) AS INTEGER)
+                       BETWEEN 0 AND 23
+                   AND schedule_timezone IS NOT NULL
+                   AND length(trim(schedule_timezone)) > 0
+               )
+           )"""
+    )
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: migrate_0_to_1,
     1: migrate_1_to_2,
@@ -1085,6 +1200,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     5: migrate_5_to_6,
     6: migrate_6_to_7,
     7: migrate_7_to_8,
+    8: migrate_8_to_9,
 }
 
 

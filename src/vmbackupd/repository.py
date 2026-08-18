@@ -369,8 +369,10 @@ class SQLiteRepository:
                    full_chains_to_retain, minimum_full_chains,
                    space_reclaim_mode, backup_size_margin_percent,
                    interval_seconds, misfire_grace_seconds,
-                   catch_up_mode, overlap_policy, next_run_at, created_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   catch_up_mode, overlap_policy,
+                   schedule_type, daily_time, schedule_timezone,
+                   next_run_at, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (value.id, value.vm_id, value.name, value.storage_destination_id,
              int(value.enabled),
              value.backup_policy.max_incrementals_per_chain,
@@ -383,6 +385,9 @@ class SQLiteRepository:
              value.schedule_policy.misfire_grace_seconds,
              value.schedule_policy.catch_up_mode,
              value.schedule_policy.overlap_policy,
+             value.schedule_policy.schedule_type,
+             value.schedule_policy.daily_time,
+             value.schedule_policy.schedule_timezone,
              value.next_run_at.isoformat() if value.next_run_at else None,
              value.created_at.isoformat()),
         )
@@ -394,7 +399,9 @@ class SQLiteRepository:
         restore_points_to_retain=None, minimum_full_chains=None,
         full_chains_to_retain=None, space_reclaim_mode=None,
         backup_size_margin_percent=None,
-        interval_seconds=None, misfire_grace_seconds=None, schedule_enabled=None,
+        interval_seconds=None, misfire_grace_seconds=None,
+        schedule_type=None, daily_time=None, schedule_timezone=None,
+        schedule_enabled=None,
     ) -> BackupJob:
         """Read, derive, and write a mutable job patch under one write lock."""
         self.connection.execute("BEGIN IMMEDIATE")
@@ -418,11 +425,52 @@ class SQLiteRepository:
             if destination_id is None:
                 raise DomainInvariantError("STORAGE_DESTINATION_REQUIRED")
             self.get_storage_destination(local_node_id, destination_id)
-            interval = (current.schedule_policy.interval_seconds if interval_seconds is None
-                        else interval_seconds)
-            grace = (current.schedule_policy.misfire_grace_seconds
-                     if misfire_grace_seconds is None else misfire_grace_seconds)
-            schedule = SchedulePolicy(interval, grace)
+            interval = (
+                current.schedule_policy.interval_seconds
+                if interval_seconds is None
+                else interval_seconds
+            )
+            grace = (
+                current.schedule_policy.misfire_grace_seconds
+                if misfire_grace_seconds is None
+                else misfire_grace_seconds
+            )
+
+            target_schedule_type = (
+                current.schedule_policy.schedule_type
+                if schedule_type is None
+                else schedule_type
+            )
+            target_schedule_type_value = getattr(
+                target_schedule_type,
+                "value",
+                target_schedule_type,
+            )
+
+            if target_schedule_type_value == "INTERVAL":
+                target_daily_time = None
+                target_schedule_timezone = None
+            else:
+                target_daily_time = (
+                    current.schedule_policy.daily_time
+                    if daily_time is None
+                    else daily_time
+                )
+                target_schedule_timezone = (
+                    current.schedule_policy.schedule_timezone
+                    if schedule_timezone is None
+                    else schedule_timezone
+                )
+
+            schedule = SchedulePolicy(
+                interval,
+                grace,
+                current.schedule_policy.catch_up_mode,
+                current.schedule_policy.overlap_policy,
+                target_schedule_type,
+                target_daily_time,
+                target_schedule_timezone,
+            )
             retention = RetentionPolicy(
                 current.retention_policy.restore_points_to_retain
                 if restore_points_to_retain is None else restore_points_to_retain,
@@ -438,20 +486,43 @@ class SQLiteRepository:
             new_enabled = current.enabled if enabled is None else enabled
             was_scheduled = current.next_run_at is not None
             will_schedule = was_scheduled if schedule_enabled is None else schedule_enabled
+            schedule_position_changed = (
+                schedule.schedule_type
+                != current.schedule_policy.schedule_type
+                or (
+                    schedule.schedule_type.value == "INTERVAL"
+                    and interval
+                    != current.schedule_policy.interval_seconds
+                )
+                or schedule.daily_time
+                != current.schedule_policy.daily_time
+                or schedule.schedule_timezone
+                != current.schedule_policy.schedule_timezone
+            )
+
             reset_cursor = will_schedule and (
-                not was_scheduled or interval != current.schedule_policy.interval_seconds
+                not was_scheduled
+                or schedule_position_changed
                 or (not current.enabled and new_enabled)
             )
-            next_run_at = current.next_run_at if will_schedule else None
+
+            next_run_at = (
+                current.next_run_at
+                if will_schedule
+                else None
+            )
+
             if reset_cursor:
-                next_run_at = now + timedelta(seconds=interval)
+                next_run_at = schedule.next_run_after(now)
             self.connection.execute(
                 """UPDATE backup_jobs SET name = ?, storage_destination_id = ?, enabled = ?,
                    max_incrementals_per_chain = ?, restore_points_to_retain = ?,
                    full_chains_to_retain = ?, minimum_full_chains = ?,
                    space_reclaim_mode = ?, backup_size_margin_percent = ?,
                    interval_seconds = ?, misfire_grace_seconds = ?,
-                   catch_up_mode = ?, overlap_policy = ?, next_run_at = ? WHERE id = ?""",
+                   catch_up_mode = ?, overlap_policy = ?,
+                   schedule_type = ?, daily_time = ?, schedule_timezone = ?,
+                   next_run_at = ? WHERE id = ?""",
                 (current.name if name is None else name, destination_id, int(new_enabled),
                  current.backup_policy.max_incrementals_per_chain,
                  retention.restore_points_to_retain,
@@ -459,6 +530,8 @@ class SQLiteRepository:
                  retention.space_reclaim_mode, retention.backup_size_margin_percent,
                  schedule.interval_seconds, schedule.misfire_grace_seconds,
                  schedule.catch_up_mode, schedule.overlap_policy,
+                 schedule.schedule_type, schedule.daily_time,
+                 schedule.schedule_timezone,
                  next_run_at.isoformat() if next_run_at else None, current.id),
             )
             self.connection.commit()
@@ -1192,9 +1265,12 @@ class SQLiteRepository:
             if job.storage_destination_id is None:
                 raise DomainInvariantError("STORAGE_DESTINATION_REQUIRED")
             self.get_storage_destination(vm.node_id, job.storage_destination_id)
-            interval = job.schedule_policy.interval_seconds
-            represented = int((now - due).total_seconds() // interval) + 1
-            next_run_at = due + timedelta(seconds=represented * interval)
+            represented, next_run_at = (
+                job.schedule_policy.advance_due(
+                    due,
+                    now,
+                )
+            )
             is_catch_up = represented > 1 or (
                 now - due
             ).total_seconds() > job.schedule_policy.misfire_grace_seconds
@@ -3840,10 +3916,15 @@ class SQLiteRepository:
                 row["space_reclaim_mode"],
                 row["backup_size_margin_percent"],
             ),
-            schedule_policy=SchedulePolicy(row["interval_seconds"],
-                                           row["misfire_grace_seconds"],
-                                           CatchUpMode(row["catch_up_mode"]),
-                                           OverlapPolicy(row["overlap_policy"])),
+            schedule_policy=SchedulePolicy(
+                row["interval_seconds"],
+                row["misfire_grace_seconds"],
+                CatchUpMode(row["catch_up_mode"]),
+                OverlapPolicy(row["overlap_policy"]),
+                row["schedule_type"],
+                row["daily_time"],
+                row["schedule_timezone"],
+            ),
             next_run_at=datetime.fromisoformat(row["next_run_at"]) if row["next_run_at"] else None,
             created_at=datetime.fromisoformat(row["created_at"]),
         )

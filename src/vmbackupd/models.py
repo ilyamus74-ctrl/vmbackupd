@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import timedelta as _schedule_timedelta
+from datetime import timezone as _schedule_timezone_utc
+from zoneinfo import ZoneInfo as _ScheduleZoneInfo
+from zoneinfo import ZoneInfoNotFoundError as _ScheduleZoneInfoNotFoundError
+
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -141,22 +146,286 @@ class RetentionPolicy:
             raise ValueError("backup_size_margin_percent must be between 0 and 100")
 
 
+class ScheduleType(StrEnum):
+    INTERVAL = "INTERVAL"
+    DAILY = "DAILY"
+
+
 @dataclass(frozen=True, slots=True)
 class SchedulePolicy:
     interval_seconds: int = 3600
     misfire_grace_seconds: int = 0
     catch_up_mode: CatchUpMode = CatchUpMode.RUN_ONCE
     overlap_policy: OverlapPolicy = OverlapPolicy.SKIP_IF_BUSY
+    schedule_type: ScheduleType = ScheduleType.INTERVAL
+    daily_time: str | None = None
+    schedule_timezone: str | None = None
 
     def __post_init__(self) -> None:
         if self.interval_seconds < 60:
             raise ValueError("interval_seconds must be at least 60")
         if self.misfire_grace_seconds < 0:
             raise ValueError("misfire_grace_seconds must be non-negative")
-        if self.catch_up_mode is not CatchUpMode.RUN_ONCE:
+
+        try:
+            catch_up = CatchUpMode(self.catch_up_mode)
+        except ValueError as exc:
+            raise ValueError("invalid catch_up_mode") from exc
+        object.__setattr__(self, "catch_up_mode", catch_up)
+
+        try:
+            overlap = OverlapPolicy(self.overlap_policy)
+        except ValueError as exc:
+            raise ValueError("invalid overlap_policy") from exc
+        object.__setattr__(self, "overlap_policy", overlap)
+
+        if catch_up is not CatchUpMode.RUN_ONCE:
             raise ValueError("only RUN_ONCE catch-up is supported")
-        if self.overlap_policy is not OverlapPolicy.SKIP_IF_BUSY:
+        if overlap is not OverlapPolicy.SKIP_IF_BUSY:
             raise ValueError("only SKIP_IF_BUSY overlap is supported")
+
+        try:
+            schedule_type = ScheduleType(self.schedule_type)
+        except ValueError as exc:
+            raise ValueError("invalid schedule_type") from exc
+        object.__setattr__(self, "schedule_type", schedule_type)
+
+        if schedule_type is ScheduleType.INTERVAL:
+            if (
+                self.daily_time is not None
+                or self.schedule_timezone is not None
+            ):
+                raise ValueError(
+                    "INTERVAL schedule cannot define daily time or timezone"
+                )
+            return
+
+        daily_time = self.daily_time
+        timezone_name = self.schedule_timezone
+
+        if not isinstance(daily_time, str) or len(daily_time) != 5:
+            raise ValueError("DAILY schedule requires HH:MM daily_time")
+        if daily_time[2] != ":":
+            raise ValueError("DAILY schedule requires HH:MM daily_time")
+
+        hour_text = daily_time[:2]
+        minute_text = daily_time[3:]
+
+        if not hour_text.isdigit() or not minute_text.isdigit():
+            raise ValueError("DAILY schedule requires HH:MM daily_time")
+
+        hour = int(hour_text)
+        minute = int(minute_text)
+
+        if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+            raise ValueError("DAILY schedule requires valid HH:MM daily_time")
+
+        if (
+            not isinstance(timezone_name, str)
+            or not timezone_name.strip()
+        ):
+            raise ValueError(
+                "DAILY schedule requires schedule_timezone"
+            )
+
+        try:
+            _ScheduleZoneInfo(timezone_name)
+        except (
+            _ScheduleZoneInfoNotFoundError,
+            ValueError,
+            TypeError,
+        ) as exc:
+            raise ValueError(
+                "DAILY schedule requires valid IANA timezone"
+            ) from exc
+
+    @staticmethod
+    def _require_aware(value: datetime, label: str) -> None:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(f"{label} must be timezone-aware")
+
+    @staticmethod
+    def _utc(value: datetime) -> datetime:
+        return value.astimezone(_schedule_timezone_utc.utc)
+
+    @staticmethod
+    def _valid_local_candidates(
+        naive: datetime,
+        zone: _ScheduleZoneInfo,
+    ) -> list[datetime]:
+        candidates: dict[datetime, datetime] = {}
+
+        for fold in (0, 1):
+            candidate = naive.replace(
+                tzinfo=zone,
+                fold=fold,
+            )
+
+            utc_value = candidate.astimezone(
+                _schedule_timezone_utc.utc
+            )
+
+            round_trip = utc_value.astimezone(zone)
+
+            if round_trip.replace(tzinfo=None) != naive:
+                continue
+
+            candidates.setdefault(
+                utc_value,
+                candidate,
+            )
+
+        return [
+            candidates[key]
+            for key in sorted(candidates)
+        ]
+
+    def _daily_slot_for_date(
+        self,
+        local_date,
+    ) -> datetime:
+        if (
+            self.schedule_type is not ScheduleType.DAILY
+            or self.daily_time is None
+            or self.schedule_timezone is None
+        ):
+            raise ValueError(
+                "daily slot requested for non-DAILY schedule"
+            )
+
+        hour = int(self.daily_time[:2])
+        minute = int(self.daily_time[3:])
+        zone = _ScheduleZoneInfo(
+            self.schedule_timezone
+        )
+
+        naive = datetime(
+            local_date.year,
+            local_date.month,
+            local_date.day,
+            hour,
+            minute,
+        )
+
+        # Normal or ambiguous wall time. For an ambiguous fall-back
+        # occurrence choose the first real instant.
+        candidates = self._valid_local_candidates(
+            naive,
+            zone,
+        )
+
+        if candidates:
+            return candidates[0]
+
+        # Spring-forward gap: use the first existing wall-clock minute
+        # after the requested time.
+        for offset_minutes in range(1, 24 * 60 + 1):
+            probe = naive + _schedule_timedelta(
+                minutes=offset_minutes
+            )
+            candidates = self._valid_local_candidates(
+                probe,
+                zone,
+            )
+            if candidates:
+                return candidates[0]
+
+        raise ValueError(
+            "cannot resolve DAILY schedule wall-clock time"
+        )
+
+    def next_run_after(
+        self,
+        value: datetime,
+    ) -> datetime:
+        """Return the first schedule slot strictly after value."""
+
+        self._require_aware(value, "schedule cursor")
+
+        if self.schedule_type is ScheduleType.INTERVAL:
+            return value + _schedule_timedelta(
+                seconds=self.interval_seconds
+            )
+
+        assert self.schedule_timezone is not None
+
+        zone = _ScheduleZoneInfo(
+            self.schedule_timezone
+        )
+        local_date = value.astimezone(zone).date()
+        value_utc = self._utc(value)
+
+        # Usually zero or one iterations. The loop also handles timezone
+        # transitions without converting DAILY into a 24-hour interval.
+        for _ in range(0, 3700):
+            candidate = self._daily_slot_for_date(
+                local_date
+            )
+
+            if self._utc(candidate) > value_utc:
+                return candidate
+
+            local_date = (
+                local_date
+                + _schedule_timedelta(days=1)
+            )
+
+        raise ValueError(
+            "cannot determine next DAILY schedule slot"
+        )
+
+    def advance_due(
+        self,
+        due: datetime,
+        now: datetime,
+    ) -> tuple[int, datetime]:
+        """Coalesce due occurrences and return count plus next future slot."""
+
+        self._require_aware(due, "scheduled due time")
+        self._require_aware(now, "scheduler time")
+
+        due_utc = self._utc(due)
+        now_utc = self._utc(now)
+
+        if due_utc > now_utc:
+            raise ValueError(
+                "scheduled due time is still in the future"
+            )
+
+        if self.schedule_type is ScheduleType.INTERVAL:
+            represented = (
+                int(
+                    (now_utc - due_utc).total_seconds()
+                    // self.interval_seconds
+                )
+                + 1
+            )
+
+            return (
+                represented,
+                due
+                + _schedule_timedelta(
+                    seconds=(
+                        represented
+                        * self.interval_seconds
+                    )
+                ),
+            )
+
+        represented = 0
+        cursor = due
+
+        while self._utc(cursor) <= now_utc:
+            represented += 1
+
+            if represented > 1_000_000:
+                raise ValueError(
+                    "DAILY schedule backlog is unreasonably large"
+                )
+
+            cursor = self.next_run_after(cursor)
+
+        return represented, cursor
 
 
 @dataclass(frozen=True, slots=True)

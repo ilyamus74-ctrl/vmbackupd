@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from vmbackupd.clock import FakeClock
 from vmbackupd.models import (
@@ -88,3 +89,271 @@ def test_schedule_state_survives_repository_restart(tmp_path):
     assert len(reopened.list_runs()) == 1
     assert IntervalScheduler(reopened, clock).tick() == []
     reopened.close()
+
+
+def test_daily_schedule_creates_calendar_run_and_advances_to_next_day():
+    repository = SQLiteRepository()
+
+    node = Node(name="daily-node")
+    repository.add_node(node)
+
+    destination = StorageDestination(
+        node_id=node.id,
+        name="local",
+        backup_data_root="/data",
+        is_default=True,
+    )
+    repository.add_storage_destination(destination)
+
+    vm = VM(
+        node_id=node.id,
+        name="daily-vm",
+        external_id="daily-vm",
+    )
+    repository.add_vm(vm)
+
+    berlin = ZoneInfo("Europe/Berlin")
+    due = datetime(2026, 8, 19, 1, 0, tzinfo=berlin)
+
+    job = BackupJob(
+        vm_id=vm.id,
+        name="daily",
+        storage_destination_id=destination.id,
+        schedule_policy=SchedulePolicy(
+            schedule_type="DAILY",
+            daily_time="01:00",
+            schedule_timezone="Europe/Berlin",
+        ),
+        next_run_at=due,
+    )
+    repository.add_job(job)
+
+    runs = IntervalScheduler(
+        repository,
+        FakeClock(due),
+    ).tick()
+
+    assert len(runs) == 1
+    assert runs[0].scheduled_for == due
+    assert not runs[0].is_catch_up
+
+    persisted = repository.get_job(job.id)
+
+    assert persisted.next_run_at == datetime(
+        2026,
+        8,
+        20,
+        1,
+        0,
+        tzinfo=berlin,
+    )
+
+
+def test_daily_schedule_run_once_coalesces_missed_calendar_days():
+    repository = SQLiteRepository()
+
+    node = Node(name="daily-late-node")
+    repository.add_node(node)
+
+    destination = StorageDestination(
+        node_id=node.id,
+        name="local",
+        backup_data_root="/data",
+        is_default=True,
+    )
+    repository.add_storage_destination(destination)
+
+    vm = VM(
+        node_id=node.id,
+        name="daily-late-vm",
+        external_id="daily-late-vm",
+    )
+    repository.add_vm(vm)
+
+    berlin = ZoneInfo("Europe/Berlin")
+
+    due = datetime(
+        2026,
+        8,
+        15,
+        1,
+        0,
+        tzinfo=berlin,
+    )
+    now = datetime(
+        2026,
+        8,
+        18,
+        5,
+        0,
+        tzinfo=berlin,
+    )
+
+    job = BackupJob(
+        vm_id=vm.id,
+        name="daily-late",
+        storage_destination_id=destination.id,
+        schedule_policy=SchedulePolicy(
+            schedule_type="DAILY",
+            daily_time="01:00",
+            schedule_timezone="Europe/Berlin",
+        ),
+        next_run_at=due,
+    )
+    repository.add_job(job)
+
+    runs = IntervalScheduler(
+        repository,
+        FakeClock(now),
+    ).tick()
+
+    assert len(runs) == 1
+
+    run = runs[0]
+
+    assert run.scheduled_for == due
+    assert run.is_catch_up
+    assert run.missed_schedule_slots == 4
+
+    assert repository.get_job(job.id).next_run_at == datetime(
+        2026,
+        8,
+        19,
+        1,
+        0,
+        tzinfo=berlin,
+    )
+
+
+def test_daily_schedule_survives_repository_restart(tmp_path):
+    path = tmp_path / "daily-restart.db"
+
+    berlin = ZoneInfo("Europe/Berlin")
+    due = datetime(
+        2026,
+        8,
+        19,
+        1,
+        0,
+        tzinfo=berlin,
+    )
+
+    repository = SQLiteRepository(path)
+
+    node = Node(name="daily-restart-node")
+    repository.add_node(node)
+
+    destination = StorageDestination(
+        node_id=node.id,
+        name="local",
+        backup_data_root="/data",
+        is_default=True,
+    )
+    repository.add_storage_destination(destination)
+
+    vm = VM(
+        node_id=node.id,
+        name="daily-restart-vm",
+        external_id="daily-restart-vm",
+    )
+    repository.add_vm(vm)
+
+    job = BackupJob(
+        vm_id=vm.id,
+        name="daily-restart",
+        storage_destination_id=destination.id,
+        schedule_policy=SchedulePolicy(
+            schedule_type="DAILY",
+            daily_time="01:00",
+            schedule_timezone="Europe/Berlin",
+        ),
+        next_run_at=due,
+    )
+    repository.add_job(job)
+    repository.close()
+
+    reopened = SQLiteRepository(path)
+    persisted = reopened.get_job(job.id)
+
+    assert persisted.schedule_policy.schedule_type.value == "DAILY"
+    assert persisted.schedule_policy.daily_time == "01:00"
+    assert (
+        persisted.schedule_policy.schedule_timezone
+        == "Europe/Berlin"
+    )
+    assert persisted.next_run_at == due
+
+    runs = IntervalScheduler(
+        reopened,
+        FakeClock(due),
+    ).tick()
+
+    assert len(runs) == 1
+
+    assert reopened.get_job(job.id).next_run_at == datetime(
+        2026,
+        8,
+        20,
+        1,
+        0,
+        tzinfo=berlin,
+    )
+
+    reopened.close()
+
+
+def test_daily_dst_spring_gap_uses_first_existing_wall_clock_time():
+    berlin = ZoneInfo("Europe/Berlin")
+
+    schedule = SchedulePolicy(
+        schedule_type="DAILY",
+        daily_time="02:30",
+        schedule_timezone="Europe/Berlin",
+    )
+
+    before = datetime(
+        2026,
+        3,
+        28,
+        2,
+        30,
+        tzinfo=berlin,
+    )
+
+    assert schedule.next_run_after(before) == datetime(
+        2026,
+        3,
+        29,
+        3,
+        0,
+        tzinfo=berlin,
+    )
+
+
+def test_daily_dst_fall_back_uses_first_ambiguous_occurrence():
+    berlin = ZoneInfo("Europe/Berlin")
+
+    schedule = SchedulePolicy(
+        schedule_type="DAILY",
+        daily_time="02:30",
+        schedule_timezone="Europe/Berlin",
+    )
+
+    before = datetime(
+        2026,
+        10,
+        24,
+        2,
+        30,
+        tzinfo=berlin,
+    )
+
+    result = schedule.next_run_after(before)
+
+    assert result.year == 2026
+    assert result.month == 10
+    assert result.day == 25
+    assert result.hour == 2
+    assert result.minute == 30
+    assert result.fold == 0
+    assert result.utcoffset() == timedelta(hours=2)
