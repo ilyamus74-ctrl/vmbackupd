@@ -1269,11 +1269,103 @@ perform remote atomic promotion.
 
 ---
 
+# SSH.2a — Per-destination SSH identities
+
+Status: CLOSED
+
+Implementation commit:
+
+    e9447c8 — Add per-destination SSH identities
+
+Implemented daemon-owned per-destination Ed25519 client identities outside
+SQLite.
+
+Persistent layout:
+
+    /var/lib/vmbackupd/ssh/identities/<destination-id>/
+        id_ed25519
+        id_ed25519.pub
+
+Filesystem contract:
+
+    destination directory   0700
+    private key             0600
+    public key              0644
+
+SSH identity material is associated with the immutable storage destination ID.
+No schema change was required and CURRENT_SCHEMA_VERSION remains 10.
+
+Implemented operations:
+
+    ssh.identity.show
+    ssh.identity.generate
+    ssh.identity.rotate
+
+The same operations are exposed through vmbackupctl:
+
+    vmbackupctl ssh identity-show <destination-id>
+    vmbackupctl ssh identity-generate <destination-id>
+    vmbackupctl ssh identity-rotate <destination-id>
+
+Identity operations are valid only for SSH storage destinations.
+
+The public API exposes only:
+
+    destination_id
+    exists
+    public_key
+    fingerprint
+
+The private key and its filesystem path are never serialized through the
+application API or CLI response.
+
+Generation uses argv-only ssh-keygen invocation and Ed25519 keys. Beginning
+with this phase, the RPM declares openssh-clients as a runtime dependency.
+
+Safety behavior is fail-closed:
+
+- normal generation does not overwrite an existing identity;
+- explicit rotation is required to replace a valid identity;
+- incomplete private/public pairs are rejected;
+- mismatched private/public pairs are rejected;
+- symlink/non-regular identity files are rejected;
+- unsafe key-file permissions are rejected;
+- unsafe destination IDs cannot escape the identities root;
+- failed normal rotation preserves the previous valid identity;
+- the public key is verified against the private key using ssh-keygen -y.
+
+The identity state remains outside RPM payload and therefore survives normal
+package upgrades together with /var/lib/vmbackupd state.
+
+Acceptance includes:
+
+- fake-runner deterministic identity lifecycle tests;
+- real /usr/bin/ssh-keygen Ed25519 generation;
+- real key rotation;
+- 0700/0600/0644 filesystem permission verification;
+- SHA256 public-key fingerprint generation;
+- explicit verification that private-key material is absent from API and CLI
+  serialization;
+- existing SSH destination and API regression;
+- package dependency regression;
+- complete project pytest regression;
+- Python compilation;
+- Cockpit JavaScript syntax validation;
+- real vmbackupctl identity command help;
+- schema version remains v10;
+- git diff validation.
+
+This phase does not implement known_hosts trust management, SSH network
+connection testing, receiver enrollment, remote transfer, remote verification,
+or atomic remote promotion.
+
+---
+
 # Current position
 
 Current implementation milestone:
 
-    SSH.1b API, configuration, and package persistence — CLOSED
+    SSH.2a per-destination SSH identities — CLOSED
 
 Current safety boundary:
 
@@ -1296,6 +1388,9 @@ Current safety boundary:
     SSH transport identity        YES
     SSH API/configuration         YES
     SSH persistent state dirs     YES
-    SSH key management            NO
+    SSH identity generation       YES
+    SSH identity rotation         YES
+    private key API isolation     YES
+    SSH known_hosts trust         NO
     SSH connection preflight      NO
     remote SSH transfer           NO
