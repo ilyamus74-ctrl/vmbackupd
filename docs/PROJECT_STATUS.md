@@ -290,9 +290,49 @@ No backup files or catalog objects are deleted by this phase.
 
 ---
 
-## 3E.8b.1c — Reclaim state transition/recovery API
+## 3E.8b.1c.1 — Durable reclaim recovery provenance
 
-Status: PLANNED
+Status: CLOSED
+
+Closing commit:
+
+    ef47fa2
+
+Implemented schema v7 recovery provenance for durable reclaim operations.
+
+Added:
+
+- `reclaim_operations.recovery_from_state`;
+- domain validation coupling `RECOVERY_REQUIRED` to its prior durable state;
+- frozen historical schema-v6 reclaim DDL;
+- ordered migration `6 -> 7`;
+- historical v5 -> v6 -> v7 migration validation.
+
+Allowed recovery source states:
+
+    RETIRING
+    QUARANTINED
+    CATALOG_REMOVED
+    PURGING
+    PURGED
+
+A reclaim operation in `RECOVERY_REQUIRED` must record exactly one valid
+`recovery_from_state`.
+
+A non-recovery operation must not carry recovery provenance.
+
+Migration from schema v6 refuses a pre-existing `RECOVERY_REQUIRED`
+operation because schema v6 did not contain enough durable information to
+determine its previous destructive state safely.
+
+This phase performs no reclaim state transitions and no filesystem or catalog
+mutation.
+
+---
+
+## 3E.8b.1c.2 — Reclaim state transition/recovery API
+
+Status: IN_PROGRESS
 
 Target state flow:
 
@@ -307,9 +347,21 @@ Safe pre-mutation abort:
 
     PLANNED -> ABORTED
 
-Ambiguous or unsafe state:
+Ambiguous destructive state:
 
-    * -> RECOVERY_REQUIRED
+    RETIRING / QUARANTINED / CATALOG_REMOVED / PURGING / PURGED
+        -> RECOVERY_REQUIRED
+
+Recovery must preserve and use `recovery_from_state`.
+
+Target scope:
+
+- strict repository transition API;
+- atomic state changes;
+- bundle-level quarantine/purge state transitions;
+- state-dependent invariant validation;
+- durable recovery entry and recovery resume semantics;
+- no filesystem operations.
 
 ---
 
