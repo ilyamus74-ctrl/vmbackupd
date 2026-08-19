@@ -16,7 +16,8 @@ from vmbackupd.libvirt_backend import (
     VirshLibvirtDriver,
 )
 from vmbackupd.libvirt_execution import (
-    ImageInfo, LibvirtAuthorizationError, LibvirtBackupExecutor,
+    ImageInfo, LibvirtAuthorizationError,
+    LibvirtBackupStartRejectedError, LibvirtBackupExecutor,
     LibvirtExecutionSafetyError,
     QemuImageInspector, QemuOutputImagePreparer, StagingFilesystem, VirshBackupDriver,
 )
@@ -1327,6 +1328,11 @@ def test_data_directory_mode_and_optional_ownership_are_explicit(tmp_path):
     assert data_dir.stat().st_mode & 0o777 == 0o750
     assert staging.run_directory("safe-run").stat().st_mode & 0o777 == 0o700
     assert calls == [
+        (
+            staging.backup_data_root / ".incoming",
+            -1,
+            456,
+        ),
         (staging.data_run_directory("safe-run"), -1, 456),
         (data_dir, -1, 456),
     ]
@@ -1346,7 +1352,11 @@ def test_optional_data_ownership_is_deterministic(tmp_path, uid, gid, expected):
         chown=lambda path, actual_uid, actual_gid: calls.append((actual_uid, actual_gid)),
     )
     staging.prepare_new_run("safe-run", filesystem_artifacts(control, data))
-    assert calls == ([] if expected is None else [expected, expected])
+    assert calls == (
+        []
+        if expected is None
+        else [expected, expected, expected]
+    )
 
 
 def test_data_directory_cannot_be_transferred_to_a_different_user(tmp_path):
@@ -1834,3 +1844,223 @@ def test_virsh_manage_preflight_is_exact_bounded_argv():
             4,
         )
     ]
+
+
+def test_staging_incoming_root_is_qemu_traversable_contract(
+    tmp_path,
+):
+    control = tmp_path / "control"
+    data = tmp_path / "data"
+
+    gid = os.getegid()
+
+    staging = StagingFilesystem(
+        control,
+        data,
+        backup_data_gid=gid,
+        backup_data_mode=0o750,
+    )
+
+    artifacts = filesystem_artifacts(
+        control,
+        data,
+    )
+
+    staging.prepare_new_run(
+        "safe-run",
+        artifacts,
+    )
+
+    incoming = data / ".incoming"
+    run_dir = incoming / "safe-run"
+    disks = run_dir / "disks"
+
+    for path in (
+        incoming,
+        run_dir,
+        disks,
+    ):
+        info = path.stat()
+
+        assert info.st_gid == gid
+        assert info.st_mode & 0o777 == 0o750
+
+    # Regression for the live Fedora 44 failure:
+    # every path component leading to QEMU-written files must expose
+    # group execute/traverse.
+    assert incoming.stat().st_mode & 0o010
+    assert run_dir.stat().st_mode & 0o010
+    assert disks.stat().st_mode & 0o010
+
+
+def test_existing_incoming_root_is_repaired_for_qemu_group(
+    tmp_path,
+):
+    control = tmp_path / "control"
+    data = tmp_path / "data"
+
+    data.mkdir()
+
+    incoming = data / ".incoming"
+    incoming.mkdir(mode=0o750)
+
+    # Reproduce the live defect: parent staging directory exists with
+    # an unrelated group/mode state. prepare_new_run must normalize it.
+    os.chmod(
+        incoming,
+        0o700,
+    )
+
+    gid = os.getegid()
+
+    staging = StagingFilesystem(
+        control,
+        data,
+        backup_data_gid=gid,
+        backup_data_mode=0o750,
+    )
+
+    staging.prepare_new_run(
+        "safe-run",
+        filesystem_artifacts(
+            control,
+            data,
+        ),
+    )
+
+    info = incoming.stat()
+
+    assert info.st_gid == gid
+    assert info.st_mode & 0o777 == 0o750
+    assert info.st_mode & 0o010
+
+
+def test_virsh_backup_begin_classifies_blockdev_permission_denied_as_definite_rejection(
+    tmp_path,
+):
+    backup_xml = str(
+        tmp_path / "backup.xml"
+    )
+
+    command = (
+        "virsh",
+        "--connect",
+        "qemu:///system",
+        "backup-begin",
+        "domain-uuid",
+        backup_xml,
+        "--reuse-external",
+    )
+
+    runner = FakeCommandRunner({
+        command: (
+            1,
+            "",
+            "error: internal error: unable to execute QEMU command "
+            "'blockdev-add': Could not open "
+            "'/backup/.incoming/run/disks/vda.qcow2': "
+            "Permission denied",
+        )
+    })
+
+    driver = VirshBackupDriver(
+        runner,
+        "qemu:///system",
+        timeout=15,
+    )
+
+    with pytest.raises(
+        LibvirtBackupStartRejectedError,
+        match="could not open",
+    ):
+        driver.begin_backup(
+            "domain-uuid",
+            backup_xml,
+        )
+
+    assert runner.calls == [
+        (
+            command,
+            15,
+        )
+    ]
+
+
+def test_blockdev_permission_rejection_after_start_requested_becomes_failed_not_recovery(
+    execution,
+):
+    error = LibvirtBackupStartRejectedError(
+        "libvirt backup start was rejected before execution: "
+        "QEMU could not open the prepared backup target"
+    )
+
+    mutation = Mutation(
+        execution[0],
+        error=error,
+    )
+
+    value, _ = executor(
+        execution,
+        mutation=mutation,
+    )
+
+    result = value.advance_run(
+        execution[3].id
+    )
+
+    assert (
+        mutation.state_seen
+        is LibvirtExternalState.START_REQUESTED
+    )
+
+    assert result.state is RunState.CLEANUP
+    assert result.recovery_required is False
+    assert "could not open" in (
+        result.error or ""
+    ).lower()
+
+    operation = execution[0].get_libvirt_operation(
+        result.id
+    )
+
+    assert (
+        operation.external_state
+        is LibvirtExternalState.PLANNED
+    )
+
+    failed = value.advance_cleanup(
+        result.id
+    )
+
+    assert failed.state is RunState.FAILED
+    assert failed.recovery_required is False
+
+
+def test_generic_backup_begin_timeout_remains_ambiguous_recovery(
+    execution,
+):
+    mutation = Mutation(
+        execution[0],
+        error=TimeoutError(
+            "timed out"
+        ),
+    )
+
+    value, _ = executor(
+        execution,
+        mutation=mutation,
+    )
+
+    result = value.advance_run(
+        execution[3].id
+    )
+
+    assert result.state is RunState.BACKING_UP
+    assert result.recovery_required is True
+
+    assert (
+        execution[0]
+        .get_libvirt_operation(result.id)
+        .external_state
+        is LibvirtExternalState.UNKNOWN
+    )

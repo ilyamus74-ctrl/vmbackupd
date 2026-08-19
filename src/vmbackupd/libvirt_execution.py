@@ -46,6 +46,10 @@ class LibvirtAuthorizationError(LibvirtExecutionSafetyError):
     """Libvirt rejected management authorization before executing mutation."""
 
 
+class LibvirtBackupStartRejectedError(LibvirtExecutionSafetyError):
+    """Libvirt definitively rejected backup-begin before a backup job existed."""
+
+
 def _is_libvirt_manage_auth_failure(result: CommandResult) -> bool:
     detail = "\n".join(
         value
@@ -75,6 +79,28 @@ def _is_libvirt_manage_auth_failure(result: CommandResult) -> bool:
     )
 
     return authentication and policy
+
+
+def _is_libvirt_backup_start_rejection(
+    result: CommandResult,
+) -> bool:
+    detail = "\n".join(
+        value
+        for value in (
+            result.stdout,
+            result.stderr,
+        )
+        if value
+    ).lower()
+
+    # This is a synchronous QEMU blockdev-add rejection returned by
+    # backup-begin itself. The backup target could not be opened, so
+    # libvirt did not establish a domain backup job.
+    return (
+        "blockdev-add" in detail
+        and "could not open" in detail
+        and "permission denied" in detail
+    )
 
 
 class VirshBackupDriver:
@@ -124,6 +150,15 @@ class VirshBackupDriver:
              backup_xml_file, "--reuse-external"),
             timeout=self.timeout,
         )
+
+        if (
+            result.returncode != 0
+            and _is_libvirt_backup_start_rejection(result)
+        ):
+            raise LibvirtBackupStartRejectedError(
+                "libvirt backup start was rejected before execution: "
+                "QEMU could not open the prepared backup target"
+            )
 
         return self._require_success(result)
 
@@ -332,14 +367,51 @@ class StagingFilesystem:
         incoming_root = self.backup_data_root / ".incoming"
         if incoming_root.is_symlink():
             raise LibvirtExecutionSafetyError("backup incoming root is a symlink")
-        incoming_root.mkdir(mode=self.backup_data_mode, exist_ok=True)
-        data_run_dir.mkdir(mode=self.backup_data_mode)
-        os.chmod(data_run_dir, self.backup_data_mode)
+
+        incoming_root.mkdir(
+            mode=self.backup_data_mode,
+            exist_ok=True,
+        )
+        self._reject_symlink_chain(incoming_root)
+        os.chmod(
+            incoming_root,
+            self.backup_data_mode,
+        )
+
+        data_run_dir.mkdir(
+            mode=self.backup_data_mode,
+        )
+        os.chmod(
+            data_run_dir,
+            self.backup_data_mode,
+        )
+
         disks_dir = self.data_disks_directory(run_id)
-        disks_dir.mkdir(mode=self.backup_data_mode)
+        disks_dir.mkdir(
+            mode=self.backup_data_mode,
+        )
+        os.chmod(
+            disks_dir,
+            self.backup_data_mode,
+        )
+
         if self.backup_data_gid is not None:
-            self._chown(data_run_dir, -1, self.backup_data_gid)
-            self._chown(disks_dir, -1, self.backup_data_gid)
+            self._chown(
+                incoming_root,
+                -1,
+                self.backup_data_gid,
+            )
+            self._chown(
+                data_run_dir,
+                -1,
+                self.backup_data_gid,
+            )
+            self._chown(
+                disks_dir,
+                -1,
+                self.backup_data_gid,
+            )
+
         return run_dir
 
     def _require_direct_path(
@@ -1107,7 +1179,10 @@ class LibvirtBackupExecutor:
                 operation.domain_uuid,
                 str(backup_xml_file),
             )
-        except LibvirtAuthorizationError as exc:
+        except (
+            LibvirtAuthorizationError,
+            LibvirtBackupStartRejectedError,
+        ) as exc:
             self.repository.reject_libvirt_start(
                 run.id,
                 str(exc),
