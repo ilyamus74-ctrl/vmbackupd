@@ -269,14 +269,177 @@ Not implemented in R2.1:
 - SSH backup data transfer;
 - replica fan-out and retry tracking.
 
-Next:
+Follow-up:
 
-    remote storage discovery
-        -> persist remote_storage_id
-        -> Cockpit live remote-storage selector
-        -> preflight(remote_storage_id)
-        -> SSH transfer by storage ID
-        -> primary + replica destinations
+R2.2 completed persistence and Cockpit selection of stable remote storage
+identity. Remote data transfer and replica execution remain separate later
+phases.
+
+---
+
+## SSH remote storage selection (R2.2)
+
+Status: CLOSED
+
+Implementation commit:
+
+    3f73a0b — Add SSH remote storage discovery workflow
+
+Implemented the sender-side stable remote-storage selection workflow on top of
+the R2.1 receiver catalog.
+
+Persistence:
+
+- schema version advanced from 10 to 11;
+- SSH destinations may now persist `remote_storage_id`;
+- new SSH destinations use stable receiver storage identity rather than a
+  receiver filesystem path;
+- legacy SSH destinations using `ssh_remote_root` remain supported for
+  migration compatibility;
+- the v11 transport contract requires exactly one remote identity form for
+  SSH destinations:
+  - legacy `ssh_remote_root`; or
+  - stable `remote_storage_id`;
+- LOCAL destinations may contain neither SSH remote-identity field;
+- `remote_storage_id` is included in storage identity immutability after the
+  first backup run references the destination;
+- historical schema fingerprints and the v9 -> v10 migration contract remain
+  frozen and compatible;
+- v10 -> v11 migration preserves existing LOCAL and legacy SSH destinations.
+
+SSH discovery:
+
+- added sender-side `ssh.storage.discover`;
+- discovery executes restricted `vmbackupd-storage-list`;
+- protocol version 2 is validated fail-closed;
+- strict managed `known_hosts` verification remains mandatory;
+- the shared daemon-owned SSH client identity is used;
+- password, keyboard-interactive and implicit host-key acceptance are disabled;
+- discovery responses are sanitized and do not expose receiver filesystem
+  paths;
+- receiver LOCAL storage with `ready=false` remains visible but is not
+  selectable;
+- unavailable capacity metadata is accepted only for non-ready storage;
+- ready storage requires complete valid capacity metadata.
+
+Cockpit workflow:
+
+    Name
+    Host
+    Port
+    User
+        -> explicit host trust
+        -> Check connection
+        -> vmbackupd-storage-list
+        -> select ready remote LOCAL storage
+        -> Save destination
+
+Cockpit behavior:
+
+- removed the manually entered `Remote destination path` field for new SSH
+  destinations;
+- added endpoint-scoped host-trust inspection and enrollment before a
+  destination exists;
+- Save remains disabled until the current Host/Port/User endpoint has passed
+  discovery and a `ready=true` remote storage is selected;
+- changing Host, Port or User invalidates the discovery result and selection;
+- non-ready storage is displayed but disabled;
+- the selected stable ID is persisted as `remote_storage_id`;
+- new SSH destinations persist `ssh_remote_root = NULL`;
+- backend Save performs a fresh discovery and verifies that the selected
+  remote storage ID still exists and is ready, so Cockpit state is not treated
+  as a security boundary;
+- identity-locked destinations retain read-only Check connection capability
+  while their endpoint and remote storage identity remain immutable;
+- SSH Test reports authenticated/host-key/capacity information;
+- the Storage table can display remote free capacity after an explicit Test;
+- configured SSH reserve is presented as remote capacity reserve.
+
+Managed sender staging:
+
+- SSH staging remains daemon-managed below `vmbackupd-staging/<destination-id>`;
+- no receiver namespace is created in sender staging;
+- post-prepare verification failures roll back the exact empty staging leaf;
+- validation or repository failures after successful staging preparation also
+  roll back the exact empty staging leaf;
+- cleanup remains non-recursive and preserves unexpected content fail-safe.
+
+Corrective live issue found during acceptance:
+
+- the current-schema startup validator initially retained the old v10 rule
+  requiring `ssh_remote_root` for every SSH destination;
+- SQLite v11 triggers correctly accepted stable `remote_storage_id`, so the
+  first live destination was created successfully but daemon restart then
+  rejected the catalog;
+- the startup validator was corrected to use the same v11 XOR identity
+  contract as repository validation and SQLite triggers;
+- a regression test now closes and reopens a v11 database containing a
+  stable-ID SSH destination.
+
+Live acceptance on maker:
+
+- production database migrated successfully to schema version 11;
+- existing jobs, runs, restore points and LOCAL destinations were preserved;
+- shared SSH identity and managed `known_hosts` state survived RPM
+  reinstallations;
+- the restricted receiver endpoint was
+  `62.205.155.66:22022`;
+- `vmbackupd-transfer` authenticated with the managed shared identity;
+- live Check connection returned two receiver storage entries;
+- receiver storage `STOR_HDD` was reported `ready=true`;
+- its stable ID was:
+
+      540459e8-2555-43eb-8527-99853ba96ea7
+
+- the non-ready receiver LOCAL storage remained visible but unselectable;
+- Cockpit successfully created `ssh-server-kiev-netasist`;
+- the persisted destination contains the stable remote storage ID and does not
+  contain the receiver filesystem path;
+- explicit SSH Test succeeded against the saved destination;
+- after final RPM installation the daemon remained running and exposed its
+  administrative UNIX socket;
+- live API acceptance returned:
+  - 4 visible storage destinations;
+  - 1 backup job;
+  - 7 job runs;
+  - 1 discovered VM;
+- the internal `__vmbackupd_ssh_identity__` destination remains hidden from the
+  public Storage catalog.
+
+Acceptance:
+
+- focused R2.2 backend tests passed;
+- Cockpit SSH discovery tests passed;
+- schema migration and historical compatibility tests passed;
+- staging rollback regression tests passed;
+- complete project pytest regression passed;
+- Python compilation passed;
+- Cockpit JavaScript syntax validation passed;
+- git diff validation passed;
+- unified Release 3 RPM build passed;
+- `dist/` remained outside Git staging.
+
+Not implemented in R2.2:
+
+- SSH backup data transfer;
+- receiver-side bundle creation by `remote_storage_id`;
+- remote bundle verification and atomic publication;
+- backup-job replica configuration;
+- replica fan-out;
+- per-replica status and retry;
+- restore from a remote replica.
+
+Next architecture:
+
+    backup job
+        -> mandatory primary destination
+        -> successful primary backup
+        -> zero or more replica destinations
+            -> SSH transfer by remote_storage_id
+            -> independent replica verification/status/retry
+
+The primary backup remains authoritative. Failure of an optional replica must
+not invalidate an already successful primary backup.
 
 ---
 
