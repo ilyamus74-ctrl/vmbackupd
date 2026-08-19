@@ -1128,10 +1128,60 @@ class VmbackupApplication:
                                             domain_uuid)
         return serialization.vm(value)
 
-    def job_list(self): return [serialization.job(x) for x in self.repository.list_jobs_for_node(self.node.id)]
+    def _serialize_job(self, value):
+        result = serialization.job(value)
+        result["replica_destination_ids"] = [
+            replica.destination_id
+            for replica in self.repository.list_job_replicas(
+                value.id
+            )
+            if replica.enabled
+        ]
+        return result
+
+    @staticmethod
+    def _replica_destination_ids(
+        value,
+        *,
+        optional: bool,
+    ):
+        if value is None:
+            return None if optional else []
+
+        if not isinstance(value, list):
+            raise ApplicationError(
+                "INVALID_PARAMS",
+                "replica_destination_ids must be an array",
+            )
+
+        result = []
+
+        for destination_id in value:
+            if (
+                not isinstance(destination_id, str)
+                or not destination_id.strip()
+            ):
+                raise ApplicationError(
+                    "INVALID_PARAMS",
+                    "replica destination IDs must be non-empty strings",
+                )
+
+            result.append(destination_id)
+
+        return result
+
+    def job_list(self):
+        return [
+            self._serialize_job(value)
+            for value in self.repository.list_jobs_for_node(
+                self.node.id
+            )
+        ]
+
     def job_show(self, id):
-        value = self.repository.get_job(id); self._require_local_job(value)
-        return serialization.job(value)
+        value = self.repository.get_job(id)
+        self._require_local_job(value)
+        return self._serialize_job(value)
 
     def job_create(self, vm_id, name, max_incrementals_per_chain=0,
                    restore_points_to_retain=7, minimum_full_chains=1,
@@ -1141,6 +1191,7 @@ class VmbackupApplication:
                    schedule_type="INTERVAL", daily_time=None,
                    schedule_timezone=None,
                    storage_destination_id=None, storage_destination=None,
+                   replica_destination_ids=None,
                    schedule_enabled=False, enabled=True):
         if not isinstance(schedule_enabled, bool) or not isinstance(enabled, bool):
             raise ApplicationError("INVALID_PARAMS", "schedule_enabled and enabled must be boolean")
@@ -1163,9 +1214,14 @@ class VmbackupApplication:
         if destination.storage_type is StorageType.SSH:
             raise ApplicationError(
                 "REMOTE_TRANSPORT_NOT_IMPLEMENTED",
-                "SSH destinations cannot be assigned to backup jobs "
-                "until remote transport is implemented",
+                "SSH destinations cannot be assigned as the primary "
+                "backup destination",
             )
+
+        replicas = self._replica_destination_ids(
+            replica_destination_ids,
+            optional=False,
+        )
 
         try:
             schedule = SchedulePolicy(
@@ -1199,8 +1255,11 @@ class VmbackupApplication:
             ),
             enabled=enabled,
         )
-        self.repository.add_job(value)
-        return serialization.job(value)
+        self.repository.add_job(
+            value,
+            replica_destination_ids=replicas,
+        )
+        return self._serialize_job(value)
 
     def job_update(self, id, name=None, enabled=None,
                    storage_destination_id=None, storage_destination=None,
@@ -1210,7 +1269,9 @@ class VmbackupApplication:
                    interval_seconds=None, misfire_grace_seconds=None,
                    schedule_type=None, daily_time=None,
                    schedule_timezone=None,
-                   schedule_enabled=None):
+                   schedule_enabled=None,
+                   max_incrementals_per_chain=None,
+                   replica_destination_ids=None):
         if enabled is not None and not isinstance(enabled, bool):
             raise ApplicationError("INVALID_PARAMS", "enabled must be boolean")
         if schedule_enabled is not None and not isinstance(schedule_enabled, bool):
@@ -1227,8 +1288,8 @@ class VmbackupApplication:
             if candidate.storage_type is StorageType.SSH:
                 raise ApplicationError(
                     "REMOTE_TRANSPORT_NOT_IMPLEMENTED",
-                    "SSH destinations cannot be assigned to backup jobs "
-                    "until remote transport is implemented",
+                    "SSH destinations cannot be assigned as the primary "
+                    "backup destination",
                 )
         elif storage_destination:
             candidate = self.repository.get_storage_destination_by_name(
@@ -1241,11 +1302,16 @@ class VmbackupApplication:
             if candidate.storage_type is StorageType.SSH:
                 raise ApplicationError(
                     "REMOTE_TRANSPORT_NOT_IMPLEMENTED",
-                    "SSH destinations cannot be assigned to backup jobs "
-                    "until remote transport is implemented",
+                    "SSH destinations cannot be assigned as the primary "
+                    "backup destination",
                 )
 
-        return serialization.job(self.repository.update_job(
+        replicas = self._replica_destination_ids(
+            replica_destination_ids,
+            optional=True,
+        )
+
+        updated = self.repository.update_job(
             id, self.node.id, self.clock.now(), name=name, enabled=enabled,
             storage_destination_id=storage_destination_id,
             storage_destination=storage_destination,
@@ -1272,7 +1338,15 @@ class VmbackupApplication:
             daily_time=daily_time,
             schedule_timezone=schedule_timezone,
             schedule_enabled=schedule_enabled,
-        ))
+            max_incrementals_per_chain=(
+                None
+                if max_incrementals_per_chain is None
+                else int(max_incrementals_per_chain)
+            ),
+            replica_destination_ids=replicas,
+        )
+
+        return self._serialize_job(updated)
 
     def backup_run(self, job_id):
         runtime_state = getattr(self.runtime, "runtime_state", "RUNNING")

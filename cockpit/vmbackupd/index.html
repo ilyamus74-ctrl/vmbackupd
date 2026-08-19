@@ -130,8 +130,30 @@
       <p id="registration-note" class="form-note" hidden>This VM will be registered when the job is saved.</p>
       <label>Virtual machine<select id="job-vm" required></select></label>
       <label>Job name<input id="job-name" required maxlength="200"></label>
-      <label>Destination<select id="job-storage" required></select></label>
-      <label>Backup mode<input value="Full" readonly aria-readonly="true"></label>
+      <label>Primary storage<select id="job-storage" required></select></label>
+
+      <fieldset class="replica-fieldset">
+        <legend>Replica storages</legend>
+        <div id="job-replicas" class="replica-options"></div>
+        <p class="form-note">
+          Replicas are created after the primary restore point is published.
+          SSH destinations may be selected as replicas.
+        </p>
+      </fieldset>
+
+      <label>
+        Maximum incrementals before next FULL
+        <input id="job-max-incrementals"
+               type="number"
+               min="0"
+               step="1"
+               value="6"
+               required>
+      </label>
+      <p class="form-note">
+        0 creates FULL backups only.
+      </p>
+
       <label class="check-label"><input id="job-enabled" type="checkbox" checked> Enabled</label>
       <label>Schedule mode<select id="job-schedule"><option value="manual">Manual</option><option value="interval">Interval</option><option value="daily">Daily</option></select></label>
       <div id="interval-fields" class="inline-fields" hidden>

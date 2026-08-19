@@ -646,3 +646,89 @@ def test_daily_schedule_rejects_invalid_wall_time_and_timezone():
                 "schedule_timezone": "Not/AZone",
             },
         )
+
+
+def test_job_api_replica_and_incremental_configuration_is_atomic():
+    repository = SQLiteRepository()
+    node, first, second, vm = catalog(repository)
+    clock = FakeClock(NOW)
+    app = application(repository, node, clock)
+
+    created = app.dispatch(
+        "job.create",
+        {
+            "vm_id": vm.id,
+            "name": "replicated",
+            "storage_destination_id": first.id,
+            "replica_destination_ids": [
+                second.id,
+            ],
+            "max_incrementals_per_chain": 6,
+        },
+    )
+
+    assert created["storage_destination_id"] == first.id
+    assert created["replica_destination_ids"] == [
+        second.id,
+    ]
+    assert created["max_incrementals_per_chain"] == 6
+
+    run = repository.create_manual_run(
+        created["id"],
+        node.id,
+        NOW,
+    )
+
+    assert [
+        item.destination_id
+        for item in repository.list_run_replicas(
+            run.id
+        )
+    ] == [second.id]
+
+    # Future job changes never rewrite the run snapshot.
+    updated = app.dispatch(
+        "job.update",
+        {
+            "id": created["id"],
+            "replica_destination_ids": [],
+            "max_incrementals_per_chain": 3,
+        },
+    )
+
+    assert updated["replica_destination_ids"] == []
+    assert updated["max_incrementals_per_chain"] == 3
+
+    assert [
+        item.destination_id
+        for item in repository.list_run_replicas(
+            run.id
+        )
+    ] == [second.id]
+
+    # A failed atomic primary/replica change must roll everything back.
+    with pytest.raises(ApplicationError) as caught:
+        app.dispatch(
+            "job.update",
+            {
+                "id": created["id"],
+                "storage_destination_id": second.id,
+                "replica_destination_ids": [
+                    second.id,
+                ],
+                "max_incrementals_per_chain": 9,
+            },
+        )
+
+    assert caught.value.code == "REPLICA_MATCHES_PRIMARY"
+
+    persisted = app.dispatch(
+        "job.show",
+        {
+            "id": created["id"],
+        },
+    )
+
+    assert persisted["storage_destination_id"] == first.id
+    assert persisted["replica_destination_ids"] == []
+    assert persisted["max_incrementals_per_chain"] == 3

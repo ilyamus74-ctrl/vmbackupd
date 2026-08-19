@@ -227,15 +227,21 @@ def test_cockpit_has_timestamp_duration_and_atomic_refresh_helpers():
     assert clear_views < main_refresh_requests
 
 
-def test_cockpit_job_management_is_full_only_and_refreshes_authoritative_data():
+def test_cockpit_job_management_supports_replicas_incrementals_and_refreshes_authoritative_data():
     html = source("index.html")
     javascript = source("vmbackupd.js")
+
     assert "Add backup job" in html
     assert "Edit" in javascript
     assert 'job.enabled ? "Disable" : "Enable"' in javascript
     assert "Run now" in javascript
-    assert 'value="Full" readonly' in html
-    assert "Destination" in html
+
+    assert "Primary storage" in html
+    assert "Replica storages" in html
+    assert "Maximum incrementals before next FULL" in html
+    assert "0 creates FULL backups only." in html
+    assert 'value="Full" readonly' not in html
+
     assert "Schedule mode" in html
     assert "Restore points to retain" in html
     assert "Full chains to retain" in html
@@ -245,19 +251,28 @@ def test_cockpit_job_management_is_full_only_and_refreshes_authoritative_data():
     assert 'value="SPACE_OPTIMIZED">SPACE_OPTIMIZED</option>' in html
     assert "never removes a valid backup" in html
     assert "oldest eligible FULL chain" in html
-    assert "Manual" in html and "Interval" in html and "Daily" in html
+    assert "Manual" in html
+    assert "Interval" in html
+    assert "Daily" in html
 
+    assert 'job ? job.max_incrementals_per_chain : 6' in javascript
     assert 'job ? job.full_chains_to_retain : 2' in javascript
     assert 'job ? job.space_reclaim_mode : "SAFE"' in javascript
+
+    assert "selectedJobReplicaIds" in javascript
+    assert "replica_destination_ids" in javascript
+    assert "max_incrementals_per_chain" in javascript
+    assert "max_incrementals_per_chain: 0" not in javascript
+
     assert 'full_chains_to_retain:' in javascript
     assert 'document.getElementById("job-full-chains").value' in javascript
     assert 'space_reclaim_mode:' in javascript
     assert 'document.getElementById("job-reclaim-mode").value' in javascript
 
-    assert 'max_incrementals_per_chain: 0' in javascript
     assert 'await api.request("job.update"' in javascript
     assert 'await api.request("backup.run"' in javascript
     assert 'await refresh();' in javascript
+
 
 
 def test_cockpit_storage_management_is_explicit_and_non_destructive():
@@ -541,3 +556,22 @@ def test_local_storage_preflight_reports_capacity_without_replacing_ssh_ui():
 
     # Existing SSH preflight rendering must survive LOCAL UI changes.
     assert "SSH preflight" in javascript
+
+
+def test_cockpit_job_form_configures_primary_replicas_and_incrementals():
+    html = source("index.html")
+    javascript = source("vmbackupd.js")
+
+    assert 'id="job-storage"' in html
+    assert "Primary storage" in html
+    assert 'id="job-replicas"' in html
+    assert "Replica storages" in html
+    assert 'id="job-max-incrementals"' in html
+    assert "Maximum incrementals before next FULL" in html
+
+    assert "Backup mode" not in html
+    assert "selectedJobReplicaIds" in javascript
+    assert "replica_destination_ids" in javascript
+    assert "max_incrementals_per_chain" in javascript
+    assert "max_incrementals_per_chain: 0" not in javascript
+    assert "updateJobReplicaOptions" in javascript

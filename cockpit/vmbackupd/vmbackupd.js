@@ -1952,39 +1952,121 @@
     function populateJobOptions(editingJob) {
         const vmSelect = document.getElementById("job-vm");
         const storageSelect = document.getElementById("job-storage");
+        const replicaContainer = document.getElementById("job-replicas");
+
         const registeredByUuid = new Map(currentModel.registeredVms
             .filter(vm => vm.libvirt_domain_uuid)
             .map(vm => [vm.libvirt_domain_uuid, vm]));
+
         const options = [];
+
         for (const vm of currentModel.registeredVms)
-            options.push({ value: `registered:${vm.id}`, label: vm.name, registered: true });
+            options.push({
+                value: `registered:${vm.id}`,
+                label: vm.name,
+                registered: true,
+            });
+
         currentModel.discoveredVms.forEach((vm, index) => {
             if (!registeredByUuid.has(vm.uuid))
-                options.push({ value: `discovered:${index}`, label: `${vm.name} (will register)`, registered: false });
+                options.push({
+                    value: `discovered:${index}`,
+                    label: `${vm.name} (will register)`,
+                    registered: false,
+                });
         });
+
         vmSelect.replaceChildren(...options.map(item => {
             const option = element("option", item.label);
             option.value = item.value;
             return option;
         }));
-        storageSelect.replaceChildren(...currentModel.storage.map(destination => {
-            const isSSH = storageType(destination) === "SSH";
-            const option = element(
-                "option",
-                isSSH ?
-                    `${destination.name} (SSH transport not enabled yet)` :
+
+        const primaryDestinations = currentModel.storage.filter(
+            destination => storageType(destination) !== "SSH"
+        );
+
+        storageSelect.replaceChildren(
+            ...primaryDestinations.map(destination => {
+                const option = element(
+                    "option",
                     destination.name,
-            );
-            option.value = destination.id;
-            option.disabled = isSSH;
-            return option;
-        }));
+                );
+                option.value = destination.id;
+                return option;
+            })
+        );
+
+        const selectedReplicas = new Set(
+            editingJob &&
+            Array.isArray(editingJob.replica_destination_ids) ?
+                editingJob.replica_destination_ids :
+                []
+        );
+
+        replicaContainer.replaceChildren(
+            ...currentModel.storage.map(destination => {
+                const label = document.createElement("label");
+                label.className = "replica-option";
+
+                const checkbox = document.createElement("input");
+                checkbox.type = "checkbox";
+                checkbox.value = destination.id;
+                checkbox.checked = selectedReplicas.has(
+                    destination.id
+                );
+
+                const description = document.createElement("span");
+                description.textContent =
+                    storageType(destination) === "SSH" ?
+                        `${destination.name} (SSH)` :
+                        `${destination.name} (Local)`;
+
+                label.append(
+                    checkbox,
+                    description,
+                );
+
+                return label;
+            })
+        );
+
         if (editingJob) {
-            vmSelect.value = `registered:${editingJob.vm_id}`;
-            storageSelect.value = editingJob.storage_destination_id;
+            vmSelect.value =
+                `registered:${editingJob.vm_id}`;
+            storageSelect.value =
+                editingJob.storage_destination_id;
         }
+
         vmSelect.disabled = Boolean(editingJob);
+
+        updateJobReplicaOptions();
         updateRegistrationNote();
+    }
+
+    function updateJobReplicaOptions() {
+        const primaryId =
+            document.getElementById("job-storage").value;
+
+        for (const checkbox of document.querySelectorAll(
+            '#job-replicas input[type="checkbox"]'
+        )) {
+            const matchesPrimary =
+                checkbox.value === primaryId;
+
+            checkbox.disabled = matchesPrimary;
+
+            if (matchesPrimary)
+                checkbox.checked = false;
+        }
+    }
+
+    function selectedJobReplicaIds() {
+        return [
+            ...document.querySelectorAll(
+                '#job-replicas input[type="checkbox"]:checked'
+            ),
+        ].map(checkbox => checkbox.value);
     }
 
     function updateRegistrationNote() {
@@ -1998,6 +2080,8 @@
         populateJobOptions(job);
         document.getElementById("job-name").value = job ? job.name : "";
         document.getElementById("job-enabled").checked = job ? job.enabled : true;
+        document.getElementById("job-max-incrementals").value =
+            job ? job.max_incrementals_per_chain : 6;
         document.getElementById("job-retain").value = job ? job.restore_points_to_retain : 7;
         document.getElementById("job-full-chains").value =
             job ? job.full_chains_to_retain : 2;
@@ -2056,6 +2140,9 @@
         const params = {
             name: document.getElementById("job-name").value.trim(),
             storage_destination_id: document.getElementById("job-storage").value,
+            replica_destination_ids: selectedJobReplicaIds(),
+            max_incrementals_per_chain:
+                Number(document.getElementById("job-max-incrementals").value),
             enabled: document.getElementById("job-enabled").checked,
             schedule_enabled: scheduleMode !== "manual",
             restore_points_to_retain: Number(document.getElementById("job-retain").value),
@@ -2096,7 +2183,8 @@
                     vmId = registeredVm.id;
                 }
                 await api.request("job.create", {
-                    vm_id: vmId, max_incrementals_per_chain: 0, ...params,
+                    vm_id: vmId,
+                    ...params,
                 });
             }
             jobDialog.close();
@@ -2235,6 +2323,10 @@
     document.getElementById("job-cancel").addEventListener("click", () => jobDialog.close());
     document.getElementById("job-vm").addEventListener("change", updateRegistrationNote);
     document.getElementById("job-schedule").addEventListener("change", updateScheduleFields);
+    document.getElementById("job-storage").addEventListener(
+        "change",
+        updateJobReplicaOptions,
+    );
     jobForm.addEventListener("submit", saveJob);
     document.getElementById("storage-cancel").addEventListener("click", () => storageDialog.close());
     document.getElementById("storage-test-candidate").addEventListener("click", testStorageCandidate);

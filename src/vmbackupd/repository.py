@@ -663,6 +663,90 @@ class SQLiteRepository:
 
         return current
 
+    def _validate_job_replica_destinations(
+        self,
+        local_node_id: str,
+        primary_destination_id: str,
+        destination_ids: list[str],
+    ) -> list[str]:
+        requested = list(destination_ids)
+
+        if len(requested) != len(set(requested)):
+            raise DomainInvariantError(
+                "REPLICA_DESTINATION_DUPLICATE"
+            )
+
+        try:
+            primary = self.get_storage_destination(
+                local_node_id,
+                primary_destination_id,
+            )
+        except KeyError as exc:
+            raise DomainInvariantError(
+                "STORAGE_DESTINATION_NOT_LOCAL"
+            ) from exc
+
+        if primary.storage_type is not StorageType.LOCAL:
+            raise DomainInvariantError(
+                "REMOTE_TRANSPORT_NOT_IMPLEMENTED"
+            )
+
+        for destination_id in requested:
+            if destination_id == primary_destination_id:
+                raise DomainInvariantError(
+                    "REPLICA_MATCHES_PRIMARY"
+                )
+
+            try:
+                self.get_storage_destination(
+                    local_node_id,
+                    destination_id,
+                )
+            except KeyError as exc:
+                raise DomainInvariantError(
+                    "REPLICA_DESTINATION_NOT_LOCAL"
+                ) from exc
+
+        return requested
+
+    def _replace_job_replicas(
+        self,
+        job_id: str,
+        local_node_id: str,
+        primary_destination_id: str,
+        destination_ids: list[str],
+        now: datetime,
+    ) -> None:
+        requested = self._validate_job_replica_destinations(
+            local_node_id,
+            primary_destination_id,
+            destination_ids,
+        )
+
+        self.connection.execute(
+            """DELETE FROM backup_job_replicas
+               WHERE job_id = ?""",
+            (job_id,),
+        )
+
+        for ordinal, destination_id in enumerate(requested):
+            self.connection.execute(
+                """INSERT INTO backup_job_replicas (
+                       job_id,
+                       destination_id,
+                       ordinal,
+                       enabled,
+                       created_at
+                   )
+                   VALUES (?, ?, ?, 1, ?)""",
+                (
+                    job_id,
+                    destination_id,
+                    ordinal,
+                    now.isoformat(),
+                ),
+            )
+
     def list_job_replicas(
         self,
         job_id: str,
@@ -691,13 +775,6 @@ class SQLiteRepository:
     ) -> list[BackupJobReplica]:
         """Atomically replace future replica targets for a job."""
 
-        requested = list(destination_ids)
-
-        if len(requested) != len(set(requested)):
-            raise DomainInvariantError(
-                "REPLICA_DESTINATION_DUPLICATE"
-            )
-
         self.connection.execute("BEGIN IMMEDIATE")
 
         try:
@@ -714,59 +791,13 @@ class SQLiteRepository:
                     "STORAGE_DESTINATION_REQUIRED"
                 )
 
-            primary = self.get_storage_destination(
+            self._replace_job_replicas(
+                job.id,
                 local_node_id,
                 job.storage_destination_id,
+                destination_ids,
+                now,
             )
-
-            if primary.storage_type is not StorageType.LOCAL:
-                raise DomainInvariantError(
-                    "PRIMARY_STORAGE_MUST_BE_LOCAL"
-                )
-
-            replicas: list[StorageDestination] = []
-
-            for destination_id in requested:
-                if destination_id == primary.id:
-                    raise DomainInvariantError(
-                        "REPLICA_MATCHES_PRIMARY"
-                    )
-
-                try:
-                    destination = self.get_storage_destination(
-                        local_node_id,
-                        destination_id,
-                    )
-                except KeyError as exc:
-                    raise DomainInvariantError(
-                        "REPLICA_DESTINATION_NOT_LOCAL"
-                    ) from exc
-
-                replicas.append(destination)
-
-            self.connection.execute(
-                """DELETE FROM backup_job_replicas
-                   WHERE job_id = ?""",
-                (job_id,),
-            )
-
-            for ordinal, destination in enumerate(replicas):
-                self.connection.execute(
-                    """INSERT INTO backup_job_replicas (
-                           job_id,
-                           destination_id,
-                           ordinal,
-                           enabled,
-                           created_at
-                       )
-                       VALUES (?, ?, ?, 1, ?)""",
-                    (
-                        job_id,
-                        destination.id,
-                        ordinal,
-                        now.isoformat(),
-                    ),
-                )
 
             self.connection.commit()
 
@@ -830,48 +861,100 @@ class SQLiteRepository:
                 ),
             )
 
-    def add_job(self, value: BackupJob) -> None:
+    def add_job(
+        self,
+        value: BackupJob,
+        replica_destination_ids: list[str] | None = None,
+    ) -> None:
         vm = self.get_vm(value.vm_id)
+
         if value.storage_destination_id is None:
-            raise DomainInvariantError("STORAGE_DESTINATION_REQUIRED")
-        try:
-            destination = self.get_storage_destination(
-                vm.node_id, value.storage_destination_id
+            raise DomainInvariantError(
+                "STORAGE_DESTINATION_REQUIRED"
             )
-        except KeyError as exc:
-            raise DomainInvariantError("STORAGE_DESTINATION_NOT_LOCAL") from exc
-        if destination.storage_type is StorageType.SSH:
-            raise DomainInvariantError("REMOTE_TRANSPORT_NOT_IMPLEMENTED")
-        self.connection.execute(
-            """INSERT INTO backup_jobs (
-                   id, vm_id, name, storage_destination_id, enabled,
-                   max_incrementals_per_chain, restore_points_to_retain,
-                   full_chains_to_retain, minimum_full_chains,
-                   space_reclaim_mode, backup_size_margin_percent,
-                   interval_seconds, misfire_grace_seconds,
-                   catch_up_mode, overlap_policy,
-                   schedule_type, daily_time, schedule_timezone,
-                   next_run_at, created_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (value.id, value.vm_id, value.name, value.storage_destination_id,
-             int(value.enabled),
-             value.backup_policy.max_incrementals_per_chain,
-             value.retention_policy.restore_points_to_retain,
-             value.retention_policy.full_chains_to_retain,
-             value.retention_policy.minimum_full_chains,
-             value.retention_policy.space_reclaim_mode,
-             value.retention_policy.backup_size_margin_percent,
-             value.schedule_policy.interval_seconds,
-             value.schedule_policy.misfire_grace_seconds,
-             value.schedule_policy.catch_up_mode,
-             value.schedule_policy.overlap_policy,
-             value.schedule_policy.schedule_type,
-             value.schedule_policy.daily_time,
-             value.schedule_policy.schedule_timezone,
-             value.next_run_at.isoformat() if value.next_run_at else None,
-             value.created_at.isoformat()),
+
+        requested_replicas = (
+            []
+            if replica_destination_ids is None
+            else list(replica_destination_ids)
         )
-        self.connection.commit()
+
+        self._validate_job_replica_destinations(
+            vm.node_id,
+            value.storage_destination_id,
+            requested_replicas,
+        )
+
+        try:
+            if not self.connection.in_transaction:
+                self.connection.execute(
+                    "BEGIN IMMEDIATE"
+                )
+
+            self.connection.execute(
+                """INSERT INTO backup_jobs (
+                       id, vm_id, name, storage_destination_id, enabled,
+                       max_incrementals_per_chain,
+                       restore_points_to_retain,
+                       full_chains_to_retain,
+                       minimum_full_chains,
+                       space_reclaim_mode,
+                       backup_size_margin_percent,
+                       interval_seconds,
+                       misfire_grace_seconds,
+                       catch_up_mode,
+                       overlap_policy,
+                       schedule_type,
+                       daily_time,
+                       schedule_timezone,
+                       next_run_at,
+                       created_at
+                   )
+                   VALUES (
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?
+                   )""",
+                (
+                    value.id,
+                    value.vm_id,
+                    value.name,
+                    value.storage_destination_id,
+                    int(value.enabled),
+                    value.backup_policy.max_incrementals_per_chain,
+                    value.retention_policy.restore_points_to_retain,
+                    value.retention_policy.full_chains_to_retain,
+                    value.retention_policy.minimum_full_chains,
+                    value.retention_policy.space_reclaim_mode,
+                    value.retention_policy.backup_size_margin_percent,
+                    value.schedule_policy.interval_seconds,
+                    value.schedule_policy.misfire_grace_seconds,
+                    value.schedule_policy.catch_up_mode,
+                    value.schedule_policy.overlap_policy,
+                    value.schedule_policy.schedule_type,
+                    value.schedule_policy.daily_time,
+                    value.schedule_policy.schedule_timezone,
+                    (
+                        value.next_run_at.isoformat()
+                        if value.next_run_at
+                        else None
+                    ),
+                    value.created_at.isoformat(),
+                ),
+            )
+
+            self._replace_job_replicas(
+                value.id,
+                vm.node_id,
+                value.storage_destination_id,
+                requested_replicas,
+                value.created_at,
+            )
+
+            self.connection.commit()
+
+        except Exception:
+            self.connection.rollback()
+            raise
 
     def update_job(
         self, job_id: str, local_node_id: str, now: datetime, *, name=None,
@@ -881,7 +964,8 @@ class SQLiteRepository:
         backup_size_margin_percent=None,
         interval_seconds=None, misfire_grace_seconds=None,
         schedule_type=None, daily_time=None, schedule_timezone=None,
-        schedule_enabled=None,
+        schedule_enabled=None, max_incrementals_per_chain=None,
+        replica_destination_ids=None,
     ) -> BackupJob:
         """Read, derive, and write a mutable job patch under one write lock."""
         self.connection.execute("BEGIN IMMEDIATE")
@@ -913,7 +997,33 @@ class SQLiteRepository:
                 destination_id = destination.id
             if destination_id is None:
                 raise DomainInvariantError("STORAGE_DESTINATION_REQUIRED")
-            self.get_storage_destination(local_node_id, destination_id)
+            primary = self.get_storage_destination(
+                local_node_id,
+                destination_id,
+            )
+            if primary.storage_type is not StorageType.LOCAL:
+                raise DomainInvariantError(
+                    "PRIMARY_STORAGE_MUST_BE_LOCAL"
+                )
+
+            if replica_destination_ids is None:
+                target_replica_ids = [
+                    item.destination_id
+                    for item in self.list_job_replicas(
+                        current.id
+                    )
+                ]
+            else:
+                target_replica_ids = list(
+                    replica_destination_ids
+                )
+
+            self._validate_job_replica_destinations(
+                local_node_id,
+                destination_id,
+                target_replica_ids,
+            )
+
             interval = (
                 current.schedule_policy.interval_seconds
                 if interval_seconds is None
@@ -960,6 +1070,12 @@ class SQLiteRepository:
                 target_daily_time,
                 target_schedule_timezone,
             )
+            backup_policy = BackupPolicy(
+                current.backup_policy.max_incrementals_per_chain
+                if max_incrementals_per_chain is None
+                else max_incrementals_per_chain
+            )
+
             retention = RetentionPolicy(
                 current.retention_policy.restore_points_to_retain
                 if restore_points_to_retain is None else restore_points_to_retain,
@@ -1013,7 +1129,7 @@ class SQLiteRepository:
                    schedule_type = ?, daily_time = ?, schedule_timezone = ?,
                    next_run_at = ? WHERE id = ?""",
                 (current.name if name is None else name, destination_id, int(new_enabled),
-                 current.backup_policy.max_incrementals_per_chain,
+                 backup_policy.max_incrementals_per_chain,
                  retention.restore_points_to_retain,
                  retention.full_chains_to_retain, retention.minimum_full_chains,
                  retention.space_reclaim_mode, retention.backup_size_margin_percent,
@@ -1023,6 +1139,15 @@ class SQLiteRepository:
                  schedule.schedule_timezone,
                  next_run_at.isoformat() if next_run_at else None, current.id),
             )
+            if replica_destination_ids is not None:
+                self._replace_job_replicas(
+                    current.id,
+                    local_node_id,
+                    destination_id,
+                    target_replica_ids,
+                    now,
+                )
+
             self.connection.commit()
             return self.get_job(current.id)
         except Exception:

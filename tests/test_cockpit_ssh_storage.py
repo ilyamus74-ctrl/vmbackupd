@@ -141,11 +141,25 @@ def test_stored_ssh_destination_never_calls_local_storage_probe():
     )
 
 
-def test_ssh_destination_is_not_selectable_for_backup_job_yet():
+def test_ssh_destination_is_replica_only_for_backup_jobs():
+    html = source("index.html")
     javascript = source("vmbackupd.js")
 
-    assert "SSH transport not enabled yet" in javascript
-    assert "option.disabled = isSSH;" in javascript
+    assert "Primary storage" in html
+    assert "Replica storages" in html
+    assert "SSH destinations may be selected as replicas." in html
+
+    # Primary selector contains LOCAL destinations only.
+    assert 'const primaryDestinations = currentModel.storage.filter(\n            destination => storageType(destination) !== "SSH"\n        );' in javascript
+
+    # Replica selector is built from the complete storage catalog.
+    assert '...currentModel.storage.map(destination => {' in javascript
+    assert '`${destination.name} (SSH)`' in javascript
+
+    # Old blanket SSH prohibition in the job selector is gone.
+    assert "SSH transport not enabled yet" not in javascript
+    assert "option.disabled = isSSH;" not in javascript
+
 
 
 def test_ssh_destination_cannot_be_made_default_from_cockpit_yet():
