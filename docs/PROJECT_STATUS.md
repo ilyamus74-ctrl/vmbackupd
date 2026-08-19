@@ -2180,11 +2180,252 @@ capture to multiple disks or remote receivers.
 
 ---
 
+# Backup replica topology and job configuration (R3.1)
+
+Status:
+
+    CLOSED
+
+Implementation commits:
+
+    e7f93f2 — Add backup replica topology foundation
+    8234879 — Expose backup replicas and incremental policy
+    a0a2d5f — Derive incremental policy from retention
+
+R3.1 introduces a restore-point-centric replication model while preserving the
+existing primary backup execution model.
+
+Backup job topology:
+
+    Backup job
+      -> PRIMARY destination
+           exactly one LOCAL destination
+      -> REPLICA destinations
+           zero or more LOCAL or SSH destinations
+
+The VM capture is still executed once. A successful primary backup creates the
+authoritative Restore Point first. Replica work is derived from that published
+Restore Point and does not trigger another QEMU/libvirt capture.
+
+Persistence added in schema version 12:
+
+    backup_job_replicas
+        mutable desired replica configuration for future runs
+
+    job_run_replicas
+        immutable replica snapshot captured when a run is created
+
+    restore_point_locations
+        physical Restore Point inventory by destination
+
+    replica_tasks
+        per-Restore-Point replica execution state
+
+Replica task states:
+
+    PENDING
+    BLOCKED
+    TRANSFERRING
+    VERIFYING
+    SUCCESS
+    FAILED
+
+Restore Point locations distinguish:
+
+    PRIMARY
+    REPLICA
+
+with durable location states:
+
+    AVAILABLE
+    DEGRADED
+    MISSING
+
+Primary semantics:
+
+- the primary destination remains mandatory;
+- the primary destination must be LOCAL;
+- successful primary publication remains authoritative;
+- primary backup SUCCESS does not depend on optional replica completion;
+- every successful Restore Point receives one PRIMARY/AVAILABLE location;
+- the PRIMARY location destination matches the immutable
+  `job_runs.storage_destination_id`.
+
+Replica semantics:
+
+- replica destinations may be LOCAL or SSH;
+- a replica destination cannot equal the primary destination;
+- job replica configuration is snapshotted into `job_run_replicas`;
+- later job edits do not modify an existing run's replica snapshot;
+- replica tasks are created only after successful primary Restore Point
+  publication;
+- a failed or pending replica does not invalidate the successful primary;
+- historical Restore Points are not automatically queued when a new replica
+  is configured;
+- explicit historical backfill remains possible as a later operation.
+
+Incremental dependency semantics:
+
+    FULL
+      -> INC 1
+          -> INC 2
+              -> ...
+
+A replica of an incremental Restore Point is runnable only when its direct
+parent Restore Point is AVAILABLE on the same destination.
+
+Therefore, for a destination:
+
+    FULL missing
+        -> INC 1 BLOCKED
+
+    FULL AVAILABLE
+        -> INC 1 PENDING
+
+Publishing the parent location releases its direct BLOCKED child task.
+
+The model also permits future chain backfill to a newly configured destination:
+
+    FULL
+      -> INC 1
+      -> INC 2
+      -> INC 3
+
+without modifying historical `job_run_replicas`.
+
+User-facing incremental policy is derived from retention:
+
+    max_incrementals_per_chain =
+        max(0, restore_points_to_retain - 1)
+
+For example:
+
+    Restore points to retain = 7
+        -> maximum incrementals per chain = 6
+
+which produces:
+
+    FULL
+    INC 1
+    INC 2
+    INC 3
+    INC 4
+    INC 5
+    INC 6
+    next backup -> FULL
+
+The internal `max_incrementals_per_chain` field remains persisted for planner
+and execution contracts, but Cockpit and normal CLI usage do not require the
+administrator to configure the same policy twice.
+
+Cockpit job configuration now exposes:
+
+    Primary storage
+    Replica storages
+    Restore points to retain
+    Schedule mode / DAILY time / timezone
+    retention and reclaim controls
+
+SSH destinations are excluded from the Primary storage selector and are
+available in the Replica storages selector.
+
+CLI supports:
+
+    --replica DESTINATION_ID
+    --clear-replicas
+    --retain N
+
+`--replica` may be specified repeatedly when creating a job. Job update
+distinguishes between an omitted replica option (leave configuration unchanged)
+and `--clear-replicas` (replace the replica set with an empty set).
+
+Live maker acceptance:
+
+    schema before upgrade = 11
+    schema after upgrade  = 12
+
+    backup_jobs                = 1
+    job_runs                   = 7
+    restore_points             = 3
+    restore_point_locations    = 3
+
+Historical migration produced exactly one PRIMARY/AVAILABLE location for every
+existing Restore Point and preserved its immutable primary destination.
+
+Migration validation:
+
+    missing primary locations   = 0
+    wrong primary destinations  = 0
+    PRAGMA foreign_key_check    = []
+    PRAGMA integrity_check      = ok
+
+Package-update preservation was also verified:
+
+- `/etc/vmbackupd` configuration was preserved;
+- `/var/lib/vmbackupd/ssh` identities and known_hosts state were preserved;
+- no `.rpmnew` or `.rpmsave` files were produced;
+- the SSH destination `ssh-server-kiev-netasist` retained host
+  `62.205.155.66`, port `22022`, user `vmbackupd-transfer`, and stable remote
+  storage ID `540459e8-2555-43eb-8527-99853ba96ea7`.
+
+Live job acceptance:
+
+    job                       = win10-full
+    primary                   = local-root
+    replica                   = ssh-server-kiev-netasist
+    restore_points_to_retain  = 7
+    max_incrementals_per_chain = 6
+
+Immediately after configuration:
+
+    backup_job_replicas = 1
+    job_run_replicas    = 0
+    replica_tasks       = 0
+
+This confirms that configuring a replica affects future runs only and does not
+implicitly enqueue historical Restore Points.
+
+Acceptance:
+
+- schema 11 -> 12 migration passed on the live maker database;
+- historical primary-location backfill passed;
+- foreign-key and SQLite integrity checks passed;
+- package reinstall preserved configuration, database state, SSH keys and
+  known_hosts;
+- full project pytest regression passed;
+- Cockpit Primary/Replica storage configuration passed;
+- SSH is selectable as a replica but not as primary;
+- CLI replica configuration passed;
+- retention-derived incremental policy passed;
+- immutable run replica snapshot regression passed;
+- FULL -> INCREMENTAL replica dependency blocking regression passed;
+- historical explicit-backfill model regression passed;
+- live job configuration with LOCAL primary and SSH replica passed;
+- no historical replica tasks were created during migration or configuration.
+
+Not implemented in R3.1:
+
+- receiver-side data transfer protocol;
+- SSH replica byte transfer;
+- remote verification and atomic publication;
+- replica worker retry execution;
+- automatic historical chain backfill;
+- replica-aware retention pinning and reclaim execution;
+- restore execution from a remote replica.
+
+These belong to R3.2 and later phases.
+
+---
+
 # Current position
 
 Current implementation milestone:
 
-    SSH.3c.1 Receiver authorized source registry — CLOSED
+    R3.1 Backup replica topology and job configuration — CLOSED
+
+Next implementation milestone:
+
+    R3.2 SSH receiver transfer protocol
 
 Current safety boundary:
 
@@ -2221,5 +2462,11 @@ Current safety boundary:
     receiver source key CLI       YES
     receiver OS/sshd integration  NO
     SSH connection preflight      NO
+    replica topology/schema      YES
+    job replica configuration     YES
+    immutable run replica snapshot YES
+    incremental replica dependency YES
+    Cockpit replica controls      YES
+    CLI replica controls          YES
     remote SSH transfer           NO
-    backup replication            ROADMAP
+    replica transfer execution    NO
