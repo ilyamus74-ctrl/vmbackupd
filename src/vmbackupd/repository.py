@@ -1993,9 +1993,35 @@ class SQLiteRepository:
         """Atomically claim one ready SSH replica task for sender execution."""
 
         try:
-            self.connection.execute(
-                "BEGIN IMMEDIATE"
-            )
+            try:
+                self.connection.execute(
+                    "BEGIN IMMEDIATE"
+                )
+            except sqlite3.OperationalError as exc:
+                code = getattr(
+                    exc,
+                    "sqlite_errorcode",
+                    None,
+                )
+                message = str(exc).lower()
+
+                if (
+                    code not in {
+                        sqlite3.SQLITE_BUSY,
+                        sqlite3.SQLITE_LOCKED,
+                    }
+                    and "database is locked" not in message
+                    and "database table is locked" not in message
+                ):
+                    raise
+
+                # No replica task has been claimed yet. Contention with
+                # another vmbackupd writer is an idle poll condition, not
+                # a fatal ReplicaWorker failure.
+                if self.connection.in_transaction:
+                    self.connection.rollback()
+
+                return None
 
             row = self.connection.execute(
                 """SELECT rt.id

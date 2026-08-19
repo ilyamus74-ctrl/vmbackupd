@@ -849,3 +849,41 @@ def test_replica_task_shutdown_cancellation_preserves_transferring():
     )
     assert result.attempts == 1
     assert repository.failed is False
+
+
+def test_ssh_replica_idle_claim_tolerates_sqlite_writer_contention(
+    tmp_path,
+):
+    from vmbackupd.models import utcnow
+    from vmbackupd.repository import SQLiteRepository
+
+    database = tmp_path / "replica-contention.db"
+
+    writer = SQLiteRepository(database)
+    replica = SQLiteRepository(database)
+
+    try:
+        replica.connection.execute(
+            "PRAGMA busy_timeout = 1"
+        )
+
+        writer.connection.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        assert replica.claim_next_ssh_replica_task(
+            "node-id",
+            utcnow(),
+        ) is None
+
+        assert not replica.connection.in_transaction
+
+    finally:
+        if replica.connection.in_transaction:
+            replica.connection.rollback()
+
+        if writer.connection.in_transaction:
+            writer.connection.rollback()
+
+        replica.close()
+        writer.close()
