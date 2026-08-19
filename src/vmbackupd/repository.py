@@ -2737,6 +2737,141 @@ class SQLiteRepository:
                                      message=reason, created_at=now))
         return self.get_run(run_id)
 
+    def adopt_recovery_run(
+        self,
+        run_id: str,
+        daemon_instance_id: str,
+        now: datetime,
+        lease_seconds: int,
+    ) -> JobRun:
+        """Atomically adopt a quarantined unsafe run under the live controller."""
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be positive")
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            context = self._run_context(run_id)
+            run = self.get_run(run_id)
+
+            if not run.recovery_required:
+                raise DomainInvariantError("RECOVERY_NOT_REQUIRED")
+
+            adoptable = {
+                RunState.BACKING_UP,
+                RunState.TRANSFERRING,
+                RunState.VERIFYING,
+                RunState.FINALIZING,
+            }
+            if run.state not in adoptable:
+                raise DomainInvariantError("RECOVERY_STATE_NOT_ADOPTABLE")
+
+            daemon = self.get_daemon(daemon_instance_id)
+            vm = self.connection.execute(
+                "SELECT node_id FROM vms WHERE id = ?",
+                (context["vm_id"],),
+            ).fetchone()
+            if vm is None or daemon.node_id != vm["node_id"]:
+                raise DomainInvariantError(
+                    "daemon cannot adopt a VM owned by another node"
+                )
+
+            self._assert_controller(
+                daemon_instance_id,
+                vm["node_id"],
+                now,
+            )
+
+            existing = self.connection.execute(
+                "SELECT * FROM execution_leases WHERE vm_id = ?",
+                (context["vm_id"],),
+            ).fetchone()
+
+            if existing is not None:
+                expires_at = datetime.fromisoformat(
+                    existing["lease_expires_at"]
+                )
+                if expires_at > now:
+                    raise DomainInvariantError("RECOVERY_VM_LEASE_BUSY")
+
+                self.connection.execute(
+                    "DELETE FROM execution_leases WHERE vm_id = ?",
+                    (context["vm_id"],),
+                )
+                self._insert_event(Event(
+                    job_run_id=existing["run_id"],
+                    event_type="LEASE_EXPIRED",
+                    message=(
+                        "expired execution lease removed during "
+                        "recovery adoption"
+                    ),
+                    created_at=now,
+                ))
+
+            other_quarantine = self.connection.execute(
+                """SELECT jr.id
+                   FROM job_runs jr
+                   JOIN backup_jobs bj ON bj.id = jr.job_id
+                   WHERE bj.vm_id = ?
+                     AND jr.id != ?
+                     AND jr.recovery_required = 1
+                     AND jr.state IN (
+                         'BACKING_UP',
+                         'TRANSFERRING',
+                         'VERIFYING',
+                         'FINALIZING'
+                     )
+                   LIMIT 1""",
+                (context["vm_id"], run_id),
+            ).fetchone()
+            if other_quarantine is not None:
+                raise DomainInvariantError(
+                    "RECOVERY_VM_HAS_OTHER_QUARANTINE"
+                )
+
+            expires = now + timedelta(seconds=lease_seconds)
+            self.connection.execute(
+                "INSERT INTO execution_leases VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    context["vm_id"],
+                    run_id,
+                    daemon_instance_id,
+                    now.isoformat(),
+                    expires.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+            self._insert_event(Event(
+                job_run_id=run_id,
+                event_type="LEASE_ACQUIRED",
+                message=(
+                    f"recovery lease adopted by {daemon_instance_id}"
+                ),
+                created_at=now,
+            ))
+
+            self.connection.execute(
+                """UPDATE job_runs
+                   SET recovery_required = 0,
+                       recovery_reason = NULL,
+                       updated_at = ?
+                   WHERE id = ?""",
+                (now.isoformat(), run_id),
+            )
+            self._insert_event(Event(
+                job_run_id=run_id,
+                event_type="RUN_RECOVERY_RESOLVED",
+                message=(
+                    "operator resumed recovery under current controller"
+                ),
+                created_at=now,
+            ))
+
+            self.connection.commit()
+            return self.get_run(run_id)
+        except Exception:
+            self.connection.rollback()
+            raise
+
     def start_daemon(self, node_id: str, now: datetime, instance_id: str | None = None) -> DaemonInstance:
         daemon = DaemonInstance(node_id=node_id, instance_id=instance_id or new_id(),
                                 started_at=now, last_heartbeat_at=now)

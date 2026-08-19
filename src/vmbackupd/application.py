@@ -86,6 +86,7 @@ class VmbackupApplication:
             "restore_point.list": self.restore_point_list,
             "restore_point.show": self.restore_point_show,
             "recovery.list": self.recovery_list, "recovery.show": self.recovery_show,
+            "recovery.resume": self.recovery_resume,
             "event.list": self.event_list,
         }
         handler = handlers.get(method)
@@ -1394,6 +1395,40 @@ class VmbackupApplication:
         if not value.recovery_required:
             raise ApplicationError("NOT_RECOVERY_REQUIRED", "run does not require recovery")
         return serialization.run(value)
+    def recovery_resume(self, run_id):
+        value = self.repository.get_run(run_id)
+        self._require_local_run(value)
+        if not value.recovery_required:
+            raise ApplicationError(
+                "NOT_RECOVERY_REQUIRED",
+                "run does not require recovery",
+            )
+
+        runtime_state = getattr(
+            self.runtime, "runtime_state", "RUNNING"
+        )
+        runtime_state = getattr(runtime_state, "value", runtime_state)
+        if runtime_state != "RUNNING":
+            raise ApplicationError(
+                "RUNTIME_NOT_RUNNING",
+                "runtime must be RUNNING to resume recovery",
+            )
+
+        instance_id = getattr(self.runtime, "instance_id", None)
+        if not instance_id:
+            raise ApplicationError(
+                "RUNTIME_NOT_RUNNING",
+                "runtime has no active controller instance",
+            )
+
+        value = self.repository.adopt_recovery_run(
+            run_id,
+            instance_id,
+            self.clock.now(),
+            self.config.daemon.execution_lease_seconds,
+        )
+        return serialization.run(value)
+
     def event_list(self, run_id=None):
         if run_id:
             self._require_local_run(self.repository.get_run(run_id))
