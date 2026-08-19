@@ -19,6 +19,7 @@ from .storage import lexical_storage_path, storage_path_has_symlink
 DEFAULT_SOCKET = "/run/vmbackupd/storage-helper.sock"
 MAX_MESSAGE = 65536
 RECEIVER_DIRECTORY = ".vmbackupd-receiver"
+STAGING_DIRECTORY = "vmbackupd-staging"
 
 _FORBIDDEN_ROOTS = (
     Path("/boot"),
@@ -115,6 +116,226 @@ def validate_managed_storage_path(value: str | Path) -> Path:
 
     return path
 
+
+
+def validate_managed_staging_path(
+    value: str | Path,
+    seed_root: str | Path,
+) -> tuple[Path, Path]:
+    """Validate one helper-managed SSH staging destination.
+
+    The daemon supplies an existing LOCAL storage root as the anchor.
+    Staging is allowed only beside that root:
+
+        <seed-parent>/vmbackupd-staging/<destination-id>
+
+    The remote receiver account receives no access to this namespace.
+    """
+
+    try:
+        path = lexical_storage_path(value)
+        seed = lexical_storage_path(seed_root)
+    except ValueError as exc:
+        raise ManagedStorageError(
+            "SSH_STAGING_PATH_INVALID",
+            str(exc),
+        ) from None
+
+    # Reuse the managed LOCAL safety policy for the anchor.
+    seed = validate_managed_storage_path(seed)
+
+    try:
+        seed_info = seed.lstat()
+    except FileNotFoundError:
+        raise ManagedStorageError(
+            "SSH_STAGING_SEED_MISSING",
+            "SSH staging seed storage does not exist",
+        ) from None
+    except OSError as exc:
+        raise ManagedStorageError(
+            "SSH_STAGING_PREPARE_FAILED",
+            "cannot inspect SSH staging seed storage: "
+            f"{exc.strerror or type(exc).__name__}",
+        ) from None
+
+    if (
+        stat.S_ISLNK(seed_info.st_mode)
+        or not stat.S_ISDIR(seed_info.st_mode)
+    ):
+        raise ManagedStorageError(
+            "SSH_STAGING_SEED_UNSAFE",
+            "SSH staging seed storage is not a real directory",
+        )
+
+    staging_base = seed.parent / STAGING_DIRECTORY
+
+    if path.parent != staging_base or not path.name:
+        raise ManagedStorageError(
+            "SSH_STAGING_PATH_INVALID",
+            "SSH staging path is outside the managed staging namespace",
+        )
+
+    if storage_path_has_symlink(path):
+        raise ManagedStorageError(
+            "SSH_STAGING_PATH_UNSAFE",
+            "SSH staging path contains a symbolic link",
+        )
+
+    try:
+        base_info = staging_base.lstat()
+    except FileNotFoundError:
+        base_info = None
+    except OSError as exc:
+        raise ManagedStorageError(
+            "SSH_STAGING_PREPARE_FAILED",
+            "cannot inspect SSH staging namespace: "
+            f"{exc.strerror or type(exc).__name__}",
+        ) from None
+
+    if base_info is not None and (
+        stat.S_ISLNK(base_info.st_mode)
+        or not stat.S_ISDIR(base_info.st_mode)
+    ):
+        raise ManagedStorageError(
+            "SSH_STAGING_PATH_UNSAFE",
+            "managed SSH staging namespace is not a real directory",
+        )
+
+    try:
+        path_info = path.lstat()
+    except FileNotFoundError:
+        path_info = None
+    except OSError as exc:
+        raise ManagedStorageError(
+            "SSH_STAGING_PREPARE_FAILED",
+            "cannot inspect SSH staging destination: "
+            f"{exc.strerror or type(exc).__name__}",
+        ) from None
+
+    if path_info is not None and (
+        stat.S_ISLNK(path_info.st_mode)
+        or not stat.S_ISDIR(path_info.st_mode)
+    ):
+        raise ManagedStorageError(
+            "SSH_STAGING_PATH_UNSAFE",
+            "managed SSH staging destination is not a real directory",
+        )
+
+    return path, staging_base
+
+
+def prepare_staging_root(
+    value: str | Path,
+    seed_root: str | Path,
+    *,
+    user_lookup=pwd.getpwnam,
+    group_lookup=grp.getgrnam,
+    chown=os.chown,
+    chmod=os.chmod,
+) -> dict:
+    """Create one private local staging root for an SSH destination."""
+
+    path, staging_base = validate_managed_staging_path(
+        value,
+        seed_root,
+    )
+
+    try:
+        daemon = user_lookup("vmbackupd")
+        qemu = group_lookup("qemu")
+    except KeyError as exc:
+        raise ManagedStorageError(
+            "STORAGE_ACCOUNT_MISSING",
+            f"required system account is missing: {exc.args[0]}",
+        ) from None
+
+    base_created = False
+    path_created = False
+
+    try:
+        if not staging_base.exists():
+            os.mkdir(staging_base, 0o750)
+            base_created = True
+
+        # Keep creation of sibling destination roots privileged.
+        # vmbackupd/qemu may traverse the namespace but cannot create
+        # arbitrary sibling directories in it.
+        chown(staging_base, 0, qemu.gr_gid)
+        chmod(staging_base, 0o750)
+
+        if path.exists():
+            raise ManagedStorageError(
+                "SSH_STAGING_EXISTS",
+                "managed SSH staging destination already exists",
+            )
+
+        os.mkdir(path, 0o750)
+        path_created = True
+
+        chown(path, daemon.pw_uid, qemu.gr_gid)
+        chmod(path, 0o750)
+
+    except ManagedStorageError:
+        raise
+    except OSError as exc:
+        if path_created:
+            try:
+                path.rmdir()
+            except OSError:
+                pass
+
+        if base_created:
+            try:
+                staging_base.rmdir()
+            except OSError:
+                pass
+
+        raise ManagedStorageError(
+            "SSH_STAGING_PREPARE_FAILED",
+            "cannot prepare managed SSH staging: "
+            f"{exc.strerror or type(exc).__name__}",
+        ) from None
+
+    return {
+        "ok": True,
+        "kind": "SSH_STAGING",
+        "path": str(path),
+        "staging_base": str(staging_base),
+        "owner": "vmbackupd",
+        "group": "qemu",
+        "mode": "0750",
+    }
+
+
+def remove_staging_root(
+    value: str | Path,
+    seed_root: str | Path,
+) -> dict:
+    """Remove an empty helper-managed SSH staging destination only."""
+
+    path, _ = validate_managed_staging_path(
+        value,
+        seed_root,
+    )
+
+    try:
+        path.rmdir()
+        removed = True
+    except FileNotFoundError:
+        removed = False
+    except OSError as exc:
+        raise ManagedStorageError(
+            "SSH_STAGING_REMOVE_FAILED",
+            "cannot remove managed SSH staging: "
+            f"{exc.strerror or type(exc).__name__}",
+        ) from None
+
+    return {
+        "ok": True,
+        "kind": "SSH_STAGING",
+        "path": str(path),
+        "removed": removed,
+    }
 
 
 def probe_managed_storage_root(
@@ -373,12 +594,9 @@ class StoragePrepareClient:
         self.socket_path = str(socket_path)
         self.timeout = timeout
 
-    def prepare(self, path: str | Path) -> dict:
+    def _request(self, value: dict) -> dict:
         payload = json.dumps(
-            {
-                "operation": "prepare",
-                "path": str(path),
-            },
+            value,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8") + b"\n"
@@ -415,12 +633,14 @@ class StoragePrepareClient:
         except OSError as exc:
             raise ManagedStorageError(
                 "STORAGE_HELPER_UNAVAILABLE",
-                f"managed storage helper is unavailable: "
+                "managed storage helper is unavailable: "
                 f"{exc.strerror or type(exc).__name__}",
             ) from None
 
         try:
-            result = json.loads(b"".join(chunks).decode("utf-8"))
+            result = json.loads(
+                b"".join(chunks).decode("utf-8")
+            )
         except (UnicodeError, json.JSONDecodeError):
             raise ManagedStorageError(
                 "STORAGE_HELPER_PROTOCOL_ERROR",
@@ -446,6 +666,34 @@ class StoragePrepareClient:
             raise ManagedStorageError(code, message)
 
         return result
+
+    def prepare(self, path: str | Path) -> dict:
+        return self._request({
+            "operation": "prepare",
+            "path": str(path),
+        })
+
+    def prepare_staging(
+        self,
+        path: str | Path,
+        seed_root: str | Path,
+    ) -> dict:
+        return self._request({
+            "operation": "prepare_staging",
+            "path": str(path),
+            "seed_root": str(seed_root),
+        })
+
+    def remove_staging(
+        self,
+        path: str | Path,
+        seed_root: str | Path,
+    ) -> dict:
+        return self._request({
+            "operation": "remove_staging",
+            "path": str(path),
+            "seed_root": str(seed_root),
+        })
 
 
 def _emit(value: dict) -> None:
@@ -483,8 +731,7 @@ def helper_main() -> int:
 
     if (
         not isinstance(request, dict)
-        or set(request) != {"operation", "path"}
-        or request.get("operation") != "prepare"
+        or not isinstance(request.get("operation"), str)
         or not isinstance(request.get("path"), str)
     ):
         _emit({
@@ -494,8 +741,47 @@ def helper_main() -> int:
         })
         return 0
 
+    operation = request["operation"]
+
     try:
-        result = prepare_storage_root(request["path"])
+        if (
+            operation == "prepare"
+            and set(request) == {"operation", "path"}
+        ):
+            result = prepare_storage_root(
+                request["path"],
+            )
+
+        elif (
+            operation == "prepare_staging"
+            and set(request)
+            == {"operation", "path", "seed_root"}
+            and isinstance(request.get("seed_root"), str)
+        ):
+            result = prepare_staging_root(
+                request["path"],
+                request["seed_root"],
+            )
+
+        elif (
+            operation == "remove_staging"
+            and set(request)
+            == {"operation", "path", "seed_root"}
+            and isinstance(request.get("seed_root"), str)
+        ):
+            result = remove_staging_root(
+                request["path"],
+                request["seed_root"],
+            )
+
+        else:
+            _emit({
+                "ok": False,
+                "code": "STORAGE_HELPER_PROTOCOL_ERROR",
+                "message": "unsupported managed storage request",
+            })
+            return 0
+
     except ManagedStorageError as exc:
         _emit({
             "ok": False,

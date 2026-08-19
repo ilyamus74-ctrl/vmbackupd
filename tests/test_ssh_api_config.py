@@ -51,7 +51,12 @@ name = "destination"
     return path
 
 
-def application_for(repository, node):
+def application_for(
+    repository,
+    node,
+    *,
+    storage_preparer=None,
+):
     destination = repository.get_default_storage_destination(node.id)
     config = SimpleNamespace(
         libvirt=SimpleNamespace(
@@ -78,6 +83,7 @@ def application_for(repository, node):
         node,
         FakeClock(NOW),
         "test",
+        storage_preparer=storage_preparer,
     )
 
 
@@ -494,11 +500,71 @@ def test_runtime_router_refuses_ssh_before_building_local_executor(tmp_path):
     assert built == []
 
 
-def test_api_create_ssh_destination_assigns_managed_staging(tmp_path):
+def test_api_create_ssh_destination_assigns_managed_staging(
+    tmp_path,
+):
     from pathlib import Path
 
+    class RecordingStagingPreparer:
+        def __init__(self):
+            self.prepare_calls = []
+            self.remove_calls = []
+
+        def prepare_staging(
+            self,
+            path,
+            seed_root,
+        ):
+            self.prepare_calls.append(
+                (str(path), str(seed_root))
+            )
+
+            target = Path(path)
+            target.parent.mkdir(
+                mode=0o750,
+                exist_ok=True,
+            )
+            target.mkdir(mode=0o750)
+
+            return {
+                "ok": True,
+                "kind": "SSH_STAGING",
+                "path": str(target),
+            }
+
+        def remove_staging(
+            self,
+            path,
+            seed_root,
+        ):
+            self.remove_calls.append(
+                (str(path), str(seed_root))
+            )
+
+            target = Path(path)
+
+            try:
+                target.rmdir()
+                removed = True
+            except FileNotFoundError:
+                removed = False
+
+            return {
+                "ok": True,
+                "kind": "SSH_STAGING",
+                "path": str(target),
+                "removed": removed,
+            }
+
     repository, node, _, _ = catalog(tmp_path)
-    app = application_for(repository, node)
+
+    preparer = RecordingStagingPreparer()
+
+    app = application_for(
+        repository,
+        node,
+        storage_preparer=preparer,
+    )
 
     created = app.dispatch(
         "storage.create",
@@ -517,6 +583,13 @@ def test_api_create_ssh_destination_assigns_managed_staging(tmp_path):
     assert root.name == created["id"]
     assert root.parent.name == "vmbackupd-staging"
     assert root.is_dir()
+
+    assert len(preparer.prepare_calls) == 1
+    assert preparer.remove_calls == []
+
+    assert (
+        root / ".vmbackupd-receiver"
+    ).exists() is False
 
     repository.close()
 

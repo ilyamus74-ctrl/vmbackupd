@@ -373,3 +373,255 @@ def test_local_storage_update_prepares_new_root_before_persisting(
     assert persisted.backup_data_root == str(new_root)
 
     repository.close()
+
+
+def test_prepare_ssh_staging_is_private_and_has_no_receiver_namespace(
+    tmp_path,
+):
+    from vmbackupd.storage_prepare import (
+        STAGING_DIRECTORY,
+        prepare_staging_root,
+    )
+
+    disk = tmp_path / "libvirt-images"
+    disk.mkdir()
+
+    seed = disk / "vmbackupd"
+    seed.mkdir(mode=0o750)
+
+    destination_id = "11111111-2222-3333-4444-555555555555"
+
+    target = (
+        disk
+        / STAGING_DIRECTORY
+        / destination_id
+    )
+
+    chowns = []
+
+    def user_lookup(name):
+        assert name == "vmbackupd"
+        return SimpleNamespace(
+            pw_uid=1001,
+            pw_gid=1001,
+        )
+
+    def group_lookup(name):
+        assert name == "qemu"
+        return SimpleNamespace(
+            gr_gid=2001,
+        )
+
+    def fake_chown(path, uid, gid):
+        chowns.append(
+            (str(path), uid, gid)
+        )
+
+    result = prepare_staging_root(
+        target,
+        seed,
+        user_lookup=user_lookup,
+        group_lookup=group_lookup,
+        chown=fake_chown,
+    )
+
+    base = disk / STAGING_DIRECTORY
+
+    assert result["ok"] is True
+    assert result["kind"] == "SSH_STAGING"
+    assert result["path"] == str(target)
+
+    assert base.is_dir()
+    assert target.is_dir()
+
+    assert base.stat().st_mode & 0o7777 == 0o750
+    assert target.stat().st_mode & 0o7777 == 0o750
+
+    assert (
+        target / ".vmbackupd-receiver"
+    ).exists() is False
+
+    assert (
+        str(base),
+        0,
+        2001,
+    ) in chowns
+
+    assert (
+        str(target),
+        1001,
+        2001,
+    ) in chowns
+
+
+def test_prepare_ssh_staging_accepts_restricted_seed_parent(
+    tmp_path,
+):
+    from vmbackupd.storage_prepare import (
+        STAGING_DIRECTORY,
+        prepare_staging_root,
+    )
+
+    images = tmp_path / "images"
+    images.mkdir(mode=0o711)
+
+    seed = images / "vmbackupd"
+    seed.mkdir(mode=0o750)
+
+    target = (
+        images
+        / STAGING_DIRECTORY
+        / "11111111-2222-3333-4444-555555555555"
+    )
+
+    def user_lookup(name):
+        assert name == "vmbackupd"
+        return SimpleNamespace(
+            pw_uid=1001,
+            pw_gid=1001,
+        )
+
+    def group_lookup(name):
+        assert name == "qemu"
+        return SimpleNamespace(
+            gr_gid=2001,
+        )
+
+    def fake_chown(path, uid, gid):
+        pass
+
+    result = prepare_staging_root(
+        target,
+        seed,
+        user_lookup=user_lookup,
+        group_lookup=group_lookup,
+        chown=fake_chown,
+    )
+
+    assert result["ok"] is True
+    assert target.is_dir()
+
+
+def test_remove_ssh_staging_only_removes_empty_destination(
+    tmp_path,
+):
+    from vmbackupd.storage_prepare import (
+        STAGING_DIRECTORY,
+        prepare_staging_root,
+        remove_staging_root,
+    )
+
+    images = tmp_path / "images"
+    images.mkdir()
+
+    seed = images / "vmbackupd"
+    seed.mkdir()
+
+    target = (
+        images
+        / STAGING_DIRECTORY
+        / "11111111-2222-3333-4444-555555555555"
+    )
+
+    def user_lookup(name):
+        return SimpleNamespace(
+            pw_uid=1001,
+            pw_gid=1001,
+        )
+
+    def group_lookup(name):
+        return SimpleNamespace(
+            gr_gid=2001,
+        )
+
+    prepare_staging_root(
+        target,
+        seed,
+        user_lookup=user_lookup,
+        group_lookup=group_lookup,
+        chown=lambda *args: None,
+    )
+
+    result = remove_staging_root(
+        target,
+        seed,
+    )
+
+    assert result["ok"] is True
+    assert result["removed"] is True
+    assert target.exists() is False
+
+
+def test_storage_prepare_client_uses_newline_delimited_json(
+    monkeypatch,
+):
+    import json
+
+    import vmbackupd.storage_prepare as storage_prepare
+
+    sent = []
+
+    class FakeSocket:
+        def __init__(self):
+            self.responses = [
+                (
+                    b'{"ok":true,'
+                    b'"kind":"SSH_STAGING",'
+                    b'"path":"/staging/id"}\n'
+                ),
+                b"",
+            ]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def settimeout(self, value):
+            pass
+
+        def connect(self, path):
+            pass
+
+        def sendall(self, payload):
+            sent.append(payload)
+
+        def shutdown(self, how):
+            pass
+
+        def recv(self, size):
+            return self.responses.pop(0)
+
+    monkeypatch.setattr(
+        storage_prepare.socket,
+        "socket",
+        lambda *args, **kwargs: FakeSocket(),
+    )
+
+    client = storage_prepare.StoragePrepareClient(
+        "/ignored.sock",
+    )
+
+    result = client.prepare_staging(
+        "/staging/id",
+        "/seed",
+    )
+
+    assert result["ok"] is True
+
+    assert len(sent) == 1
+
+    # Actual LF byte, not the two literal bytes backslash+n.
+    assert sent[0].endswith(b"\n")
+    assert not sent[0].endswith(b"\\n")
+
+    request = json.loads(
+        sent[0].decode("utf-8")
+    )
+
+    assert request == {
+        "operation": "prepare_staging",
+        "path": "/staging/id",
+        "seed_root": "/seed",
+    }

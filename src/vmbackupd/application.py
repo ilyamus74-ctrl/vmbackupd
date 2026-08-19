@@ -247,33 +247,96 @@ class VmbackupApplication:
         )
         return configured
 
-    def _create_managed_ssh_staging(self, profile, destination_id):
-        seed_root = lexical_storage_path(profile.backup_data_root)
-        staging_base = seed_root.parent / "vmbackupd-staging"
-        staging_root = staging_base / destination_id
+    def _create_managed_ssh_staging(
+        self,
+        profile,
+        destination_id,
+    ):
+        seed_root = lexical_storage_path(
+            profile.backup_data_root
+        )
 
-        mode = int(profile.backup_data_mode)
+        staging_root = (
+            seed_root.parent
+            / "vmbackupd-staging"
+            / destination_id
+        )
 
-        try:
-            staging_base.mkdir(parents=True, exist_ok=True, mode=mode)
-            os.chmod(staging_base, mode)
-
-            if profile.backup_data_gid is not None:
-                os.chown(staging_base, -1, int(profile.backup_data_gid))
-
-            staging_root.mkdir(mode=mode)
-            os.chmod(staging_root, mode)
-
-            if profile.backup_data_gid is not None:
-                os.chown(staging_root, -1, int(profile.backup_data_gid))
-        except OSError as exc:
+        if self.storage_preparer is None:
             raise ApplicationError(
                 "SSH_STAGING_PREPARE_FAILED",
-                f"cannot prepare managed SSH staging: "
-                f"{exc.strerror or type(exc).__name__}",
+                "managed SSH staging helper is not configured",
+            )
+
+        try:
+            result = self.storage_preparer.prepare_staging(
+                staging_root,
+                seed_root,
+            )
+        except ManagedStorageError as exc:
+            raise ApplicationError(
+                "SSH_STAGING_PREPARE_FAILED",
+                "cannot prepare managed SSH staging: "
+                + str(exc),
             ) from None
 
+        if (
+            not isinstance(result, dict)
+            or result.get("ok") is not True
+            or result.get("kind") != "SSH_STAGING"
+            or result.get("path") != str(staging_root)
+        ):
+            raise ApplicationError(
+                "STORAGE_HELPER_PROTOCOL_ERROR",
+                "managed storage helper returned "
+                "inconsistent SSH staging identity",
+            )
+
+        probe = self.storage_tester.test(
+            str(staging_root),
+            0,
+            0,
+        )
+
+        if not (
+            probe.get("backup_data_root_exists") is True
+            and probe.get("backup_data_root_writable") is True
+        ):
+            errors = probe.get("errors") or []
+            detail = (
+                "; ".join(str(item) for item in errors)
+                or "verification failed"
+            )
+
+            raise ApplicationError(
+                "SSH_STAGING_PREPARE_FAILED",
+                "managed SSH staging is not writable "
+                "by vmbackupd after preparation: "
+                + detail,
+            )
+
         return str(staging_root)
+
+    def _remove_managed_ssh_staging(
+        self,
+        profile,
+        staging_root,
+    ):
+        if self.storage_preparer is None:
+            return
+
+        try:
+            self.storage_preparer.remove_staging(
+                staging_root,
+                lexical_storage_path(
+                    profile.backup_data_root
+                ),
+            )
+        except ManagedStorageError:
+            # Preserve the original repository error. The helper
+            # deliberately refuses recursive removal, so any
+            # unexpected content remains untouched.
+            pass
 
     def storage_create(self, name, backup_data_root=None,
                        minimum_free_bytes=0, minimum_free_percent=5,
@@ -352,10 +415,10 @@ class VmbackupApplication:
             )
         except Exception:
             if managed_staging:
-                try:
-                    Path(backup_data_root).rmdir()
-                except OSError:
-                    pass
+                self._remove_managed_ssh_staging(
+                    profile,
+                    backup_data_root,
+                )
             raise
 
         return self._serialize_storage(created)
