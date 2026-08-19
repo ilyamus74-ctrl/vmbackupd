@@ -81,7 +81,12 @@ def _parser():
                 item.add_argument("--vm", required=True); item.add_argument("--name", required=True)
                 destination = item.add_mutually_exclusive_group()
                 destination.add_argument("--storage"); destination.add_argument("--storage-name")
-                item.add_argument("--max-incrementals", type=int, default=0)
+                item.add_argument(
+                    "--replica",
+                    action="append",
+                    default=None,
+                    metavar="DESTINATION_ID",
+                )
                 item.add_argument("--retain", type=int, default=7)
                 item.add_argument("--full-chains-to-retain", type=int, default=2)
                 item.add_argument("--minimum-full-chains", type=int, default=1)
@@ -108,6 +113,19 @@ def _parser():
                 item.add_argument("id"); item.add_argument("--name")
                 destination = item.add_mutually_exclusive_group()
                 destination.add_argument("--storage"); destination.add_argument("--storage-name")
+
+                replicas = item.add_mutually_exclusive_group()
+                replicas.add_argument(
+                    "--replica",
+                    action="append",
+                    default=None,
+                    metavar="DESTINATION_ID",
+                )
+                replicas.add_argument(
+                    "--clear-replicas",
+                    action="store_true",
+                )
+
                 item.add_argument("--retain", type=int)
                 item.add_argument("--full-chains-to-retain", type=int)
                 item.add_argument("--minimum-full-chains", type=int)
@@ -205,7 +223,9 @@ def _request(args):
         params = {"vm_id": args.vm, "name": args.name,
                   "storage_destination_id": args.storage,
                   "storage_destination": args.storage_name,
-                  "max_incrementals_per_chain": args.max_incrementals,
+                  "replica_destination_ids": args.replica or [],
+                  "max_incrementals_per_chain":
+                      max(0, args.retain - 1),
                   "restore_points_to_retain": args.retain,
                   "full_chains_to_retain": args.full_chains_to_retain,
                   "minimum_full_chains": args.minimum_full_chains,
@@ -222,6 +242,16 @@ def _request(args):
         params = {"id": args.id, "name": args.name,
                   "storage_destination_id": args.storage,
                   "storage_destination": args.storage_name,
+                  "replica_destination_ids": (
+                      []
+                      if args.clear_replicas
+                      else args.replica
+                  ),
+                  "max_incrementals_per_chain": (
+                      None
+                      if args.retain is None
+                      else max(0, args.retain - 1)
+                  ),
                   "restore_points_to_retain": args.retain,
                   "full_chains_to_retain": args.full_chains_to_retain,
                   "minimum_full_chains": args.minimum_full_chains,

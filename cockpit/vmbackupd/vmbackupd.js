@@ -2080,8 +2080,6 @@
         populateJobOptions(job);
         document.getElementById("job-name").value = job ? job.name : "";
         document.getElementById("job-enabled").checked = job ? job.enabled : true;
-        document.getElementById("job-max-incrementals").value =
-            job ? job.max_incrementals_per_chain : 6;
         document.getElementById("job-retain").value = job ? job.restore_points_to_retain : 7;
         document.getElementById("job-full-chains").value =
             job ? job.full_chains_to_retain : 2;
@@ -2141,8 +2139,10 @@
             name: document.getElementById("job-name").value.trim(),
             storage_destination_id: document.getElementById("job-storage").value,
             replica_destination_ids: selectedJobReplicaIds(),
-            max_incrementals_per_chain:
-                Number(document.getElementById("job-max-incrementals").value),
+            max_incrementals_per_chain: Math.max(
+                0,
+                Number(document.getElementById("job-retain").value) - 1,
+            ),
             enabled: document.getElementById("job-enabled").checked,
             schedule_enabled: scheduleMode !== "manual",
             restore_points_to_retain: Number(document.getElementById("job-retain").value),

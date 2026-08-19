@@ -238,8 +238,8 @@ def test_cockpit_job_management_supports_replicas_incrementals_and_refreshes_aut
 
     assert "Primary storage" in html
     assert "Replica storages" in html
-    assert "Maximum incrementals before next FULL" in html
-    assert "0 creates FULL backups only." in html
+    assert "Maximum incrementals before next FULL" not in html
+    assert 'id="job-max-incrementals"' not in html
     assert 'value="Full" readonly' not in html
 
     assert "Schedule mode" in html
@@ -255,7 +255,7 @@ def test_cockpit_job_management_supports_replicas_incrementals_and_refreshes_aut
     assert "Interval" in html
     assert "Daily" in html
 
-    assert 'job ? job.max_incrementals_per_chain : 6' in javascript
+    assert 'Number(document.getElementById("job-retain").value) - 1' in javascript
     assert 'job ? job.full_chains_to_retain : 2' in javascript
     assert 'job ? job.space_reclaim_mode : "SAFE"' in javascript
 
@@ -566,8 +566,8 @@ def test_cockpit_job_form_configures_primary_replicas_and_incrementals():
     assert "Primary storage" in html
     assert 'id="job-replicas"' in html
     assert "Replica storages" in html
-    assert 'id="job-max-incrementals"' in html
-    assert "Maximum incrementals before next FULL" in html
+    assert 'id="job-max-incrementals"' not in html
+    assert "Maximum incrementals before next FULL" not in html
 
     assert "Backup mode" not in html
     assert "selectedJobReplicaIds" in javascript

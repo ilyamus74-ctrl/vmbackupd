@@ -474,7 +474,10 @@ def test_cli_job_create_and_update_map_schedule_enable_and_destination_options()
     assert method == "job.update"
     assert params == {
         "id": "job-id", "name": None, "storage_destination_id": "storage-id",
-        "storage_destination": None, "restore_points_to_retain": 9,
+        "storage_destination": None,
+        "replica_destination_ids": None,
+        "max_incrementals_per_chain": 8,
+        "restore_points_to_retain": 9,
         "full_chains_to_retain": 3, "minimum_full_chains": 2,
         "space_reclaim_mode": "SPACE_OPTIMIZED",
         "backup_size_margin_percent": 25.5,
@@ -732,3 +735,80 @@ def test_job_api_replica_and_incremental_configuration_is_atomic():
     assert persisted["storage_destination_id"] == first.id
     assert persisted["replica_destination_ids"] == []
     assert persisted["max_incrementals_per_chain"] == 3
+
+
+def test_cli_job_replica_options_and_retention_derive_incremental_chain():
+    parser = _parser()
+
+    method, params = _request(
+        parser.parse_args([
+            "job",
+            "create",
+            "--vm",
+            "vm-id",
+            "--name",
+            "replicated",
+            "--retain",
+            "7",
+            "--replica",
+            "kiev",
+            "--replica",
+            "second",
+        ])
+    )
+
+    assert method == "job.create"
+    assert params["restore_points_to_retain"] == 7
+    assert params["max_incrementals_per_chain"] == 6
+    assert params["replica_destination_ids"] == [
+        "kiev",
+        "second",
+    ]
+
+    method, params = _request(
+        parser.parse_args([
+            "job",
+            "update",
+            "job-id",
+            "--retain",
+            "7",
+            "--replica",
+            "kiev",
+        ])
+    )
+
+    assert method == "job.update"
+    assert params["restore_points_to_retain"] == 7
+    assert params["max_incrementals_per_chain"] == 6
+    assert params["replica_destination_ids"] == [
+        "kiev",
+    ]
+
+    method, params = _request(
+        parser.parse_args([
+            "job",
+            "update",
+            "job-id",
+            "--clear-replicas",
+        ])
+    )
+
+    assert method == "job.update"
+    assert params["restore_points_to_retain"] is None
+    assert params["max_incrementals_per_chain"] is None
+    assert params["replica_destination_ids"] == []
+
+    # No replica option means "do not modify current replicas".
+    method, params = _request(
+        parser.parse_args([
+            "job",
+            "update",
+            "job-id",
+            "--name",
+            "renamed",
+        ])
+    )
+
+    assert method == "job.update"
+    assert params["replica_destination_ids"] is None
+    assert params["max_incrementals_per_chain"] is None
