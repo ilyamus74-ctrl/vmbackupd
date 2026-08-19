@@ -2417,15 +2417,201 @@ These belong to R3.2 and later phases.
 
 ---
 
+# SSH receiver transfer protocol (R3.2)
+
+Status: CLOSED
+
+Closing implementation commit:
+
+    db971bb — Add restricted SSH replica staging protocol
+
+Foundation commit:
+
+    c8f00f3 — Add internal receiver storage resolver
+
+Related reliability correction included in the accepted package:
+
+    919797f — Fix deterministic libvirt authorization failures
+
+R3.2 implements the receiver-side byte-transfer boundary for replica data.
+It deliberately does not implement sender-side replica execution, semantic
+Restore Point verification, final publication, or replica availability.
+
+Receiver storage resolution:
+
+    remote_storage_id
+        -> vmbackupd-transfer-v1 BEGIN
+        -> /run/vmbackupd-receiver-resolver.sock
+        -> internal vmbackupd resolver worker
+        -> managed LOCAL storage
+        -> .vmbackupd-receiver/staging/<transfer_id>
+
+The public SSH peer supplies only stable IDs and protocol metadata. Receiver
+filesystem roots are resolved internally and are not returned through the
+public SSH protocol.
+
+Restricted SSH command:
+
+    vmbackupd-transfer-v1
+
+The command is accepted only as an exact SSH_ORIGINAL_COMMAND. Arguments,
+shell metacharacters and alternate command forms remain rejected by the
+restricted receiver session.
+
+Transfer protocol:
+
+    BEGIN
+        storage_id
+        transfer_id
+        vm_id
+        Restore Point identity
+        FULL / INCREMENTAL
+        sequence / parent
+        declared bundle files
+
+    FILE_BEGIN
+        relative bundle path
+
+    EXTENT
+        offset
+        length
+        sha256
+        raw payload bytes
+
+    FILE_END
+
+    FINISH
+        -> fsync staged files/directories
+        -> receipt.json
+        -> transfer.json state=STAGING_COMPLETE
+        -> STAGING_COMPLETE response
+
+Accepted bundle paths are restricted to:
+
+    metadata/domain.xml
+    metadata/manifest.json
+    metadata/restore-point.json
+    disks/<safe-target>.qcow2
+
+Absolute paths, traversal, undeclared files, duplicate files, unsafe file
+types, overlapping extents, out-of-range extents and checksum mismatches fail
+closed.
+
+Sparse transport:
+
+- qcow2 logical size and transferred payload size are represented separately;
+- DATA extents are written at explicit offsets;
+- holes are preserved rather than expanded into zero-filled payload;
+- individual extent size is bounded;
+- declared payload must fit receiver usable capacity after configured reserve.
+
+Publication boundary:
+
+    STAGING_COMPLETE
+        !=
+    REPLICA AVAILABLE
+
+R3.2 never creates a successful replica location and never publishes the
+staged bundle into the final `vms/...` namespace.
+
+`restore_point_locations` and `replica_tasks` therefore remain unchanged by
+the receiver transport itself. Semantic verification and atomic publication
+belong to R3.4.
+
+Incremental transport metadata includes the parent Restore Point identity,
+but R3.2 does not treat staged parent metadata as evidence that an
+incremental replica may be published. R3.4 must require the direct parent to
+be AVAILABLE on the same destination before publication.
+
+Live acceptance:
+
+- full project pytest regression passed;
+- unified Release 3 RPM build passed on Fedora 41;
+- the same SRPM rebuilt successfully as the Fedora 44 unified RPM;
+- Fedora 41 maker and Fedora 44 receiver package installation passed;
+- package reinstall preserved `/etc/vmbackupd` configuration;
+- package reinstall preserved `/var/lib/vmbackupd/ssh` identities and trust
+  state;
+- Fedora 44 production database remained schema version 12;
+- production SQLite `PRAGMA integrity_check` returned `ok`;
+- production SQLite `PRAGMA foreign_key_check` returned no rows;
+- receiver catalog and resolver sockets passed systemd validation and live
+  socket activation;
+- stable receiver storage ID
+  `540459e8-2555-43eb-8527-99853ba96ea7` resolved internally to managed
+  storage `STOR_HDD`;
+- public `vmbackupd-storage-list` remained path-free;
+- real SSH transfer acceptance passed from maker to
+  `62.205.155.66:22022` using strict host-key verification and the managed
+  vmbackupd SSH identity;
+- exact `vmbackupd-transfer-v1` command produced READY, FILE_READY,
+  FILE_COMPLETE and STAGING_COMPLETE responses;
+- synthetic FULL transfer staged all required metadata and one sparse qcow2
+  disk successfully;
+- the synthetic qcow2 had 8 MiB logical size while consuming only 8 KiB of
+  allocated filesystem blocks;
+- the staged disk preserved HEAD and TAIL DATA extents with a sparse hole
+  between them;
+- `transfer.json` recorded `STAGING_COMPLETE`;
+- `receipt.json` recorded `STAGING_COMPLETE`;
+- no final bundle was published under `vms/...`;
+- no synthetic `restore_point_locations` row was created;
+- no synthetic `replica_tasks` row was created;
+- the synthetic receiver staging tree was removed after acceptance.
+
+A libvirt authorization defect discovered during the same package acceptance
+was corrected by commit `919797f`. The package now grants only the dedicated
+`vmbackupd` service account the libvirt connection authorization
+`org.libvirt.unix.manage`. The daemon remains outside the broad `libvirt`
+administrative group. Non-interactive `qemu:///system` management access was
+verified on both maker and the Fedora 44 receiver.
+
+The execution layer also distinguishes definite libvirt authorization
+rejection from genuinely ambiguous backup-start failures:
+
+    definite authorization rejection
+        -> CLEANUP
+        -> FAILED
+        -> recovery_required = false
+
+    timeout/uncertain failure after START_REQUESTED
+        -> UNKNOWN
+        -> recovery_required = true
+
+This prevents the previously observed polkit rejection from leaving a run
+indefinitely quarantined as an ambiguous backup start while preserving the
+existing fail-closed behavior for genuinely uncertain external execution.
+
+`storage.list.transport_ready` intentionally remains `false` at R3.2 closure.
+It is not used as evidence that the restricted receiver command is absent;
+it remains false until the sender-side replica transfer workflow is integrated
+in R3.3.
+
+Not implemented in R3.2:
+
+- sender-side replica worker execution;
+- enumeration of a published primary bundle for transfer;
+- sender sparse extent discovery with SEEK_DATA / SEEK_HOLE;
+- replica task retry execution;
+- remote semantic verification;
+- atomic publication into the final receiver bundle namespace;
+- transition of a REPLICA location to AVAILABLE;
+- replica-aware retention pinning;
+- restore execution from a remote replica.
+
+These belong to R3.3 and later phases.
+
+---
+
 # Current position
 
 Current implementation milestone:
 
-    R3.1 Backup replica topology and job configuration — CLOSED
+    R3.2 SSH receiver transfer protocol — CLOSED
 
 Next implementation milestone:
 
-    R3.2 SSH receiver transfer protocol
+    R3.3 SSH sender transfer
 
 Current safety boundary:
 
@@ -2462,11 +2648,16 @@ Current safety boundary:
     receiver source key CLI       YES
     receiver OS/sshd integration  YES
     SSH connection preflight      YES
-    replica topology/schema      YES
+    receiver storage resolver     YES
+    receiver SSH transfer protocol YES
+    sparse receiver staging       YES
+    STAGING_COMPLETE boundary     YES
+    replica topology/schema       YES
     job replica configuration     YES
     immutable run replica snapshot YES
     incremental replica dependency YES
     Cockpit replica controls      YES
     CLI replica controls          YES
-    remote SSH transfer           NO
+    sender SSH transfer           NO
     replica transfer execution    NO
+    remote verification/publish   NO
