@@ -2737,6 +2737,221 @@ class SQLiteRepository:
                                      message=reason, created_at=now))
         return self.get_run(run_id)
 
+    def authorize_recovery_cleanup(
+        self,
+        run_id: str,
+        daemon_instance_id: str,
+        now: datetime,
+    ) -> JobRun:
+        """Authorize destructive cleanup without accepting backup success."""
+
+        self.connection.execute("BEGIN IMMEDIATE")
+
+        try:
+            context = self._run_context(run_id)
+            run = self.get_run(run_id)
+
+            # Lost-response retry is idempotent.
+            if not run.recovery_required:
+                if (
+                    run.cleanup_authorized
+                    and run.state in {
+                        RunState.CLEANUP,
+                        RunState.FAILED,
+                    }
+                ):
+                    self.connection.commit()
+                    return run
+
+                raise DomainInvariantError(
+                    "RECOVERY_NOT_REQUIRED"
+                )
+
+            abandonable = {
+                RunState.BACKING_UP,
+                RunState.TRANSFERRING,
+                RunState.VERIFYING,
+                RunState.FINALIZING,
+                RunState.CLEANUP,
+            }
+
+            if run.state not in abandonable:
+                raise DomainInvariantError(
+                    "RECOVERY_STATE_NOT_ABANDONABLE"
+                )
+
+            daemon = self.get_daemon(
+                daemon_instance_id
+            )
+
+            vm = self.connection.execute(
+                "SELECT node_id FROM vms WHERE id = ?",
+                (context["vm_id"],),
+            ).fetchone()
+
+            if (
+                vm is None
+                or daemon.node_id != vm["node_id"]
+            ):
+                raise DomainInvariantError(
+                    "daemon cannot abandon a VM "
+                    "owned by another node"
+                )
+
+            self._assert_controller(
+                daemon_instance_id,
+                vm["node_id"],
+                now,
+            )
+
+            # A run which already produced a restore point must never
+            # enter operator-abandon cleanup.
+            published = self.connection.execute(
+                """SELECT 1
+                   FROM restore_points
+                   WHERE job_run_id = ?
+                   LIMIT 1""",
+                (run_id,),
+            ).fetchone()
+
+            if published is not None:
+                raise DomainInvariantError(
+                    "RECOVERY_RUN_ALREADY_PUBLISHED"
+                )
+
+            # Do not cross another run/controller's VM lease.
+            existing = self.connection.execute(
+                """SELECT *
+                   FROM execution_leases
+                   WHERE vm_id = ?""",
+                (context["vm_id"],),
+            ).fetchone()
+
+            if existing is not None:
+                expires_at = datetime.fromisoformat(
+                    existing["lease_expires_at"]
+                )
+
+                if expires_at <= now:
+                    self.connection.execute(
+                        """DELETE FROM execution_leases
+                           WHERE vm_id = ?""",
+                        (context["vm_id"],),
+                    )
+
+                    self._insert_event(Event(
+                        job_run_id=existing["run_id"],
+                        event_type="LEASE_EXPIRED",
+                        message=(
+                            "expired execution lease removed "
+                            "during recovery abandonment"
+                        ),
+                        created_at=now,
+                    ))
+
+                elif (
+                    existing["run_id"] != run_id
+                    or existing["daemon_instance_id"]
+                    != daemon_instance_id
+                ):
+                    raise DomainInvariantError(
+                        "RECOVERY_VM_LEASE_BUSY"
+                    )
+
+                # A still-live lease belonging to this exact run and
+                # controller is deliberately retained.  Runtime can
+                # reuse it immediately for CLEANUP.
+
+            other_quarantine = self.connection.execute(
+                """SELECT jr.id
+                   FROM job_runs jr
+                   JOIN backup_jobs bj
+                     ON bj.id = jr.job_id
+                   WHERE bj.vm_id = ?
+                     AND jr.id != ?
+                     AND jr.recovery_required = 1
+                     AND jr.state IN (
+                         'BACKING_UP',
+                         'TRANSFERRING',
+                         'VERIFYING',
+                         'FINALIZING',
+                         'CLEANUP'
+                     )
+                   LIMIT 1""",
+                (
+                    context["vm_id"],
+                    run_id,
+                ),
+            ).fetchone()
+
+            if other_quarantine is not None:
+                raise DomainInvariantError(
+                    "RECOVERY_VM_HAS_OTHER_QUARANTINE"
+                )
+
+            if run.state is not RunState.CLEANUP:
+                validate_transition(
+                    run.state,
+                    RunState.CLEANUP,
+                )
+
+            message = (
+                "operator abandoned recovery run; "
+                "backup success was not proven"
+            )
+
+            self.connection.execute(
+                """UPDATE job_runs
+                   SET state = ?,
+                       cleanup_authorized = 1,
+                       recovery_required = 0,
+                       recovery_reason = NULL,
+                       error = COALESCE(error, ?),
+                       updated_at = ?
+                   WHERE id = ?""",
+                (
+                    RunState.CLEANUP,
+                    message,
+                    now.isoformat(),
+                    run_id,
+                ),
+            )
+
+            if run.state is not RunState.CLEANUP:
+                self._insert_transition_event(
+                    run_id,
+                    run.state,
+                    RunState.CLEANUP,
+                )
+
+            if not run.cleanup_authorized:
+                self._insert_event(Event(
+                    job_run_id=run_id,
+                    event_type="RUN_CLEANUP_AUTHORIZED",
+                    message=(
+                        "operator authorized cleanup "
+                        "without accepting backup success"
+                    ),
+                    created_at=now,
+                ))
+
+            self._insert_event(Event(
+                job_run_id=run_id,
+                event_type="RUN_RECOVERY_RESOLVED",
+                message=(
+                    "operator abandoned recovery run "
+                    "for cleanup"
+                ),
+                created_at=now,
+            ))
+
+            self.connection.commit()
+            return self.get_run(run_id)
+
+        except Exception:
+            self.connection.rollback()
+            raise
+
     def adopt_recovery_run(
         self,
         run_id: str,
@@ -5328,6 +5543,7 @@ class SQLiteRepository:
             missed_schedule_slots=row["missed_schedule_slots"],
             recovery_required=bool(row["recovery_required"]),
             recovery_reason=row["recovery_reason"],
+            cleanup_authorized=bool(row["cleanup_authorized"]),
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
         )

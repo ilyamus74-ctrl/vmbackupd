@@ -9,7 +9,7 @@ import sqlite3
 from collections.abc import Callable, Mapping
 
 
-CURRENT_SCHEMA_VERSION = 12
+CURRENT_SCHEMA_VERSION = 13
 
 
 class SchemaError(RuntimeError):
@@ -43,6 +43,8 @@ JOB_RUNS_TABLE_SQL = """CREATE TABLE job_runs (
         recovery_required INTEGER NOT NULL DEFAULT 0, recovery_reason TEXT,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
         storage_destination_id TEXT REFERENCES storage_destinations(id),
+        cleanup_authorized INTEGER NOT NULL DEFAULT 0
+            CHECK(cleanup_authorized IN (0, 1)),
         CHECK((planned_kind IS NULL AND planned_chain_id IS NULL AND
                planned_sequence IS NULL AND parent_restore_point_id IS NULL) OR
               (planned_kind IS NOT NULL AND planned_chain_id IS NOT NULL AND
@@ -541,7 +543,8 @@ CURRENT_COLUMNS = {
     "job_runs": {"id", "job_id", "storage_destination_id", "state", "planned_kind", "planned_chain_id",
                  "planned_sequence", "parent_restore_point_id", "error", "cleanup_error",
                  "cleanup_attempts", "scheduled_for", "is_catch_up", "missed_schedule_slots",
-                 "recovery_required", "recovery_reason", "created_at", "updated_at"},
+                 "recovery_required", "recovery_reason", "cleanup_authorized",
+                 "created_at", "updated_at"},
     "backup_chains": {"id", "vm_id", "status", "created_at", "closed_at"},
     "restore_points": {"id", "chain_id", "job_run_id", "kind", "sequence",
                        "backup_object_id", "parent_restore_point_id",
@@ -598,8 +601,15 @@ CURRENT_COLUMNS = {
     },
 }
 
-VERSION_11_COLUMNS = {
+VERSION_12_COLUMNS = {
     name: set(columns) for name, columns in CURRENT_COLUMNS.items()
+}
+VERSION_12_COLUMNS["job_runs"].remove(
+    "cleanup_authorized"
+)
+
+VERSION_11_COLUMNS = {
+    name: set(columns) for name, columns in VERSION_12_COLUMNS.items()
 }
 for _table in (
     "backup_job_replicas",
@@ -1740,6 +1750,21 @@ def migrate_11_to_12(connection: sqlite3.Connection) -> None:
         )
 
 
+def migrate_12_to_13(connection: sqlite3.Connection) -> None:
+    """Add durable operator authorization for destructive recovery cleanup."""
+
+    _validate_fingerprint(
+        connection,
+        VERSION_12_COLUMNS,
+    )
+
+    connection.execute(
+        """ALTER TABLE job_runs
+           ADD COLUMN cleanup_authorized INTEGER NOT NULL DEFAULT 0
+           CHECK(cleanup_authorized IN (0, 1))"""
+    )
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: migrate_0_to_1,
     1: migrate_1_to_2,
@@ -1753,6 +1778,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     9: migrate_9_to_10,
     10: migrate_10_to_11,
     11: migrate_11_to_12,
+    12: migrate_12_to_13,
 }
 
 

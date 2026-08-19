@@ -1444,12 +1444,69 @@ class LibvirtBackupExecutor:
         run = self.repository.get_run(run_id)
         if run.state is not RunState.CLEANUP:
             return run
-        operation = self.repository.get_libvirt_operation(run_id)
-        if operation is not None and operation.external_state is not LibvirtExternalState.PLANNED:
+
+        operation = self.repository.get_libvirt_operation(
+            run_id
+        )
+
+        if run.cleanup_authorized:
+            if operation is None:
+                return self.repository.mark_recovery_required(
+                    run_id,
+                    (
+                        "authorized cleanup lost persisted "
+                        "libvirt operation identity"
+                    ),
+                    self.clock.now(),
+                )
+
+            try:
+                inspection = self.read_driver.inspect_backup(
+                    operation.domain_uuid
+                )
+            except Exception as exc:
+                return self.repository.mark_recovery_required(
+                    run_id,
+                    (
+                        "authorized cleanup live libvirt "
+                        "inspection failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                    self.clock.now(),
+                )
+
+            if inspection.state is not DomainJobState.NONE:
+                detail = (
+                    inspection.error
+                    or inspection.state.value
+                )
+
+                return self.repository.mark_recovery_required(
+                    run_id,
+                    (
+                        "authorized cleanup blocked by "
+                        "live libvirt state: "
+                        f"{detail}"
+                    ),
+                    self.clock.now(),
+                )
+
+        elif (
+            operation is not None
+            and operation.external_state
+            is not LibvirtExternalState.PLANNED
+        ):
             return self.repository.mark_recovery_required(
-                run_id, "cleanup is unsafe after libvirt start was requested", self.clock.now()
+                run_id,
+                "cleanup is unsafe after libvirt start was requested",
+                self.clock.now(),
             )
-        self.staging.cleanup_metadata(run_id, self.repository.list_artifacts_for_run(run_id))
+
+        self.staging.cleanup_metadata(
+            run_id,
+            self.repository.list_artifacts_for_run(run_id),
+        )
+
         return self.repository.finish_cleanup(run_id)
 
     def _previous_successful_full_physical(

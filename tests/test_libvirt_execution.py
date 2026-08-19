@@ -2064,3 +2064,102 @@ def test_generic_backup_begin_timeout_remains_ambiguous_recovery(
         .external_state
         is LibvirtExternalState.UNKNOWN
     )
+
+
+
+def _prepare_authorized_ambiguous_cleanup(
+    execution,
+):
+    repository, _, _, run, _, _, clock = execution
+
+    repository.transition_libvirt_external_state(
+        run.id,
+        LibvirtExternalState.START_REQUESTED,
+        clock.now(),
+    )
+
+    repository.transition_libvirt_external_state(
+        run.id,
+        LibvirtExternalState.UNKNOWN,
+        clock.now(),
+        message="test ambiguous backup",
+    )
+
+    repository.transition_run(
+        run.id,
+        RunState.CLEANUP,
+        "operator abandonment test",
+    )
+
+    repository.connection.execute(
+        """UPDATE job_runs
+           SET cleanup_authorized = 1,
+               recovery_required = 0,
+               recovery_reason = NULL
+           WHERE id = ?""",
+        (run.id,),
+    )
+    repository.connection.commit()
+
+
+def test_authorized_cleanup_rechecks_idle_libvirt_before_delete(
+    execution,
+):
+    repository, vm, _, run, driver, _, _ = execution
+
+    _prepare_authorized_ambiguous_cleanup(
+        execution
+    )
+
+    driver.active = BackupInspection(
+        DomainJobState.NONE
+    )
+
+    value, _ = executor(execution)
+
+    result = value.advance_cleanup(
+        run.id
+    )
+
+    assert result.state is RunState.FAILED
+    assert result.cleanup_authorized
+    assert not result.recovery_required
+
+    # Operator abandonment can never create success evidence.
+    assert repository.list_restore_points(
+        vm.id
+    ) == []
+
+
+def test_authorized_cleanup_blocks_if_live_libvirt_job_reappears(
+    execution,
+):
+    repository, vm, _, run, driver, _, _ = execution
+
+    _prepare_authorized_ambiguous_cleanup(
+        execution
+    )
+
+    driver.active = BackupInspection(
+        DomainJobState.BACKUP
+    )
+
+    value, _ = executor(execution)
+
+    result = value.advance_cleanup(
+        run.id
+    )
+
+    assert result.state is RunState.CLEANUP
+    assert result.cleanup_authorized
+    assert result.recovery_required
+
+    assert (
+        "authorized cleanup blocked by "
+        "live libvirt state"
+        in (result.recovery_reason or "")
+    )
+
+    assert repository.list_restore_points(
+        vm.id
+    ) == []

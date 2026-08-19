@@ -15,6 +15,7 @@ from pathlib import Path
 
 from . import serialization
 from .clock import Clock
+from .libvirt_backend import DomainJobState
 from .models import (
     BackupJob, BackupPolicy, RetentionPolicy, SchedulePolicy, StorageDestination,
     StorageType,
@@ -87,6 +88,7 @@ class VmbackupApplication:
             "restore_point.show": self.restore_point_show,
             "recovery.list": self.recovery_list, "recovery.show": self.recovery_show,
             "recovery.resume": self.recovery_resume,
+            "recovery.fail": self.recovery_fail,
             "event.list": self.event_list,
         }
         handler = handlers.get(method)
@@ -1427,6 +1429,101 @@ class VmbackupApplication:
             self.clock.now(),
             self.config.daemon.execution_lease_seconds,
         )
+        return serialization.run(value)
+
+    def recovery_fail(self, run_id):
+        value = self.repository.get_run(run_id)
+        self._require_local_run(value)
+
+        # Lost-response retries remain harmless after authorization.
+        if not value.recovery_required:
+            if value.cleanup_authorized:
+                return serialization.run(value)
+
+            raise ApplicationError(
+                "NOT_RECOVERY_REQUIRED",
+                "run does not require recovery",
+            )
+
+        runtime_state = getattr(
+            self.runtime,
+            "runtime_state",
+            "RUNNING",
+        )
+        runtime_state = getattr(
+            runtime_state,
+            "value",
+            runtime_state,
+        )
+
+        if runtime_state != "RUNNING":
+            raise ApplicationError(
+                "RUNTIME_NOT_RUNNING",
+                "runtime must be RUNNING to fail recovery",
+            )
+
+        instance_id = getattr(
+            self.runtime,
+            "instance_id",
+            None,
+        )
+
+        if not instance_id:
+            raise ApplicationError(
+                "RUNTIME_NOT_RUNNING",
+                "runtime has no active controller instance",
+            )
+
+        operation = self.repository.get_libvirt_operation(
+            run_id
+        )
+
+        if operation is None:
+            raise ApplicationError(
+                "RECOVERY_CLEANUP_UNSAFE",
+                (
+                    "recovery cleanup requires persisted "
+                    "libvirt operation identity"
+                ),
+            )
+
+        try:
+            inspection = self.driver.inspect_backup(
+                operation.domain_uuid
+            )
+        except Exception as exc:
+            raise ApplicationError(
+                "RECOVERY_CLEANUP_INSPECTION_FAILED",
+                (
+                    "live libvirt inspection failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            ) from None
+
+        if inspection.state is not DomainJobState.NONE:
+            detail = (
+                inspection.error
+                or inspection.state.value
+            )
+
+            raise ApplicationError(
+                "RECOVERY_CLEANUP_BLOCKED",
+                (
+                    "live libvirt state does not prove "
+                    "the domain idle: "
+                    f"{detail}"
+                ),
+            )
+
+        value = (
+            self.repository
+            .authorize_recovery_cleanup(
+                run_id,
+                instance_id,
+                self.clock.now(),
+            )
+        )
+
         return serialization.run(value)
 
     def event_list(self, run_id=None):

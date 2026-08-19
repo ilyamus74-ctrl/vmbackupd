@@ -27,14 +27,14 @@ def _parser():
               "vm": ["discover", "list", "show", "register"],
               "job": ["list", "show", "create", "update"], "backup": ["run"],
               "run": ["list", "show"], "restore-point": ["list", "show"],
-              "recovery": ["list", "show", "resume"], "event": ["list"]}
+              "recovery": ["list", "show", "resume", "fail"], "event": ["list"]}
     for group, commands in simple.items():
         group_parser = top.add_parser(group)
         subs = group_parser.add_subparsers(dest="command", required=True)
         for command in commands:
             item = subs.add_parser(command)
             if command == "show": item.add_argument("id")
-            if group == "recovery" and command == "resume":
+            if group == "recovery" and command in {"resume", "fail"}:
                 item.add_argument("id")
             if group == "storage" and command == "create":
                 item.add_argument("--name", required=True)
@@ -187,7 +187,7 @@ def _request(args):
                 params["key"] = args.key
         else:
             raise ValueError("unknown SSH command")
-    elif args.group == "recovery" and args.command == "resume":
+    elif args.group == "recovery" and args.command in {"resume", "fail"}:
         params = {"run_id": args.id}
     elif args.command == "show":
         params["run_id" if args.group == "recovery" else "id"] = args.id

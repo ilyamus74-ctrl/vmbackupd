@@ -42,6 +42,7 @@ def run(value: JobRun) -> dict:
             "error": value.error, "cleanup_error": value.cleanup_error,
             "recovery_required": value.recovery_required,
             "recovery_reason": value.recovery_reason,
+            "cleanup_authorized": value.cleanup_authorized,
             "scheduled_for": value.scheduled_for.isoformat() if value.scheduled_for else None,
             "created_at": value.created_at.isoformat(), "updated_at": value.updated_at.isoformat(),
             "progress": {"bytes_processed": None, "bytes_total": None}}

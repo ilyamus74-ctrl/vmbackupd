@@ -536,6 +536,7 @@ class JobRun:
     missed_schedule_slots: int = 0
     recovery_required: bool = False
     recovery_reason: str | None = None
+    cleanup_authorized: bool = False
     created_at: datetime = field(default_factory=utcnow)
     updated_at: datetime = field(default_factory=utcnow)
 

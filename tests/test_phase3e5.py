@@ -64,6 +64,11 @@ def application(repository, node, clock):
 
 
 def drop_v12_replica_tables(connection):
+    # These fixtures reconstruct pre-v12 schemas from the current
+    # database, so first remove the v13-only run cleanup marker.
+    connection.execute(
+        "ALTER TABLE job_runs DROP COLUMN cleanup_authorized"
+    )
     connection.execute("DROP TABLE replica_tasks")
     connection.execute("DROP TABLE restore_point_locations")
     connection.execute("DROP TABLE job_run_replicas")
