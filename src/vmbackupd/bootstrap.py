@@ -24,6 +24,7 @@ from .ssh_known_hosts import SSHKnownHostsManager
 from .ssh_receiver import SSHReceiverRegistry
 from .storage_prepare import StoragePrepareClient
 from .ssh_preflight import SSHPreflightClient
+from .ssh_storage_discovery import SSHStorageDiscoveryClient
 from .version import __version__
 
 
@@ -297,6 +298,11 @@ def compose(
         ssh_identity_manager,
         ssh_known_hosts_manager,
     )
+    ssh_storage_discovery_client = SSHStorageDiscoveryClient(
+        SubprocessCommandRunner(),
+        ssh_identity_manager,
+        ssh_known_hosts_manager,
+    )
     ssh_receiver_manager = SSHReceiverRegistry(
         config.daemon.database_path.parent / "receiver",
         clock,
@@ -312,5 +318,8 @@ def compose(
         ssh_receiver_manager=ssh_receiver_manager,
     )
     application.ssh_preflight_client = ssh_preflight_client
+    application.ssh_storage_discovery_client = (
+        ssh_storage_discovery_client
+    )
     server = ApiServer(application, config.daemon.socket_path, config.daemon.socket_mode)
     return Components(config, repository, runtime, application, server)

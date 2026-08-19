@@ -120,6 +120,7 @@ class SQLiteRepository:
         self._insert("storage_destinations", value, (
             "id", "node_id", "name", "backup_data_root",
             "storage_type", "ssh_host", "ssh_port", "ssh_user", "ssh_remote_root",
+            "remote_storage_id",
             "backup_data_mode", "backup_data_uid", "backup_data_gid",
             "minimum_free_bytes", "minimum_free_percent", "is_default", "created_at",
         ))
@@ -146,6 +147,7 @@ class SQLiteRepository:
             ssh_port=row["ssh_port"],
             ssh_user=row["ssh_user"],
             ssh_remote_root=row["ssh_remote_root"],
+            remote_storage_id=row["remote_storage_id"],
             backup_data_mode=row["backup_data_mode"], backup_data_uid=row["backup_data_uid"],
             backup_data_gid=row["backup_data_gid"], minimum_free_bytes=row["minimum_free_bytes"],
             minimum_free_percent=row["minimum_free_percent"], is_default=bool(row["is_default"]),
@@ -200,11 +202,12 @@ class SQLiteRepository:
                         """INSERT INTO storage_destinations (
                                id, node_id, name, backup_data_root,
                                storage_type, ssh_host, ssh_port, ssh_user, ssh_remote_root,
+                               remote_storage_id,
                                backup_data_mode, backup_data_uid, backup_data_gid,
                                minimum_free_bytes, minimum_free_percent,
                                is_default, created_at
                            )
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             intended.id,
                             node_id,
@@ -215,6 +218,7 @@ class SQLiteRepository:
                             intended.ssh_port,
                             intended.ssh_user,
                             intended.ssh_remote_root,
+                            intended.remote_storage_id,
                             intended.backup_data_mode,
                             intended.backup_data_uid,
                             intended.backup_data_gid,
@@ -263,17 +267,23 @@ class SQLiteRepository:
     @staticmethod
     def _validate_storage_fields(value: StorageDestination) -> None:
         if not value.name.strip():
-            raise DomainInvariantError("STORAGE_DESTINATION_NAME_REQUIRED")
+            raise DomainInvariantError(
+                "STORAGE_DESTINATION_NAME_REQUIRED"
+            )
 
         try:
             lexical_storage_path(value.backup_data_root)
         except ValueError:
-            raise DomainInvariantError("STORAGE_ROOT_INVALID") from None
+            raise DomainInvariantError(
+                "STORAGE_ROOT_INVALID"
+            ) from None
 
         try:
             storage_type = StorageType(value.storage_type)
         except ValueError:
-            raise DomainInvariantError("STORAGE_TRANSPORT_INVALID") from None
+            raise DomainInvariantError(
+                "STORAGE_TRANSPORT_INVALID"
+            ) from None
 
         if storage_type is StorageType.LOCAL:
             if any(item is not None for item in (
@@ -281,8 +291,11 @@ class SQLiteRepository:
                 value.ssh_port,
                 value.ssh_user,
                 value.ssh_remote_root,
+                value.remote_storage_id,
             )):
-                raise DomainInvariantError("STORAGE_TRANSPORT_INVALID")
+                raise DomainInvariantError(
+                    "STORAGE_TRANSPORT_INVALID"
+                )
 
         elif storage_type is StorageType.SSH:
             if (
@@ -293,21 +306,57 @@ class SQLiteRepository:
                 or not 1 <= value.ssh_port <= 65535
                 or not isinstance(value.ssh_user, str)
                 or not value.ssh_user.strip()
-                or not isinstance(value.ssh_remote_root, str)
-                or not value.ssh_remote_root.strip()
             ):
-                raise DomainInvariantError("STORAGE_TRANSPORT_INVALID")
+                raise DomainInvariantError(
+                    "STORAGE_TRANSPORT_INVALID"
+                )
 
-            try:
-                lexical_storage_path(value.ssh_remote_root)
-            except ValueError:
-                raise DomainInvariantError("STORAGE_REMOTE_ROOT_INVALID") from None
+            remote_root = value.ssh_remote_root
+            remote_storage_id = value.remote_storage_id
+
+            # One and only one remote identity contract:
+            # legacy path OR stable receiver storage ID.
+            if (
+                (remote_root is None)
+                == (remote_storage_id is None)
+            ):
+                raise DomainInvariantError(
+                    "STORAGE_REMOTE_IDENTITY_INVALID"
+                )
+
+            if remote_storage_id is not None:
+                if (
+                    not isinstance(remote_storage_id, str)
+                    or not remote_storage_id.strip()
+                ):
+                    raise DomainInvariantError(
+                        "STORAGE_REMOTE_IDENTITY_INVALID"
+                    )
+
+            if remote_root is not None:
+                if (
+                    not isinstance(remote_root, str)
+                    or not remote_root.strip()
+                ):
+                    raise DomainInvariantError(
+                        "STORAGE_REMOTE_ROOT_INVALID"
+                    )
+
+                try:
+                    lexical_storage_path(remote_root)
+                except ValueError:
+                    raise DomainInvariantError(
+                        "STORAGE_REMOTE_ROOT_INVALID"
+                    ) from None
 
         if (
             value.minimum_free_bytes < 0
             or not 0 <= value.minimum_free_percent <= 100
         ):
-            raise DomainInvariantError("STORAGE_RESERVE_INVALID")
+            raise DomainInvariantError(
+                "STORAGE_RESERVE_INVALID"
+            )
+
 
     def create_storage_destination(
         self, value: StorageDestination, *, make_default: bool = False,
@@ -331,11 +380,12 @@ class SQLiteRepository:
                 """INSERT INTO storage_destinations (
                        id, node_id, name, backup_data_root,
                        storage_type, ssh_host, ssh_port, ssh_user, ssh_remote_root,
+                       remote_storage_id,
                        backup_data_mode, backup_data_uid, backup_data_gid,
                        minimum_free_bytes, minimum_free_percent,
                        is_default, created_at
                    )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     value.id,
                     value.node_id,
@@ -346,6 +396,7 @@ class SQLiteRepository:
                     value.ssh_port,
                     value.ssh_user,
                     value.ssh_remote_root,
+                    value.remote_storage_id,
                     value.backup_data_mode,
                     value.backup_data_uid,
                     value.backup_data_gid,
@@ -372,6 +423,7 @@ class SQLiteRepository:
         storage_type=_STORAGE_UNSET,
         ssh_host=_STORAGE_UNSET, ssh_port=_STORAGE_UNSET,
         ssh_user=_STORAGE_UNSET, ssh_remote_root=_STORAGE_UNSET,
+        remote_storage_id=_STORAGE_UNSET,
     ) -> StorageDestination:
         try:
             self.connection.execute("BEGIN IMMEDIATE")
@@ -413,6 +465,11 @@ class SQLiteRepository:
                     if ssh_remote_root is _STORAGE_UNSET
                     else ssh_remote_root
                 ),
+                remote_storage_id=(
+                    current.remote_storage_id
+                    if remote_storage_id is _STORAGE_UNSET
+                    else remote_storage_id
+                ),
                 backup_data_mode=current.backup_data_mode,
                 backup_data_uid=current.backup_data_uid,
                 backup_data_gid=current.backup_data_gid,
@@ -431,6 +488,7 @@ class SQLiteRepository:
                 or updated.ssh_port != current.ssh_port
                 or updated.ssh_user != current.ssh_user
                 or updated.ssh_remote_root != current.ssh_remote_root
+                or updated.remote_storage_id != current.remote_storage_id
             ):
                 raise DomainInvariantError(
                     "STORAGE_DESTINATION_IDENTITY_LOCKED"
@@ -448,6 +506,7 @@ class SQLiteRepository:
                    backup_data_root = ?,
                    storage_type = ?, ssh_host = ?, ssh_port = ?,
                    ssh_user = ?, ssh_remote_root = ?,
+                   remote_storage_id = ?,
                    minimum_free_bytes = ?, minimum_free_percent = ?,
                    is_default = ? WHERE id = ? AND node_id = ?""",
                 (
@@ -458,6 +517,7 @@ class SQLiteRepository:
                     updated.ssh_port,
                     updated.ssh_user,
                     updated.ssh_remote_root,
+                    updated.remote_storage_id,
                     updated.minimum_free_bytes,
                     updated.minimum_free_percent,
                     int(updated.is_default),

@@ -480,6 +480,7 @@ class StorageDestination:
     ssh_port: int | None = None
     ssh_user: str | None = None
     ssh_remote_root: str | None = None
+    remote_storage_id: str | None = None
     id: str = field(default_factory=new_id)
     created_at: datetime = field(default_factory=utcnow)
 

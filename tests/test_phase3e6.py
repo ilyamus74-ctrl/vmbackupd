@@ -66,6 +66,7 @@ def drop_v10_storage_transport(connection):
         connection.execute(f"DROP TRIGGER {trigger}")
 
     for column in (
+        "remote_storage_id",
         "ssh_remote_root",
         "ssh_user",
         "ssh_port",

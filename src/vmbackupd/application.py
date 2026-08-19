@@ -23,6 +23,7 @@ from .repository import DomainInvariantError, SQLiteRepository
 from .ssh_identity import SSHIdentityError
 from .ssh_known_hosts import SSHKnownHostsError
 from .ssh_preflight import SSHPreflightError
+from .ssh_storage_discovery import SSHStorageDiscoveryError
 from .ssh_receiver import SSHReceiverError
 from .storage import LocalStorageTester, lexical_storage_path, storage_path_has_symlink
 from .storage_prepare import (
@@ -51,6 +52,7 @@ class VmbackupApplication:
         self.ssh_identity_manager = ssh_identity_manager
         self.ssh_known_hosts_manager = ssh_known_hosts_manager
         self.ssh_preflight_client = None
+        self.ssh_storage_discovery_client = None
         self.ssh_receiver_manager = ssh_receiver_manager
 
     def dispatch(self, method: str, params: dict) -> object:
@@ -67,6 +69,10 @@ class VmbackupApplication:
             "ssh.hostkey.show": self.ssh_hostkey_show,
             "ssh.hostkey.add": self.ssh_hostkey_add,
             "ssh.hostkey.revoke": self.ssh_hostkey_revoke,
+            "ssh.hostkey.endpoint.show": self.ssh_hostkey_endpoint_show,
+            "ssh.hostkey.endpoint.add": self.ssh_hostkey_endpoint_add,
+            "ssh.hostkey.endpoint.revoke": self.ssh_hostkey_endpoint_revoke,
+            "ssh.storage.discover": self.ssh_storage_discover,
             "receiver.info": self.receiver_info,
             "receiver.key.list": self.receiver_key_list,
             "receiver.key.add": self.receiver_key_add,
@@ -268,54 +274,69 @@ class VmbackupApplication:
                 "managed SSH staging helper is not configured",
             )
 
+        prepared = False
+
         try:
-            result = self.storage_preparer.prepare_staging(
-                staging_root,
-                seed_root,
-            )
-        except ManagedStorageError as exc:
-            raise ApplicationError(
-                "SSH_STAGING_PREPARE_FAILED",
-                "cannot prepare managed SSH staging: "
-                + str(exc),
-            ) from None
+            try:
+                result = self.storage_preparer.prepare_staging(
+                    staging_root,
+                    seed_root,
+                )
+            except ManagedStorageError as exc:
+                raise ApplicationError(
+                    "SSH_STAGING_PREPARE_FAILED",
+                    "cannot prepare managed SSH staging: "
+                    + str(exc),
+                ) from None
 
-        if (
-            not isinstance(result, dict)
-            or result.get("ok") is not True
-            or result.get("kind") != "SSH_STAGING"
-            or result.get("path") != str(staging_root)
-        ):
-            raise ApplicationError(
-                "STORAGE_HELPER_PROTOCOL_ERROR",
-                "managed storage helper returned "
-                "inconsistent SSH staging identity",
-            )
+            # A successful helper call means the requested leaf may now
+            # exist. Any failure below must roll it back.
+            prepared = True
 
-        probe = self.storage_tester.test(
-            str(staging_root),
-            0,
-            0,
-        )
+            if (
+                not isinstance(result, dict)
+                or result.get("ok") is not True
+                or result.get("kind") != "SSH_STAGING"
+                or result.get("path") != str(staging_root)
+            ):
+                raise ApplicationError(
+                    "STORAGE_HELPER_PROTOCOL_ERROR",
+                    "managed storage helper returned "
+                    "inconsistent SSH staging identity",
+                )
 
-        if not (
-            probe.get("backup_data_root_exists") is True
-            and probe.get("backup_data_root_writable") is True
-        ):
-            errors = probe.get("errors") or []
-            detail = (
-                "; ".join(str(item) for item in errors)
-                or "verification failed"
+            probe = self.storage_tester.test(
+                str(staging_root),
+                0,
+                0,
             )
 
-            raise ApplicationError(
-                "SSH_STAGING_PREPARE_FAILED",
-                "managed SSH staging is not writable "
-                "by vmbackupd after preparation: "
-                + detail,
-            )
+            if not (
+                probe.get("backup_data_root_exists") is True
+                and probe.get("backup_data_root_writable") is True
+            ):
+                errors = probe.get("errors") or []
+                detail = (
+                    "; ".join(str(item) for item in errors)
+                    or "verification failed"
+                )
 
-        return str(staging_root)
+                raise ApplicationError(
+                    "SSH_STAGING_PREPARE_FAILED",
+                    "managed SSH staging is not writable "
+                    "by vmbackupd after preparation: "
+                    + detail,
+                )
+
+            return str(staging_root)
+
+        except Exception:
+            if prepared:
+                self._remove_managed_ssh_staging(
+                    profile,
+                    str(staging_root),
+                )
+            raise
 
     def _remove_managed_ssh_staging(
         self,
@@ -338,11 +359,133 @@ class VmbackupApplication:
             # unexpected content remains untouched.
             pass
 
+    @staticmethod
+    def _normalize_remote_storage_id(value):
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+        ):
+            raise ApplicationError(
+                "SSH_REMOTE_STORAGE_ID_INVALID",
+                "remote_storage_id must not be empty",
+            )
+
+        return value.strip()
+
+    def ssh_storage_discover(
+        self,
+        host,
+        port,
+        user,
+    ):
+        if self.ssh_storage_discovery_client is None:
+            raise ApplicationError(
+                "SSH_STORAGE_DISCOVERY_UNAVAILABLE",
+                "SSH storage discovery client is not configured",
+            )
+
+        try:
+            return self.ssh_storage_discovery_client.discover(
+                host,
+                port,
+                user,
+            )
+        except SSHStorageDiscoveryError as exc:
+            raise ApplicationError(
+                exc.code,
+                str(exc),
+            ) from None
+
+    @staticmethod
+    def _find_discovered_storage(
+        discovery,
+        remote_storage_id,
+    ):
+        matches = [
+            item
+            for item in discovery.get("storages", [])
+            if item.get("id") == remote_storage_id
+        ]
+
+        if len(matches) != 1:
+            raise ApplicationError(
+                "SSH_REMOTE_STORAGE_NOT_FOUND",
+                "selected remote storage is not exposed by the receiver",
+            )
+
+        storage = matches[0]
+
+        if storage.get("ready") is not True:
+            raise ApplicationError(
+                "SSH_REMOTE_STORAGE_NOT_READY",
+                "selected remote storage is not ready to receive backups",
+            )
+
+        return storage
+
+    def _validate_ssh_remote_identity(
+        self,
+        host,
+        port,
+        user,
+        remote_storage_id,
+        ssh_remote_root,
+        *,
+        discover,
+    ):
+        if (
+            remote_storage_id is not None
+            and ssh_remote_root is not None
+        ):
+            raise ApplicationError(
+                "SSH_REMOTE_IDENTITY_AMBIGUOUS",
+                "use remote_storage_id or legacy ssh_remote_root, not both",
+            )
+
+        if remote_storage_id is not None:
+            remote_storage_id = (
+                self._normalize_remote_storage_id(
+                    remote_storage_id
+                )
+            )
+
+            if discover:
+                discovery = self.ssh_storage_discover(
+                    host,
+                    port,
+                    user,
+                )
+
+                self._find_discovered_storage(
+                    discovery,
+                    remote_storage_id,
+                )
+
+            return remote_storage_id, None
+
+        if ssh_remote_root is not None:
+            try:
+                remote_root = lexical_storage_path(
+                    ssh_remote_root
+                )
+            except ValueError:
+                raise ApplicationError(
+                    "INVALID_PARAMS",
+                    "ssh_remote_root must be absolute and traversal-free",
+                ) from None
+
+            return None, str(remote_root)
+
+        raise ApplicationError(
+            "SSH_REMOTE_STORAGE_REQUIRED",
+            "SSH destination requires a selected remote storage",
+        )
+
     def storage_create(self, name, backup_data_root=None,
                        minimum_free_bytes=0, minimum_free_percent=5,
                        make_default=False, storage_type="LOCAL",
                        ssh_host=None, ssh_port=None, ssh_user=None,
-                       ssh_remote_root=None):
+                       ssh_remote_root=None, remote_storage_id=None):
         if not isinstance(make_default, bool):
             raise ApplicationError(
                 "INVALID_PARAMS",
@@ -367,6 +510,18 @@ class VmbackupApplication:
         destination_id = new_id()
         managed_staging = False
 
+        if transport is StorageType.SSH:
+            remote_storage_id, ssh_remote_root = (
+                self._validate_ssh_remote_identity(
+                    ssh_host,
+                    ssh_port,
+                    ssh_user,
+                    remote_storage_id,
+                    ssh_remote_root,
+                    discover=remote_storage_id is not None,
+                )
+            )
+
         if transport is StorageType.SSH and backup_data_root is None:
             backup_data_root = self._create_managed_ssh_staging(
                 profile,
@@ -379,40 +534,44 @@ class VmbackupApplication:
                 "backup_data_root is required for LOCAL storage",
             )
 
-        name, backup_data_root, free_bytes, free_percent = (
-            self._validate_storage_values(
-                name,
-                backup_data_root,
-                minimum_free_bytes,
-                minimum_free_percent,
-            )
-        )
-
-        if transport is StorageType.LOCAL:
-            self._prepare_local_storage(backup_data_root)
-
-        value = StorageDestination(
-            id=destination_id,
-            node_id=self.node.id,
-            name=name,
-            backup_data_root=backup_data_root,
-            backup_data_mode=profile.backup_data_mode,
-            backup_data_uid=profile.backup_data_uid,
-            backup_data_gid=profile.backup_data_gid,
-            minimum_free_bytes=free_bytes,
-            minimum_free_percent=free_percent,
-            storage_type=transport,
-            ssh_host=ssh_host,
-            ssh_port=ssh_port,
-            ssh_user=ssh_user,
-            ssh_remote_root=ssh_remote_root,
-        )
-
         try:
+            name, backup_data_root, free_bytes, free_percent = (
+                self._validate_storage_values(
+                    name,
+                    backup_data_root,
+                    minimum_free_bytes,
+                    minimum_free_percent,
+                )
+            )
+
+            if transport is StorageType.LOCAL:
+                self._prepare_local_storage(
+                    backup_data_root
+                )
+
+            value = StorageDestination(
+                id=destination_id,
+                node_id=self.node.id,
+                name=name,
+                backup_data_root=backup_data_root,
+                backup_data_mode=profile.backup_data_mode,
+                backup_data_uid=profile.backup_data_uid,
+                backup_data_gid=profile.backup_data_gid,
+                minimum_free_bytes=free_bytes,
+                minimum_free_percent=free_percent,
+                storage_type=transport,
+                ssh_host=ssh_host,
+                ssh_port=ssh_port,
+                ssh_user=ssh_user,
+                ssh_remote_root=ssh_remote_root,
+                remote_storage_id=remote_storage_id,
+            )
+
             created = self.repository.create_storage_destination(
                 value,
                 make_default=make_default,
             )
+
         except Exception:
             if managed_staging:
                 self._remove_managed_ssh_staging(
@@ -427,7 +586,8 @@ class VmbackupApplication:
                        minimum_free_bytes=None, minimum_free_percent=None,
                        make_default=False, storage_type=_UNSET,
                        ssh_host=_UNSET, ssh_port=_UNSET,
-                       ssh_user=_UNSET, ssh_remote_root=_UNSET):
+                       ssh_user=_UNSET, ssh_remote_root=_UNSET,
+                       remote_storage_id=_UNSET):
         if not isinstance(make_default, bool):
             raise ApplicationError("INVALID_PARAMS", "make_default must be boolean")
         if name is not None and (not isinstance(name, str) or not name.strip()):
@@ -462,15 +622,6 @@ class VmbackupApplication:
                     "storage roots must be absolute and traversal-free",
                 ) from None
 
-        if ssh_remote_root is not _UNSET and ssh_remote_root is not None:
-            try:
-                lexical_storage_path(ssh_remote_root)
-            except ValueError:
-                raise ApplicationError(
-                    "INVALID_PARAMS",
-                    "ssh_remote_root must be absolute and traversal-free",
-                ) from None
-
         if minimum_free_bytes is not None and int(minimum_free_bytes) < 0:
             raise ApplicationError(
                 "INVALID_PARAMS", "minimum_free_bytes must be non-negative"
@@ -488,12 +639,75 @@ class VmbackupApplication:
         ):
             self._prepare_local_storage(backup_data_root)
 
+        if current.storage_type is StorageType.SSH:
+            candidate_host = (
+                current.ssh_host
+                if ssh_host is _UNSET
+                else ssh_host
+            )
+            candidate_port = (
+                current.ssh_port
+                if ssh_port is _UNSET
+                else ssh_port
+            )
+            candidate_user = (
+                current.ssh_user
+                if ssh_user is _UNSET
+                else ssh_user
+            )
+            candidate_root = (
+                current.ssh_remote_root
+                if ssh_remote_root is _UNSET
+                else ssh_remote_root
+            )
+            candidate_remote_storage_id = (
+                current.remote_storage_id
+                if remote_storage_id is _UNSET
+                else remote_storage_id
+            )
+
+            identity_changed = any(
+                candidate is not _UNSET
+                for candidate in (
+                    ssh_host,
+                    ssh_port,
+                    ssh_user,
+                    ssh_remote_root,
+                    remote_storage_id,
+                )
+            )
+
+            (
+                candidate_remote_storage_id,
+                candidate_root,
+            ) = self._validate_ssh_remote_identity(
+                candidate_host,
+                candidate_port,
+                candidate_user,
+                candidate_remote_storage_id,
+                candidate_root,
+                discover=(
+                    identity_changed
+                    and candidate_remote_storage_id
+                    is not None
+                ),
+            )
+
+            if remote_storage_id is not _UNSET:
+                remote_storage_id = (
+                    candidate_remote_storage_id
+                )
+
+            if ssh_remote_root is not _UNSET:
+                ssh_remote_root = candidate_root
+
         transport_patch = {}
         for key, candidate in (
             ("ssh_host", ssh_host),
             ("ssh_port", ssh_port),
             ("ssh_user", ssh_user),
             ("ssh_remote_root", ssh_remote_root),
+            ("remote_storage_id", remote_storage_id),
         ):
             if candidate is not _UNSET:
                 transport_patch[key] = candidate
@@ -553,6 +767,69 @@ class VmbackupApplication:
                 raise ApplicationError("INVALID_PARAMS", "test by ID or candidate, not both")
             value = self.repository.get_storage_destination(self.node.id, id)
             if value.storage_type is StorageType.SSH:
+                if value.remote_storage_id is not None:
+                    discovery = self.ssh_storage_discover(
+                        value.ssh_host,
+                        value.ssh_port,
+                        value.ssh_user,
+                    )
+
+                    matches = [
+                        item
+                        for item in discovery.get("storages", [])
+                        if item.get("id") == value.remote_storage_id
+                    ]
+
+                    if len(matches) != 1:
+                        raise ApplicationError(
+                            "SSH_REMOTE_STORAGE_NOT_FOUND",
+                            "selected remote storage is not exposed by the receiver",
+                        )
+
+                    remote = matches[0]
+                    free_bytes = remote["free_bytes"]
+                    total_bytes = remote["total_bytes"]
+                    ready = remote.get("ready") is True
+
+                    free_percent = None
+                    reserve_ok = False
+
+                    if (
+                        ready
+                        and isinstance(free_bytes, int)
+                        and isinstance(total_bytes, int)
+                        and total_bytes > 0
+                    ):
+                        free_percent = (
+                            free_bytes * 100.0 / total_bytes
+                        )
+                        reserve_ok = (
+                            free_bytes >= value.minimum_free_bytes
+                            and free_percent >= value.minimum_free_percent
+                        )
+
+                    return {
+                        "ok": ready and reserve_ok,
+                        "storage_type": "SSH",
+                        "host": value.ssh_host,
+                        "port": value.ssh_port,
+                        "user": value.ssh_user,
+                        "remote_storage_id": value.remote_storage_id,
+                        "remote_storage_name": remote["name"],
+                        "authenticated": True,
+                        "host_key_verified": True,
+                        "ready": ready,
+                        "free_bytes": free_bytes,
+                        "total_bytes": total_bytes,
+                        "free_percent": free_percent,
+                        "minimum_free_bytes": value.minimum_free_bytes,
+                        "minimum_free_percent": value.minimum_free_percent,
+                        "remote_required_reserve_bytes":
+                            remote["required_reserve_bytes"],
+                        "remote_usable_after_reserve_bytes":
+                            remote["usable_after_reserve_bytes"],
+                    }
+
                 if self.ssh_preflight_client is None:
                     raise ApplicationError(
                         "SSH_PREFLIGHT_UNAVAILABLE",
@@ -656,6 +933,34 @@ class VmbackupApplication:
     def ssh_identity_rotate(self, destination_id=None):
         target = self._ssh_identity_target(destination_id)
         return self.ssh_identity_manager.rotate(target)
+
+    def _require_ssh_known_hosts_manager(self):
+        if self.ssh_known_hosts_manager is None:
+            raise ApplicationError(
+                "SSH_HOSTKEY_UNAVAILABLE",
+                "SSH known_hosts manager is not configured",
+            )
+
+        return self.ssh_known_hosts_manager
+
+    def ssh_hostkey_endpoint_show(self, host, port):
+        return self._require_ssh_known_hosts_manager().show(
+            host,
+            port,
+        )
+
+    def ssh_hostkey_endpoint_add(self, host, port, key):
+        return self._require_ssh_known_hosts_manager().add(
+            host,
+            port,
+            key,
+        )
+
+    def ssh_hostkey_endpoint_revoke(self, host, port):
+        return self._require_ssh_known_hosts_manager().revoke(
+            host,
+            port,
+        )
 
     def _require_ssh_hostkey_destination(self, destination_id):
         destination = self.repository.get_storage_destination(

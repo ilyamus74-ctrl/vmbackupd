@@ -192,10 +192,48 @@
         <label>Remote user
           <input id="storage-ssh-user" value="vmbackupd-transfer" autocomplete="off">
         </label>
-        <label class="path-field">Remote destination path
-          <input id="storage-ssh-remote-root">
-          <small>Final backup root on the remote receiver.</small>
-        </label>
+        <div class="ssh-discovery-panel">
+          <p id="storage-ssh-trust-status"
+             class="form-note"
+             role="status">
+            Host trust has not been checked.
+          </p>
+
+          <label>Receiver host public key
+            <input id="storage-ssh-hostkey"
+                   autocomplete="off"
+                   placeholder="ssh-ed25519 AAAA...">
+            <small>
+              Required only when this host and port are not already trusted.
+            </small>
+          </label>
+
+          <div class="dialog-actions">
+            <button id="storage-ssh-trust-key"
+                    type="button">
+              Trust host key
+            </button>
+
+            <button id="storage-ssh-check"
+                    type="button">
+              Check connection
+            </button>
+          </div>
+
+          <label>Remote storage
+            <select id="storage-ssh-remote-storage"
+                    disabled>
+              <option value="">
+                Check connection first
+              </option>
+            </select>
+          </label>
+
+          <p id="storage-ssh-discovery-result"
+             class="probe-result"
+             role="status"
+             hidden></p>
+        </div>
       </div>
 
       <p id="storage-type-note" class="form-note" hidden>Destination type cannot be changed after creation. Create a new destination to switch between Local and SSH.</p>

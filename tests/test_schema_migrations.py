@@ -54,6 +54,7 @@ def drop_v10_storage_transport(connection):
     )
 
     for column in (
+        "remote_storage_id",
         "ssh_remote_root",
         "ssh_user",
         "ssh_port",
@@ -470,7 +471,7 @@ def test_v5_to_v6_adds_durable_reclaim_journal_without_data_loss(tmp_path):
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 10
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION
     assert {
         "reclaim_operations",
         "reclaim_chains",
@@ -563,7 +564,7 @@ def test_v6_to_v7_adds_recovery_provenance_without_data_loss(tmp_path):
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 10
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION
     assert "recovery_from_state" in table_columns(
         migrated.connection,
         "reclaim_operations",
@@ -776,7 +777,7 @@ def test_v7_to_v8_adds_bundle_purging_state_without_data_loss(
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 10
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION
 
     bundle_sql = migrated.connection.execute(
         """SELECT sql
@@ -942,7 +943,7 @@ def test_v8_to_v9_adds_calendar_schedule_without_changing_interval_cursor(
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 10
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION
 
     columns = table_columns(
         migrated.connection,
@@ -1014,7 +1015,7 @@ def test_v9_to_v10_adds_ssh_transport_identity_without_changing_existing_storage
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 10
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION
 
     columns = table_columns(
         migrated.connection,
@@ -1066,5 +1067,148 @@ def test_v9_to_v10_adds_ssh_transport_identity_without_changing_existing_storage
             "PRAGMA foreign_key_check"
         )
     ) == []
+
+    migrated.close()
+
+
+def test_v10_to_v11_adds_stable_remote_storage_identity_without_data_loss(
+    tmp_path,
+):
+    import sqlite3
+
+    from vmbackupd.models import (
+        Node,
+        StorageDestination,
+        StorageType,
+    )
+    from vmbackupd.repository import SQLiteRepository
+    from vmbackupd.schema import (
+        CURRENT_SCHEMA_VERSION,
+        VERSION_10_STORAGE_IDENTITY_TRIGGER_SQL,
+        VERSION_10_STORAGE_TRANSPORT_TRIGGER_STATEMENTS,
+    )
+
+    path = tmp_path / "v10-to-v11.db"
+
+    # Build real current data first, then restore the exact v10 shape.
+    repository = SQLiteRepository(path)
+
+    node = Node(name="v10-migration-node")
+    repository.add_node(node)
+
+    local = StorageDestination(
+        name="local-root",
+        backup_data_root=str(tmp_path / "local"),
+        node_id=node.id,
+        is_default=True,
+    )
+    repository.add_storage_destination(local)
+
+    legacy_ssh = StorageDestination(
+        name="legacy-ssh",
+        backup_data_root=str(tmp_path / "legacy-staging"),
+        node_id=node.id,
+        storage_type=StorageType.SSH,
+        ssh_host="backup.example.test",
+        ssh_port=22022,
+        ssh_user="vmbackupd-transfer",
+        ssh_remote_root="/srv/vmbackupd",
+    )
+    repository.add_storage_destination(legacy_ssh)
+
+    repository.close()
+
+    connection = sqlite3.connect(path)
+
+    for trigger in (
+        "storage_destination_transport_contract_insert",
+        "storage_destination_transport_contract_update",
+        "storage_destination_identity_immutable_after_run",
+    ):
+        connection.execute(
+            f"DROP TRIGGER {trigger}"
+        )
+
+    connection.execute(
+        "ALTER TABLE storage_destinations "
+        "DROP COLUMN remote_storage_id"
+    )
+
+    for statement in (
+        VERSION_10_STORAGE_TRANSPORT_TRIGGER_STATEMENTS
+    ):
+        connection.execute(statement)
+
+    connection.execute(
+        VERSION_10_STORAGE_IDENTITY_TRIGGER_SQL
+    )
+
+    connection.execute(
+        "UPDATE schema_version SET version = 10 WHERE id = 1"
+    )
+
+    connection.commit()
+    connection.close()
+
+    # Opening through the normal repository must perform 10 -> 11.
+    migrated = SQLiteRepository(path)
+
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION
+    assert CURRENT_SCHEMA_VERSION == 11
+
+    columns = {
+        row[1]
+        for row in migrated.connection.execute(
+            "PRAGMA table_info(storage_destinations)"
+        )
+    }
+
+    assert "remote_storage_id" in columns
+
+    migrated_local = migrated.get_storage_destination(
+        node.id,
+        local.id,
+    )
+
+    assert migrated_local.storage_type is StorageType.LOCAL
+    assert migrated_local.remote_storage_id is None
+    assert migrated_local.ssh_remote_root is None
+
+    migrated_legacy = migrated.get_storage_destination(
+        node.id,
+        legacy_ssh.id,
+    )
+
+    # Existing SSH configuration survives package migration unchanged.
+    assert migrated_legacy.storage_type is StorageType.SSH
+    assert migrated_legacy.ssh_host == "backup.example.test"
+    assert migrated_legacy.ssh_port == 22022
+    assert migrated_legacy.ssh_user == "vmbackupd-transfer"
+    assert migrated_legacy.ssh_remote_root == "/srv/vmbackupd"
+    assert migrated_legacy.remote_storage_id is None
+
+    # New v11 contract uses the stable remote storage ID and no path.
+    stable_id = (
+        "540459e8-2555-43eb-8527-99853ba96ea7"
+    )
+
+    modern = StorageDestination(
+        name="modern-ssh",
+        backup_data_root=str(tmp_path / "modern-staging"),
+        node_id=node.id,
+        storage_type=StorageType.SSH,
+        ssh_host="receiver.example.test",
+        ssh_port=22022,
+        ssh_user="vmbackupd-transfer",
+        ssh_remote_root=None,
+        remote_storage_id=stable_id,
+    )
+
+    created = migrated.create_storage_destination(
+        modern,
+    )
+
+    assert created.remote_storage_id == stable_id
+    assert created.ssh_remote_root is None
 
     migrated.close()

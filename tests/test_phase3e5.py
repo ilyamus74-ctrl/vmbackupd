@@ -87,6 +87,7 @@ def version_one_database(path):
         "DROP TRIGGER storage_destination_identity_immutable_after_run"
     )
     for column in (
+        "remote_storage_id",
         "ssh_remote_root",
         "ssh_user",
         "ssh_port",

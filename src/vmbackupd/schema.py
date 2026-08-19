@@ -9,7 +9,7 @@ import sqlite3
 from collections.abc import Callable, Mapping
 
 
-CURRENT_SCHEMA_VERSION = 10
+CURRENT_SCHEMA_VERSION = 11
 
 
 class SchemaError(RuntimeError):
@@ -197,6 +197,11 @@ CURRENT_SCHEMA_STATEMENTS = (
                     AND substr(ssh_remote_root, 1, 1) = '/'
                 )
             ),
+        remote_storage_id TEXT
+            CHECK(
+                remote_storage_id IS NULL
+                OR length(trim(remote_storage_id)) > 0
+            ),
         UNIQUE(node_id, name)
     )""",
     """CREATE TABLE backup_jobs (
@@ -343,6 +348,7 @@ CURRENT_SCHEMA_STATEMENTS = (
                     OR NEW.ssh_port IS NOT NULL
                     OR NEW.ssh_user IS NOT NULL
                     OR NEW.ssh_remote_root IS NOT NULL
+                    OR NEW.remote_storage_id IS NOT NULL
                 )
             )
             OR (
@@ -355,16 +361,27 @@ CURRENT_SCHEMA_STATEMENTS = (
                     OR NEW.ssh_port > 65535
                     OR NEW.ssh_user IS NULL
                     OR length(trim(NEW.ssh_user)) = 0
-                    OR NEW.ssh_remote_root IS NULL
-                    OR length(trim(NEW.ssh_remote_root)) = 0
-                    OR substr(NEW.ssh_remote_root, 1, 1) != '/'
+                    OR NOT (
+                        (
+                            NEW.remote_storage_id IS NOT NULL
+                            AND length(trim(NEW.remote_storage_id)) > 0
+                            AND NEW.ssh_remote_root IS NULL
+                        )
+                        OR
+                        (
+                            NEW.remote_storage_id IS NULL
+                            AND NEW.ssh_remote_root IS NOT NULL
+                            AND length(trim(NEW.ssh_remote_root)) > 0
+                            AND substr(NEW.ssh_remote_root, 1, 1) = '/'
+                        )
+                    )
                 )
             )
         BEGIN
             SELECT RAISE(ABORT, 'storage destination transport contract invalid');
         END""",
     """CREATE TRIGGER storage_destination_transport_contract_update
-        BEFORE UPDATE OF storage_type, ssh_host, ssh_port, ssh_user, ssh_remote_root
+        BEFORE UPDATE OF storage_type, ssh_host, ssh_port, ssh_user, ssh_remote_root, remote_storage_id
         ON storage_destinations
         WHEN
             NEW.storage_type IS NULL
@@ -376,6 +393,7 @@ CURRENT_SCHEMA_STATEMENTS = (
                     OR NEW.ssh_port IS NOT NULL
                     OR NEW.ssh_user IS NOT NULL
                     OR NEW.ssh_remote_root IS NOT NULL
+                    OR NEW.remote_storage_id IS NOT NULL
                 )
             )
             OR (
@@ -388,9 +406,20 @@ CURRENT_SCHEMA_STATEMENTS = (
                     OR NEW.ssh_port > 65535
                     OR NEW.ssh_user IS NULL
                     OR length(trim(NEW.ssh_user)) = 0
-                    OR NEW.ssh_remote_root IS NULL
-                    OR length(trim(NEW.ssh_remote_root)) = 0
-                    OR substr(NEW.ssh_remote_root, 1, 1) != '/'
+                    OR NOT (
+                        (
+                            NEW.remote_storage_id IS NOT NULL
+                            AND length(trim(NEW.remote_storage_id)) > 0
+                            AND NEW.ssh_remote_root IS NULL
+                        )
+                        OR
+                        (
+                            NEW.remote_storage_id IS NULL
+                            AND NEW.ssh_remote_root IS NOT NULL
+                            AND length(trim(NEW.ssh_remote_root)) > 0
+                            AND substr(NEW.ssh_remote_root, 1, 1) = '/'
+                        )
+                    )
                 )
             )
         BEGIN
@@ -399,7 +428,7 @@ CURRENT_SCHEMA_STATEMENTS = (
     """CREATE TRIGGER storage_destination_identity_immutable_after_run
         BEFORE UPDATE OF node_id, backup_data_root, storage_type,
                          ssh_host, ssh_port, ssh_user, ssh_remote_root,
-                         backup_data_mode, backup_data_uid, backup_data_gid
+                         remote_storage_id, backup_data_mode, backup_data_uid, backup_data_gid
         ON storage_destinations
         WHEN EXISTS (
             SELECT 1 FROM job_runs WHERE storage_destination_id = OLD.id
@@ -411,6 +440,7 @@ CURRENT_SCHEMA_STATEMENTS = (
             NEW.ssh_port IS NOT OLD.ssh_port OR
             NEW.ssh_user IS NOT OLD.ssh_user OR
             NEW.ssh_remote_root IS NOT OLD.ssh_remote_root OR
+            NEW.remote_storage_id IS NOT OLD.remote_storage_id OR
             NEW.backup_data_mode IS NOT OLD.backup_data_mode OR
             NEW.backup_data_uid IS NOT OLD.backup_data_uid OR
             NEW.backup_data_gid IS NOT OLD.backup_data_gid
@@ -426,7 +456,7 @@ CURRENT_COLUMNS = {
     "vms": {"id", "node_id", "name", "external_id", "libvirt_domain_uuid", "created_at"},
     "storage_destinations": {"id", "node_id", "name", "backup_data_root",
                              "storage_type", "ssh_host", "ssh_port", "ssh_user",
-                             "ssh_remote_root",
+                             "ssh_remote_root", "remote_storage_id",
                              "backup_data_mode", "backup_data_uid", "backup_data_gid",
                              "minimum_free_bytes", "minimum_free_percent", "is_default",
                              "created_at"},
@@ -483,8 +513,15 @@ CURRENT_COLUMNS = {
     },
 }
 
-VERSION_9_COLUMNS = {
+VERSION_10_COLUMNS = {
     name: set(columns) for name, columns in CURRENT_COLUMNS.items()
+}
+VERSION_10_COLUMNS["storage_destinations"].remove(
+    "remote_storage_id"
+)
+
+VERSION_9_COLUMNS = {
+    name: set(columns) for name, columns in VERSION_10_COLUMNS.items()
 }
 VERSION_9_COLUMNS["storage_destinations"] -= {
     "storage_type",
@@ -604,6 +641,97 @@ VERSION_4_TO_9_REQUIRED_TRIGGERS = VERSION_2_TRIGGERS | {
 DESTINATION_TRIGGER_STATEMENTS = CURRENT_SCHEMA_STATEMENTS[-6:-3]
 STORAGE_TRANSPORT_TRIGGER_STATEMENTS = CURRENT_SCHEMA_STATEMENTS[-3:-1]
 STORAGE_IDENTITY_TRIGGER_SQL = CURRENT_SCHEMA_STATEMENTS[-1]
+
+VERSION_10_STORAGE_TRANSPORT_TRIGGER_STATEMENTS = (
+    """CREATE TRIGGER storage_destination_transport_contract_insert
+        BEFORE INSERT ON storage_destinations
+        WHEN
+            NEW.storage_type IS NULL
+            OR NEW.storage_type NOT IN ('LOCAL', 'SSH')
+            OR (
+                NEW.storage_type = 'LOCAL'
+                AND (
+                    NEW.ssh_host IS NOT NULL
+                    OR NEW.ssh_port IS NOT NULL
+                    OR NEW.ssh_user IS NOT NULL
+                    OR NEW.ssh_remote_root IS NOT NULL
+                )
+            )
+            OR (
+                NEW.storage_type = 'SSH'
+                AND (
+                    NEW.ssh_host IS NULL
+                    OR length(trim(NEW.ssh_host)) = 0
+                    OR NEW.ssh_port IS NULL
+                    OR NEW.ssh_port < 1
+                    OR NEW.ssh_port > 65535
+                    OR NEW.ssh_user IS NULL
+                    OR length(trim(NEW.ssh_user)) = 0
+                    OR NEW.ssh_remote_root IS NULL
+                    OR length(trim(NEW.ssh_remote_root)) = 0
+                    OR substr(NEW.ssh_remote_root, 1, 1) != '/'
+                )
+            )
+        BEGIN
+            SELECT RAISE(ABORT, 'storage destination transport contract invalid');
+        END""",
+    """CREATE TRIGGER storage_destination_transport_contract_update
+        BEFORE UPDATE OF storage_type, ssh_host, ssh_port, ssh_user, ssh_remote_root
+        ON storage_destinations
+        WHEN
+            NEW.storage_type IS NULL
+            OR NEW.storage_type NOT IN ('LOCAL', 'SSH')
+            OR (
+                NEW.storage_type = 'LOCAL'
+                AND (
+                    NEW.ssh_host IS NOT NULL
+                    OR NEW.ssh_port IS NOT NULL
+                    OR NEW.ssh_user IS NOT NULL
+                    OR NEW.ssh_remote_root IS NOT NULL
+                )
+            )
+            OR (
+                NEW.storage_type = 'SSH'
+                AND (
+                    NEW.ssh_host IS NULL
+                    OR length(trim(NEW.ssh_host)) = 0
+                    OR NEW.ssh_port IS NULL
+                    OR NEW.ssh_port < 1
+                    OR NEW.ssh_port > 65535
+                    OR NEW.ssh_user IS NULL
+                    OR length(trim(NEW.ssh_user)) = 0
+                    OR NEW.ssh_remote_root IS NULL
+                    OR length(trim(NEW.ssh_remote_root)) = 0
+                    OR substr(NEW.ssh_remote_root, 1, 1) != '/'
+                )
+            )
+        BEGIN
+            SELECT RAISE(ABORT, 'storage destination transport contract invalid');
+        END""",
+)
+
+VERSION_10_STORAGE_IDENTITY_TRIGGER_SQL = """CREATE TRIGGER storage_destination_identity_immutable_after_run
+        BEFORE UPDATE OF node_id, backup_data_root, storage_type,
+                         ssh_host, ssh_port, ssh_user, ssh_remote_root,
+                         backup_data_mode, backup_data_uid, backup_data_gid
+        ON storage_destinations
+        WHEN EXISTS (
+            SELECT 1 FROM job_runs WHERE storage_destination_id = OLD.id
+        ) AND (
+            NEW.node_id IS NOT OLD.node_id OR
+            NEW.backup_data_root IS NOT OLD.backup_data_root OR
+            NEW.storage_type IS NOT OLD.storage_type OR
+            NEW.ssh_host IS NOT OLD.ssh_host OR
+            NEW.ssh_port IS NOT OLD.ssh_port OR
+            NEW.ssh_user IS NOT OLD.ssh_user OR
+            NEW.ssh_remote_root IS NOT OLD.ssh_remote_root OR
+            NEW.backup_data_mode IS NOT OLD.backup_data_mode OR
+            NEW.backup_data_uid IS NOT OLD.backup_data_uid OR
+            NEW.backup_data_gid IS NOT OLD.backup_data_gid
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'storage destination physical identity is immutable');
+        END"""
 
 VERSION_4_TO_9_STORAGE_IDENTITY_TRIGGER_SQL = """CREATE TRIGGER
         storage_destination_identity_immutable_after_run
@@ -932,33 +1060,41 @@ def validate_current_schema(connection: sqlite3.Connection) -> None:
     invalid_transport = connection.execute(
         """SELECT 1
            FROM storage_destinations
-           WHERE
-               storage_type IS NULL
-               OR storage_type NOT IN ('LOCAL', 'SSH')
-               OR (
-                   storage_type = 'LOCAL'
-                   AND (
-                       ssh_host IS NOT NULL
-                       OR ssh_port IS NOT NULL
-                       OR ssh_user IS NOT NULL
-                       OR ssh_remote_root IS NOT NULL
+           WHERE (
+               storage_type = 'LOCAL'
+               AND (
+                   ssh_host IS NOT NULL
+                   OR ssh_port IS NOT NULL
+                   OR ssh_user IS NOT NULL
+                   OR ssh_remote_root IS NOT NULL
+                   OR remote_storage_id IS NOT NULL
+               )
+           )
+           OR (
+               storage_type = 'SSH'
+               AND (
+                   ssh_host IS NULL
+                   OR length(trim(ssh_host)) = 0
+                   OR ssh_port IS NULL
+                   OR ssh_port < 1
+                   OR ssh_port > 65535
+                   OR ssh_user IS NULL
+                   OR length(trim(ssh_user)) = 0
+                   OR NOT (
+                       (
+                           remote_storage_id IS NOT NULL
+                           AND length(trim(remote_storage_id)) > 0
+                           AND ssh_remote_root IS NULL
+                       )
+                       OR (
+                           remote_storage_id IS NULL
+                           AND ssh_remote_root IS NOT NULL
+                           AND length(trim(ssh_remote_root)) > 0
+                           AND substr(ssh_remote_root, 1, 1) = '/'
+                       )
                    )
                )
-               OR (
-                   storage_type = 'SSH'
-                   AND (
-                       ssh_host IS NULL
-                       OR length(trim(ssh_host)) = 0
-                       OR ssh_port IS NULL
-                       OR ssh_port < 1
-                       OR ssh_port > 65535
-                       OR ssh_user IS NULL
-                       OR length(trim(ssh_user)) = 0
-                       OR ssh_remote_root IS NULL
-                       OR length(trim(ssh_remote_root)) = 0
-                       OR substr(ssh_remote_root, 1, 1) != '/'
-                   )
-               )
+           )
            LIMIT 1"""
     ).fetchone()
 
@@ -1399,8 +1535,38 @@ def migrate_9_to_10(connection: sqlite3.Connection) -> None:
         "DROP TRIGGER storage_destination_identity_immutable_after_run"
     )
 
+    for statement in VERSION_10_STORAGE_TRANSPORT_TRIGGER_STATEMENTS:
+        connection.execute(statement)
+    connection.execute(VERSION_10_STORAGE_IDENTITY_TRIGGER_SQL)
+
+
+def migrate_10_to_11(connection: sqlite3.Connection) -> None:
+    """Add stable receiver storage identity while preserving legacy SSH roots."""
+
+    _validate_fingerprint(connection, VERSION_10_COLUMNS)
+
+    connection.execute(
+        """ALTER TABLE storage_destinations
+           ADD COLUMN remote_storage_id TEXT
+           CHECK(
+               remote_storage_id IS NULL
+               OR length(trim(remote_storage_id)) > 0
+           )"""
+    )
+
+    connection.execute(
+        "DROP TRIGGER storage_destination_transport_contract_insert"
+    )
+    connection.execute(
+        "DROP TRIGGER storage_destination_transport_contract_update"
+    )
+    connection.execute(
+        "DROP TRIGGER storage_destination_identity_immutable_after_run"
+    )
+
     for statement in STORAGE_TRANSPORT_TRIGGER_STATEMENTS:
         connection.execute(statement)
+
     connection.execute(STORAGE_IDENTITY_TRIGGER_SQL)
 
 
@@ -1415,6 +1581,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     7: migrate_7_to_8,
     8: migrate_8_to_9,
     9: migrate_9_to_10,
+    10: migrate_10_to_11,
 }
 
 

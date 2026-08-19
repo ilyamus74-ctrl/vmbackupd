@@ -206,3 +206,63 @@ def test_storage_transport_identity_is_immutable_after_first_run():
     assert persisted.ssh_port == 3322
 
     repository.close()
+
+
+def test_current_schema_reopen_accepts_stable_remote_storage_identity(
+    tmp_path,
+):
+    from vmbackupd.models import (
+        Node,
+        StorageDestination,
+        StorageType,
+    )
+    from vmbackupd.repository import SQLiteRepository
+
+    path = tmp_path / "stable-remote-id.db"
+
+    repository = SQLiteRepository(path)
+
+    node = Node(name="local")
+    repository.add_node(node)
+
+    local = StorageDestination(
+        name="local-root",
+        backup_data_root="/var/lib/vmbackupd/local",
+        node_id=node.id,
+        is_default=True,
+    )
+    repository.add_storage_destination(local)
+
+    remote = StorageDestination(
+        name="stable-ssh",
+        backup_data_root="/var/lib/vmbackupd/staging/stable-ssh",
+        node_id=node.id,
+        storage_type=StorageType.SSH,
+        ssh_host="backup.example.test",
+        ssh_port=22022,
+        ssh_user="vmbackupd-transfer",
+        ssh_remote_root=None,
+        remote_storage_id="540459e8-2555-43eb-8527-99853ba96ea7",
+        is_default=False,
+    )
+    repository.add_storage_destination(remote)
+
+    repository.close()
+
+    # Regression: opening an already-v11 database used to fail here because
+    # the startup data validator still required legacy ssh_remote_root.
+    reopened = SQLiteRepository(path)
+
+    persisted = reopened.get_storage_destination(
+        node.id,
+        remote.id,
+    )
+
+    assert persisted.storage_type is StorageType.SSH
+    assert persisted.ssh_remote_root is None
+    assert (
+        persisted.remote_storage_id
+        == "540459e8-2555-43eb-8527-99853ba96ea7"
+    )
+
+    reopened.close()

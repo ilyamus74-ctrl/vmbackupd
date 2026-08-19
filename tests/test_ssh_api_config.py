@@ -616,3 +616,160 @@ def test_api_preserves_explicit_legacy_ssh_staging_path(tmp_path):
     assert created["backup_data_root"] == str(legacy)
 
     repository.close()
+
+
+class _RollbackStagingPreparer:
+    def __init__(self):
+        self.prepare_calls = []
+        self.remove_calls = []
+
+    def prepare_staging(self, path, seed_root):
+        from pathlib import Path
+
+        target = Path(path)
+        self.prepare_calls.append(
+            (str(target), str(seed_root))
+        )
+
+        target.parent.mkdir(
+            mode=0o750,
+            exist_ok=True,
+        )
+        target.mkdir(mode=0o750)
+
+        return {
+            "ok": True,
+            "kind": "SSH_STAGING",
+            "path": str(target),
+        }
+
+    def remove_staging(self, path, seed_root):
+        from pathlib import Path
+
+        target = Path(path)
+        self.remove_calls.append(
+            (str(target), str(seed_root))
+        )
+
+        try:
+            target.rmdir()
+            removed = True
+        except FileNotFoundError:
+            removed = False
+
+        return {
+            "ok": True,
+            "kind": "SSH_STAGING",
+            "path": str(target),
+            "removed": removed,
+        }
+
+
+def test_managed_ssh_staging_rolls_back_when_daemon_verification_fails(
+    tmp_path,
+):
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from vmbackupd.application import ApplicationError
+
+    repository, node, _, _ = catalog(tmp_path)
+    preparer = _RollbackStagingPreparer()
+
+    app = application_for(
+        repository,
+        node,
+        storage_preparer=preparer,
+    )
+
+    app.storage_tester = SimpleNamespace(
+        test=lambda *args, **kwargs: {
+            "backup_data_root_exists": True,
+            "backup_data_root_writable": False,
+            "errors": ["permission denied"],
+        }
+    )
+
+    with pytest.raises(ApplicationError) as caught:
+        app.dispatch(
+            "storage.create",
+            {
+                "name": "verify-failure",
+                "storage_type": "SSH",
+                "ssh_host": "backup.example.test",
+                "ssh_port": 22022,
+                "ssh_user": "vmbackupd-transfer",
+                "ssh_remote_root": "/srv/vmbackupd",
+            },
+        )
+
+    assert caught.value.code == "SSH_STAGING_PREPARE_FAILED"
+
+    assert len(preparer.prepare_calls) == 1
+    assert len(preparer.remove_calls) == 1
+
+    staging = Path(
+        preparer.prepare_calls[0][0]
+    )
+    assert staging.exists() is False
+
+    assert (
+        repository.get_storage_destination_by_name(
+            node.id,
+            "verify-failure",
+        )
+        is None
+    )
+
+    repository.close()
+
+
+def test_managed_ssh_staging_rolls_back_when_post_prepare_validation_fails(
+    tmp_path,
+):
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from vmbackupd.application import ApplicationError
+
+    repository, node, _, _ = catalog(tmp_path)
+    preparer = _RollbackStagingPreparer()
+
+    app = application_for(
+        repository,
+        node,
+        storage_preparer=preparer,
+    )
+
+    app.storage_tester = SimpleNamespace(
+        test=lambda *args, **kwargs: {
+            "backup_data_root_exists": True,
+            "backup_data_root_writable": True,
+            "errors": [],
+        }
+    )
+
+    with pytest.raises(ApplicationError) as caught:
+        app.dispatch(
+            "storage.create",
+            {
+                "name": "   ",
+                "storage_type": "SSH",
+                "ssh_host": "backup.example.test",
+                "ssh_port": 22022,
+                "ssh_user": "vmbackupd-transfer",
+                "ssh_remote_root": "/srv/vmbackupd",
+            },
+        )
+
+    assert caught.value.code == "INVALID_PARAMS"
+
+    assert len(preparer.prepare_calls) == 1
+    assert len(preparer.remove_calls) == 1
+
+    staging = Path(
+        preparer.prepare_calls[0][0]
+    )
+    assert staging.exists() is False
+
+    repository.close()
