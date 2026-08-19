@@ -78,6 +78,8 @@ install -Dpm 0755 packaging/receiver/vmbackupd-receiver-session \
     %{buildroot}%{_libexecdir}/vmbackupd-receiver-session
 install -Dpm 0755 packaging/receiver/vmbackupd-receiver-catalog \
     %{buildroot}%{_libexecdir}/vmbackupd-receiver-catalog
+install -Dpm 0755 packaging/receiver/vmbackupd-receiver-resolver \
+    %{buildroot}%{_libexecdir}/vmbackupd-receiver-resolver
 install -Dpm 0755 packaging/receiver/vmbackupd-receiver-hostkey \
     %{buildroot}%{_libexecdir}/vmbackupd-receiver-hostkey
 
@@ -93,6 +95,10 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-catalog.socket \
     %{buildroot}%{_unitdir}/vmbackupd-receiver-catalog.socket
 install -Dpm 0644 packaging/receiver/vmbackupd-receiver-catalog@.service \
     %{buildroot}%{_unitdir}/vmbackupd-receiver-catalog@.service
+install -Dpm 0644 packaging/receiver/vmbackupd-receiver-resolver.socket \
+    %{buildroot}%{_unitdir}/vmbackupd-receiver-resolver.socket
+install -Dpm 0644 packaging/receiver/vmbackupd-receiver-resolver@.service \
+    %{buildroot}%{_unitdir}/vmbackupd-receiver-resolver@.service
 
 %pre
 %sysusers_create_compat %{SOURCE2}
@@ -103,6 +109,7 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-catalog@.service \
 %systemd_post vmbackupd-storage-helper.socket
 %systemd_post vmbackupd-receiver-sshd.service
 %systemd_post vmbackupd-receiver-catalog.socket
+%systemd_post vmbackupd-receiver-resolver.socket
 
 %tmpfiles_create %{_tmpfilesdir}/vmbackupd.conf
 %tmpfiles_create %{_tmpfilesdir}/vmbackupd-receiver.conf
@@ -112,12 +119,14 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-catalog@.service \
 %systemd_preun vmbackupd-storage-helper.socket
 %systemd_preun vmbackupd-receiver-sshd.service
 %systemd_preun vmbackupd-receiver-catalog.socket
+%systemd_preun vmbackupd-receiver-resolver.socket
 
 %postun
 %systemd_postun vmbackupd.service
 %systemd_postun vmbackupd-storage-helper.socket
 %systemd_postun vmbackupd-receiver-sshd.service
 %systemd_postun vmbackupd-receiver-catalog.socket
+%systemd_postun vmbackupd-receiver-resolver.socket
 
 %files -f %{pyproject_files}
 %doc docs/*.md
@@ -134,6 +143,8 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-catalog@.service \
 %{_unitdir}/vmbackupd-receiver-sshd.service
 %{_unitdir}/vmbackupd-receiver-catalog.socket
 %{_unitdir}/vmbackupd-receiver-catalog@.service
+%{_unitdir}/vmbackupd-receiver-resolver.socket
+%{_unitdir}/vmbackupd-receiver-resolver@.service
 
 %{_sysusersdir}/vmbackupd.conf
 %{_sysusersdir}/vmbackupd-receiver.conf
@@ -146,6 +157,7 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-catalog@.service \
 %{_libexecdir}/vmbackupd-transfer-shell
 %{_libexecdir}/vmbackupd-receiver-session
 %{_libexecdir}/vmbackupd-receiver-catalog
+%{_libexecdir}/vmbackupd-receiver-resolver
 %{_libexecdir}/vmbackupd-receiver-hostkey
 
 %{_datadir}/cockpit/vmbackupd/

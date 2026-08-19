@@ -142,6 +142,7 @@ def test_receiver_scripts_are_root_owned_package_payloads():
         "vmbackupd-transfer-shell",
         "vmbackupd-receiver-session",
         "vmbackupd-receiver-catalog",
+        "vmbackupd-receiver-resolver",
     ):
         path = RECEIVER / name
         assert path.exists()
@@ -267,4 +268,78 @@ def test_receiver_catalog_is_part_of_unified_package():
     assert (
         "%systemd_postun vmbackupd-receiver-catalog.socket"
         in spec
+    )
+
+
+def test_receiver_resolver_bridge_is_internal_and_socket_activated():
+    socket_unit = text(
+        RECEIVER /
+        "vmbackupd-receiver-resolver.socket"
+    )
+    service = text(
+        RECEIVER /
+        "vmbackupd-receiver-resolver@.service"
+    )
+    sshd_service = text(
+        RECEIVER /
+        "vmbackupd-receiver-sshd.service"
+    )
+    spec = text(
+        PACKAGING /
+        "vmbackupd.spec"
+    )
+
+    assert (
+        "ListenStream=/run/"
+        "vmbackupd-receiver-resolver.sock"
+        in socket_unit
+    )
+    assert "Accept=yes" in socket_unit
+    assert (
+        "SocketUser=vmbackupd-transfer"
+        in socket_unit
+    )
+    assert (
+        "SocketGroup=vmbackupd-transfer"
+        in socket_unit
+    )
+    assert "SocketMode=0600" in socket_unit
+
+    assert "User=vmbackupd" in service
+    assert "Group=vmbackupd" in service
+    assert (
+        "SupplementaryGroups=qemu"
+        in service
+    )
+    assert "PrivateNetwork=yes" in service
+    assert (
+        "RestrictAddressFamilies=AF_UNIX"
+        in service
+    )
+    assert "CapabilityBoundingSet=" in service
+
+    assert (
+        "vmbackupd-receiver-resolver.socket"
+        in sshd_service
+    )
+
+    assert (
+        "packaging/receiver/"
+        "vmbackupd-receiver-resolver"
+        in spec
+    )
+    assert (
+        "%{_libexecdir}/"
+        "vmbackupd-receiver-resolver"
+        in spec
+    )
+
+    # The transfer identity never receives the daemon admin group.
+    assert (
+        "vmbackupd-admin"
+        not in socket_unit
+    )
+    assert (
+        "User=vmbackupd-transfer"
+        not in service
     )
