@@ -822,15 +822,48 @@ class LibvirtPlanningService:
             vm = self.repository.bind_libvirt_domain_uuid(vm.id, domain_uuid)
         inventory = parse_domain_disks(domain_xml)
 
-        checkpoint_to_create = (
-            checkpoint_name(run.id) if job.backup_policy.max_incrementals_per_chain > 0 else None
-        )
         incremental_base: str | None = None
         if run.planned_kind is BackupKind.INCREMENTAL:
-            if run.parent_restore_point_id is not None:
-                incremental_base = self.repository.get_restore_point(
-                    run.parent_restore_point_id
-                ).libvirt_checkpoint_name
+            parent = (
+                self.repository.get_restore_point(run.parent_restore_point_id)
+                if run.parent_restore_point_id is not None
+                else None
+            )
+            incremental_base = (
+                parent.libvirt_checkpoint_name if parent is not None else None
+            )
+
+            if not incremental_base:
+                run = self.repository.replan_incremental_as_full(
+                    run.id,
+                    "incremental parent has no persisted libvirt checkpoint",
+                )
+                incremental_base = None
+            else:
+                try:
+                    current_checkpoints = self.driver.checkpoint_names(
+                        vm.external_id
+                    )
+                except Exception as exc:
+                    return PreflightResult((PreflightIssue(
+                        "INSPECTION_FAILED",
+                        f"checkpoint inspection failed: {exc}",
+                    ),))
+
+                if incremental_base not in current_checkpoints:
+                    run = self.repository.replan_incremental_as_full(
+                        run.id,
+                        "incremental base checkpoint "
+                        f"{incremental_base} is absent from libvirt",
+                    )
+                    incremental_base = None
+
+        checkpoint_to_create = (
+            checkpoint_name(run.id)
+            if job.backup_policy.max_incrementals_per_chain > 0
+            else None
+        )
+        if run.planned_kind is BackupKind.INCREMENTAL:
             checkpoint_to_create = checkpoint_name(run.id)
 
         artifacts: list[BackupArtifact] = []

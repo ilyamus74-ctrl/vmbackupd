@@ -1304,6 +1304,108 @@ class SQLiteRepository:
             )
         return self.get_run(run_id)
 
+    def replan_incremental_as_full(self, run_id: str, reason: str) -> JobRun:
+        """Replace an unmaterialized PREPARING incremental plan with a fresh FULL."""
+        run = self.get_run(run_id)
+        if run.state is not RunState.PREPARING:
+            raise DomainInvariantError("backup replanning requires PREPARING")
+        if run.planned_kind is not BackupKind.INCREMENTAL:
+            raise DomainInvariantError("only an INCREMENTAL plan can be replanned as FULL")
+        if run.planned_chain_id is None or run.parent_restore_point_id is None:
+            raise DomainInvariantError("incremental plan is incomplete")
+
+        reason = reason.strip()
+        if not reason:
+            raise DomainInvariantError("backup replanning requires a reason")
+
+        materialized = self.connection.execute(
+            """SELECT (
+                   EXISTS(
+                       SELECT 1 FROM backup_artifacts
+                       WHERE job_run_id = ?
+                   )
+                   OR EXISTS(
+                       SELECT 1 FROM run_disks
+                       WHERE run_id = ?
+                   )
+                   OR EXISTS(
+                       SELECT 1 FROM libvirt_backup_operations
+                       WHERE run_id = ?
+                   )
+                   OR EXISTS(
+                       SELECT 1 FROM reclaim_operations
+                       WHERE job_run_id = ?
+                   )
+               ) AS present""",
+            (run_id, run_id, run_id, run_id),
+        ).fetchone()
+        if materialized is not None and bool(materialized["present"]):
+            raise DomainInvariantError(
+                "incremental plan cannot be replanned after execution materialization"
+            )
+
+        job = self.get_job(run.job_id)
+        chain = self.connection.execute(
+            """SELECT vm_id, status
+               FROM backup_chains
+               WHERE id = ?""",
+            (run.planned_chain_id,),
+        ).fetchone()
+        if (
+            chain is None
+            or chain["vm_id"] != job.vm_id
+            or BackupChainStatus(chain["status"]) is not BackupChainStatus.ACTIVE
+        ):
+            raise DomainInvariantError(
+                "incremental plan no longer references the active VM chain"
+            )
+
+        latest = self.connection.execute(
+            """SELECT id
+               FROM restore_points
+               WHERE chain_id = ?
+               ORDER BY sequence DESC
+               LIMIT 1""",
+            (run.planned_chain_id,),
+        ).fetchone()
+        if (
+            latest is None
+            or latest["id"] != run.parent_restore_point_id
+        ):
+            raise DomainInvariantError(
+                "incremental parent is no longer the latest restore point"
+            )
+
+        now = utcnow()
+        new_chain_id = new_id()
+
+        with self.connection:
+            updated = self.connection.execute(
+                """UPDATE job_runs
+                   SET planned_kind = 'FULL',
+                       planned_chain_id = ?,
+                       planned_sequence = 0,
+                       parent_restore_point_id = NULL,
+                       updated_at = ?
+                   WHERE id = ?
+                     AND state = 'PREPARING'
+                     AND planned_kind = 'INCREMENTAL'""",
+                (new_chain_id, now.isoformat(), run_id),
+            )
+            if updated.rowcount != 1:
+                raise DomainInvariantError(
+                    "incremental plan changed while replanning"
+                )
+
+            self._insert_event(Event(
+                job_run_id=run_id,
+                event_type="BACKUP_REPLANNED_FULL",
+                message=reason,
+                created_at=now,
+            ))
+
+        return self.get_run(run_id)
+
     def assign_run_chain(self, run_id: str, chain_id: str) -> None:
         """Validate an existing plan's chain; partial/ad-hoc planning is forbidden."""
         run = self.get_run(run_id)
