@@ -2460,8 +2460,8 @@ Current safety boundary:
     receiver source registry      YES
     receiver source key API       YES
     receiver source key CLI       YES
-    receiver OS/sshd integration  NO
-    SSH connection preflight      NO
+    receiver OS/sshd integration  YES
+    SSH connection preflight      YES
     replica topology/schema      YES
     job replica configuration     YES
     immutable run replica snapshot YES
