@@ -258,38 +258,131 @@ class VirshLibvirtDriver:
                 error="domjobinfo output has unknown Job type",
                 job_type=job_type, operation=operation,
             )
-        if job_type is DomainJobType.NONE:
+        terminal_types = {
+            DomainJobType.COMPLETED,
+            DomainJobType.FAILED,
+            DomainJobType.CANCELLED,
+        }
+
+        if (
+            job_type is DomainJobType.NONE
+            or job_type in terminal_types
+        ):
+            # A terminal domjobinfo result is not an active domain job.
+            # The caller must use inspect_completed_job() for durable
+            # completion evidence and outcome.
             return BackupInspection(
-                DomainJobState.NONE, raw_job_info=raw, job_type=job_type,
+                DomainJobState.NONE,
+                raw_job_info=raw,
+                job_type=job_type,
                 operation=operation,
             )
-        if job_type not in {DomainJobType.BOUNDED, DomainJobType.UNBOUNDED}:
+
+        if job_type not in {
+            DomainJobType.BOUNDED,
+            DomainJobType.UNBOUNDED,
+        }:
             return BackupInspection(
-                DomainJobState.UNKNOWN, raw_job_info=raw,
+                DomainJobState.UNKNOWN,
+                raw_job_info=raw,
                 error=f"current job has non-active type {job_type}",
-                job_type=job_type, operation=operation,
+                job_type=job_type,
+                operation=operation,
             )
+
         if operation is DomainJobOperation.UNKNOWN:
             return BackupInspection(
-                DomainJobState.UNKNOWN, raw_job_info=raw,
+                DomainJobState.UNKNOWN,
+                raw_job_info=raw,
                 error="active job operation is unknown",
-                job_type=job_type, operation=operation,
+                job_type=job_type,
+                operation=operation,
             )
+
         if operation is not DomainJobOperation.BACKUP:
             return BackupInspection(
-                DomainJobState.OTHER, raw_job_info=raw,
-                job_type=job_type, operation=operation,
+                DomainJobState.OTHER,
+                raw_job_info=raw,
+                job_type=job_type,
+                operation=operation,
             )
-        backup = self._virsh_result("backup-dumpxml", external_id)
-        if backup.returncode == 0 and _is_domainbackup_xml(backup.stdout):
+
+        backup = self._virsh_result(
+            "backup-dumpxml",
+            external_id,
+        )
+
+        if (
+            backup.returncode == 0
+            and _is_domainbackup_xml(
+                backup.stdout
+            )
+        ):
             return BackupInspection(
-                DomainJobState.BACKUP, backup_xml=backup.stdout.strip(), raw_job_info=raw,
-                job_type=job_type, operation=operation,
+                DomainJobState.BACKUP,
+                backup_xml=backup.stdout.strip(),
+                raw_job_info=raw,
+                job_type=job_type,
+                operation=operation,
             )
+
+        # Completion race:
+        #
+        # domjobinfo may observe an active BACKUP, while backup-dumpxml
+        # executes after that backup has already completed.  Re-read the
+        # active job once before declaring the external state uncertain.
+        #
+        # If it is now NONE/terminal, the caller can safely inspect the
+        # completed-job evidence.  If it is still active or ambiguous,
+        # remain fail-closed as UNKNOWN.
+        recheck = self._virsh_result(
+            "domjobinfo",
+            external_id,
+            "--rawstats",
+        )
+
+        recheck_raw = recheck.stdout.strip()
+
+        if recheck.returncode == 0:
+            recheck_fields = _parse_job_fields(
+                recheck_raw
+            )
+
+            recheck_type = _parse_job_type(
+                recheck_fields.get(
+                    "jobtype"
+                )
+            )
+
+            recheck_operation = _parse_job_operation(
+                recheck_fields.get(
+                    "operation"
+                )
+            )
+
+            if (
+                recheck_type is DomainJobType.NONE
+                or recheck_type in terminal_types
+            ):
+                return BackupInspection(
+                    DomainJobState.NONE,
+                    raw_job_info=(
+                        recheck_raw
+                        or raw
+                    ),
+                    job_type=recheck_type,
+                    operation=recheck_operation,
+                )
+
         return BackupInspection(
-            DomainJobState.UNKNOWN, raw_job_info=raw,
-            error=backup.stderr.strip() or "backup job XML unavailable or malformed",
-            job_type=job_type, operation=operation,
+            DomainJobState.UNKNOWN,
+            raw_job_info=raw,
+            error=(
+                backup.stderr.strip()
+                or "backup job XML unavailable or malformed"
+            ),
+            job_type=job_type,
+            operation=operation,
         )
 
     def inspect_completed_job(self, external_id: str) -> CompletedJobInspection:

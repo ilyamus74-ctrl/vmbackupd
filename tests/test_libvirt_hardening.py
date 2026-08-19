@@ -141,6 +141,12 @@ def test_uuid_mismatch_is_structured_and_never_rebinds():
       DomainJobState.BACKUP),
      ("Job type: Unbounded\nOperation: Backup\n", 0, "<domainbackup/>", 0,
       DomainJobState.BACKUP),
+     ("Job type: Completed\nOperation: Backup\n", 0, "", 1,
+      DomainJobState.NONE),
+     ("Job type: Failed\nOperation: Backup\n", 0, "", 1,
+      DomainJobState.NONE),
+     ("Job type: Cancelled\nOperation: Backup\n", 0, "", 1,
+      DomainJobState.NONE),
      ("Job type: Bounded\nOperation: Migration out\n", 0, "", 1,
       DomainJobState.OTHER),
      ("", 1, "", 1, DomainJobState.UNKNOWN),
@@ -421,3 +427,157 @@ def test_backing_transition_rejects_operation_uuid_mismatch():
     repository.connection.commit()
     with pytest.raises(DomainInvariantError, match="bound VM identity"):
         repository.transition_run(run.id, RunState.BACKING_UP)
+
+
+def test_backup_dumpxml_completion_race_rechecks_active_job():
+    prefix = (
+        "virsh",
+        "--readonly",
+        "--connect",
+        "qemu:///system",
+    )
+
+    job_command = (
+        *prefix,
+        "domjobinfo",
+        "guest",
+        "--rawstats",
+    )
+
+    backup_command = (
+        *prefix,
+        "backup-dumpxml",
+        "guest",
+    )
+
+    class SequenceRunner:
+        def __init__(self):
+            self.calls = []
+            self.responses = {
+                job_command: [
+                    (
+                        0,
+                        "Job type: Unbounded\n"
+                        "Operation: Backup\n",
+                        "",
+                    ),
+                    (
+                        0,
+                        "Job type: None\n",
+                        "",
+                    ),
+                ],
+                backup_command: [
+                    (
+                        1,
+                        "",
+                        "error: Domain backup job id not found: "
+                        "no domain backup job present",
+                    ),
+                ],
+            }
+
+        def run(
+            self,
+            argv,
+            *,
+            timeout=None,
+        ):
+            from vmbackupd.command import CommandResult
+
+            args = tuple(argv)
+            self.calls.append(
+                (
+                    args,
+                    timeout,
+                )
+            )
+
+            responses = self.responses.get(
+                args
+            )
+
+            if not responses:
+                return CommandResult(
+                    args,
+                    "",
+                    "unexpected command",
+                    1,
+                )
+
+            returncode, stdout, stderr = responses.pop(
+                0
+            )
+
+            return CommandResult(
+                args,
+                stdout,
+                stderr,
+                returncode,
+            )
+
+    runner = SequenceRunner()
+
+    inspection = VirshLibvirtDriver(
+        runner
+    ).inspect_backup(
+        "guest"
+    )
+
+    assert inspection.state is DomainJobState.NONE
+
+    assert [
+        call[0]
+        for call in runner.calls
+    ] == [
+        job_command,
+        backup_command,
+        job_command,
+    ]
+
+
+def test_backup_dumpxml_failure_stays_unknown_if_backup_is_still_active():
+    prefix = (
+        "virsh",
+        "--readonly",
+        "--connect",
+        "qemu:///system",
+    )
+
+    job_command = (
+        *prefix,
+        "domjobinfo",
+        "guest",
+        "--rawstats",
+    )
+
+    backup_command = (
+        *prefix,
+        "backup-dumpxml",
+        "guest",
+    )
+
+    runner = FakeCommandRunner({
+        job_command: (
+            0,
+            "Job type: Unbounded\n"
+            "Operation: Backup\n",
+            "",
+        ),
+        backup_command: (
+            1,
+            "",
+            "permission denied",
+        ),
+    })
+
+    inspection = VirshLibvirtDriver(
+        runner
+    ).inspect_backup(
+        "guest"
+    )
+
+    assert inspection.state is DomainJobState.UNKNOWN
+    assert "permission denied" in (
+        inspection.error or ""
+    )
