@@ -224,8 +224,7 @@ def _request(args):
                   "storage_destination_id": args.storage,
                   "storage_destination": args.storage_name,
                   "replica_destination_ids": args.replica or [],
-                  "max_incrementals_per_chain":
-                      max(0, args.retain - 1),
+                  "max_incrementals_per_chain": 0,
                   "restore_points_to_retain": args.retain,
                   "full_chains_to_retain": args.full_chains_to_retain,
                   "minimum_full_chains": args.minimum_full_chains,
@@ -250,7 +249,7 @@ def _request(args):
                   "max_incrementals_per_chain": (
                       None
                       if args.retain is None
-                      else max(0, args.retain - 1)
+                      else 0
                   ),
                   "restore_points_to_retain": args.retain,
                   "full_chains_to_retain": args.full_chains_to_retain,

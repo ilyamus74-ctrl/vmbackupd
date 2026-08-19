@@ -2139,10 +2139,7 @@
             name: document.getElementById("job-name").value.trim(),
             storage_destination_id: document.getElementById("job-storage").value,
             replica_destination_ids: selectedJobReplicaIds(),
-            max_incrementals_per_chain: Math.max(
-                0,
-                Number(document.getElementById("job-retain").value) - 1,
-            ),
+            max_incrementals_per_chain: 0,
             enabled: document.getElementById("job-enabled").checked,
             schedule_enabled: scheduleMode !== "manual",
             restore_points_to_retain: Number(document.getElementById("job-retain").value),

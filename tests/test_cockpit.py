@@ -255,14 +255,14 @@ def test_cockpit_job_management_supports_replicas_incrementals_and_refreshes_aut
     assert "Interval" in html
     assert "Daily" in html
 
-    assert 'Number(document.getElementById("job-retain").value) - 1' in javascript
+    assert "max_incrementals_per_chain: 0" in javascript
+    assert 'Number(document.getElementById("job-retain").value) - 1' not in javascript
     assert 'job ? job.full_chains_to_retain : 2' in javascript
     assert 'job ? job.space_reclaim_mode : "SAFE"' in javascript
 
     assert "selectedJobReplicaIds" in javascript
     assert "replica_destination_ids" in javascript
     assert "max_incrementals_per_chain" in javascript
-    assert "max_incrementals_per_chain: 0" not in javascript
 
     assert 'full_chains_to_retain:' in javascript
     assert 'document.getElementById("job-full-chains").value' in javascript
@@ -573,5 +573,5 @@ def test_cockpit_job_form_configures_primary_replicas_and_incrementals():
     assert "selectedJobReplicaIds" in javascript
     assert "replica_destination_ids" in javascript
     assert "max_incrementals_per_chain" in javascript
-    assert "max_incrementals_per_chain: 0" not in javascript
+    assert "max_incrementals_per_chain: 0" in javascript
     assert "updateJobReplicaOptions" in javascript

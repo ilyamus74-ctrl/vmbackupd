@@ -476,7 +476,7 @@ def test_cli_job_create_and_update_map_schedule_enable_and_destination_options()
         "id": "job-id", "name": None, "storage_destination_id": "storage-id",
         "storage_destination": None,
         "replica_destination_ids": None,
-        "max_incrementals_per_chain": 8,
+        "max_incrementals_per_chain": 0,
         "restore_points_to_retain": 9,
         "full_chains_to_retain": 3, "minimum_full_chains": 2,
         "space_reclaim_mode": "SPACE_OPTIMIZED",
@@ -737,7 +737,7 @@ def test_job_api_replica_and_incremental_configuration_is_atomic():
     assert persisted["max_incrementals_per_chain"] == 3
 
 
-def test_cli_job_replica_options_and_retention_derive_incremental_chain():
+def test_cli_job_replica_options_keep_current_full_only_execution_policy():
     parser = _parser()
 
     method, params = _request(
@@ -759,7 +759,7 @@ def test_cli_job_replica_options_and_retention_derive_incremental_chain():
 
     assert method == "job.create"
     assert params["restore_points_to_retain"] == 7
-    assert params["max_incrementals_per_chain"] == 6
+    assert params["max_incrementals_per_chain"] == 0
     assert params["replica_destination_ids"] == [
         "kiev",
         "second",
@@ -779,7 +779,7 @@ def test_cli_job_replica_options_and_retention_derive_incremental_chain():
 
     assert method == "job.update"
     assert params["restore_points_to_retain"] == 7
-    assert params["max_incrementals_per_chain"] == 6
+    assert params["max_incrementals_per_chain"] == 0
     assert params["replica_destination_ids"] == [
         "kiev",
     ]
