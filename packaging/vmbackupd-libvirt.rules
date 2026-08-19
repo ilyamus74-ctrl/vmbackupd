@@ -1,0 +1,16 @@
+/*
+ * vmbackupd requires a non-interactive libvirt management connection in
+ * order to invoke its deliberately restricted backup-begin mutation.
+ *
+ * Do not replace this with broad Unix group membership.  The daemon remains
+ * an unprivileged dedicated service account and the application itself keeps
+ * the mutating command surface restricted.
+ */
+polkit.addRule(function(action, subject) {
+    if (
+        action.id == "org.libvirt.unix.manage" &&
+        subject.user == "vmbackupd"
+    ) {
+        return polkit.Result.YES;
+    }
+});

@@ -369,3 +369,36 @@ def test_managed_storage_helper_executable_is_in_rpm_files():
         "%{_unitdir}/vmbackupd-storage-helper@.service"
         in files
     )
+
+
+def test_package_installs_narrow_vmbackupd_libvirt_polkit_rule():
+    spec = text("vmbackupd.spec")
+    rule = text("vmbackupd-libvirt.rules")
+
+    assert "Requires:       polkit" in spec
+
+    assert (
+        "%{_datadir}/polkit-1/rules.d/"
+        "60-vmbackupd-libvirt.rules"
+        in spec
+    )
+
+    assert (
+        'action.id == "org.libvirt.unix.manage"'
+        in rule
+    )
+
+    assert (
+        'subject.user == "vmbackupd"'
+        in rule
+    )
+
+    assert "polkit.Result.YES" in rule
+
+    # Do not silently broaden this into a Unix administration group.
+    assert "isInGroup" not in rule
+    assert "libvirtadm" not in rule
+
+    # Connection authorization only.  Do not grant a wildcard set of
+    # libvirt object/API polkit actions here.
+    assert "org.libvirt.api." not in rule

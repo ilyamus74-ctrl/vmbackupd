@@ -42,6 +42,41 @@ class LibvirtExecutionSafetyError(RuntimeError):
     """A Phase 3B safety precondition prevented external execution."""
 
 
+class LibvirtAuthorizationError(LibvirtExecutionSafetyError):
+    """Libvirt rejected management authorization before executing mutation."""
+
+
+def _is_libvirt_manage_auth_failure(result: CommandResult) -> bool:
+    detail = "\n".join(
+        value
+        for value in (
+            result.stdout,
+            result.stderr,
+        )
+        if value
+    ).lower()
+
+    authentication = any(
+        marker in detail
+        for marker in (
+            "authentication unavailable",
+            "authentication failed",
+            "authorization failed",
+            "not authorized",
+        )
+    )
+
+    policy = any(
+        marker in detail
+        for marker in (
+            "org.libvirt.unix.manage",
+            "polkit",
+        )
+    )
+
+    return authentication and policy
+
+
 class VirshBackupDriver:
     """Minimal mutation boundary: Phase 3B exposes only backup-begin."""
 
@@ -53,15 +88,44 @@ class VirshBackupDriver:
         self.connection_uri = connection_uri
         self.timeout = timeout
 
+    def _require_success(
+        self,
+        result: CommandResult,
+    ) -> CommandResult:
+        if result.returncode == 0:
+            return result
+
+        if _is_libvirt_manage_auth_failure(result):
+            raise LibvirtAuthorizationError(
+                "libvirt management authorization failed for "
+                f"{self.connection_uri}: "
+                "org.libvirt.unix.manage is unavailable "
+                "to the vmbackupd service account"
+            )
+
+        raise CommandError(result)
+
+    def require_manage_access(self) -> None:
+        result = self.runner.run(
+            (
+                "virsh",
+                "--connect",
+                self.connection_uri,
+                "uri",
+            ),
+            timeout=self.timeout,
+        )
+
+        self._require_success(result)
+
     def begin_backup(self, domain: str, backup_xml_file: str) -> CommandResult:
         result = self.runner.run(
             ("virsh", "--connect", self.connection_uri, "backup-begin", domain,
              backup_xml_file, "--reuse-external"),
             timeout=self.timeout,
         )
-        if result.returncode != 0:
-            raise CommandError(result)
-        return result
+
+        return self._require_success(result)
 
 
 @dataclass(frozen=True, slots=True)
@@ -926,6 +990,11 @@ class LibvirtBackupExecutor:
             raise LibvirtExecutionSafetyError("Phase 3B requires a full-only backup policy")
         if operation.checkpoint_xml is not None or operation.checkpoint_name is not None:
             raise LibvirtExecutionSafetyError("Phase 3B cannot execute checkpoint-bearing plans")
+
+        # Validate the exact non-interactive RW connection required by
+        # backup-begin before creating any staging/output files.
+        self.mutation_driver.require_manage_access()
+
         current_xml = self.read_driver.domain_xml(vm.external_id)
         current_uuid = self.read_driver.domain_uuid(vm.external_id)
         if current_uuid != vm.libvirt_domain_uuid or current_uuid != operation.domain_uuid:
@@ -1032,7 +1101,20 @@ class LibvirtBackupExecutor:
         self.repository.transition_libvirt_external_state(
             run.id, LibvirtExternalState.START_REQUESTED, now,
         )
-        self.mutation_driver.begin_backup(operation.domain_uuid, str(backup_xml_file))
+
+        try:
+            self.mutation_driver.begin_backup(
+                operation.domain_uuid,
+                str(backup_xml_file),
+            )
+        except LibvirtAuthorizationError as exc:
+            self.repository.reject_libvirt_start(
+                run.id,
+                str(exc),
+                self.clock.now(),
+            )
+            raise
+
         self.repository.transition_libvirt_external_state(
             run.id, LibvirtExternalState.RUNNING, self.clock.now(),
         )

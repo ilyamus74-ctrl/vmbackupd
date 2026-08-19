@@ -16,7 +16,8 @@ from vmbackupd.libvirt_backend import (
     VirshLibvirtDriver,
 )
 from vmbackupd.libvirt_execution import (
-    ImageInfo, LibvirtBackupExecutor, LibvirtExecutionSafetyError,
+    ImageInfo, LibvirtAuthorizationError, LibvirtBackupExecutor,
+    LibvirtExecutionSafetyError,
     QemuImageInspector, QemuOutputImagePreparer, StagingFilesystem, VirshBackupDriver,
 )
 from vmbackupd.models import (
@@ -95,11 +96,25 @@ class Images:
 
 
 class Mutation:
-    def __init__(self, repository=None, *, error=None):
+    def __init__(
+        self,
+        repository=None,
+        *,
+        error=None,
+        preflight_error=None,
+    ):
         self.repository = repository
         self.error = error
+        self.preflight_error = preflight_error
+        self.preflight_calls = 0
         self.calls = []
         self.state_seen = None
+
+    def require_manage_access(self):
+        self.preflight_calls += 1
+
+        if self.preflight_error:
+            raise self.preflight_error
 
     def begin_backup(self, domain, backup_xml_file):
         self.calls.append((domain, backup_xml_file))
@@ -1637,3 +1652,185 @@ def test_previous_full_physical_inspection_failure_is_advisory(
     # measurement must fall back to live allocation/virtual capacity
     # rather than blocking the current backup.
     assert history == {}
+
+
+def test_libvirt_manage_authorization_failure_is_terminal_not_recovery(
+    execution,
+):
+    error = LibvirtAuthorizationError(
+        "libvirt management authorization failed for qemu:///system: "
+        "org.libvirt.unix.manage is unavailable to the vmbackupd service account"
+    )
+
+    mutation = Mutation(
+        execution[0],
+        preflight_error=error,
+    )
+
+    value, _ = executor(
+        execution,
+        mutation=mutation,
+    )
+
+    result = value.advance_run(
+        execution[3].id
+    )
+
+    assert result.state is RunState.CLEANUP
+    assert result.recovery_required is False
+    assert "authorization failed" in (
+        result.error or ""
+    )
+
+    operation = execution[0].get_libvirt_operation(
+        result.id
+    )
+
+    assert (
+        operation.external_state
+        is LibvirtExternalState.PLANNED
+    )
+
+    assert mutation.preflight_calls == 1
+    assert mutation.calls == []
+
+    assert not execution[5].run_directory(
+        result.id
+    ).exists()
+
+    assert not execution[5].data_run_directory(
+        result.id
+    ).exists()
+
+    failed = value.advance_cleanup(
+        result.id
+    )
+
+    assert failed.state is RunState.FAILED
+    assert failed.recovery_required is False
+
+
+def test_backup_begin_auth_rejection_after_start_requested_is_not_ambiguous(
+    execution,
+):
+    error = LibvirtAuthorizationError(
+        "libvirt management authorization failed for qemu:///system: "
+        "org.libvirt.unix.manage is unavailable to the vmbackupd service account"
+    )
+
+    mutation = Mutation(
+        execution[0],
+        error=error,
+    )
+
+    value, _ = executor(
+        execution,
+        mutation=mutation,
+    )
+
+    result = value.advance_run(
+        execution[3].id
+    )
+
+    assert mutation.preflight_calls == 1
+
+    assert (
+        mutation.state_seen
+        is LibvirtExternalState.START_REQUESTED
+    )
+
+    assert result.state is RunState.CLEANUP
+    assert result.recovery_required is False
+
+    operation = execution[0].get_libvirt_operation(
+        result.id
+    )
+
+    assert (
+        operation.external_state
+        is LibvirtExternalState.PLANNED
+    )
+
+    assert any(
+        event.event_type
+        == "LIBVIRT_BACKUP_START_REJECTED"
+        for event in execution[0].list_events(
+            result.id
+        )
+    )
+
+    failed = value.advance_cleanup(
+        result.id
+    )
+
+    assert failed.state is RunState.FAILED
+    assert failed.recovery_required is False
+
+
+def test_virsh_manage_preflight_classifies_polkit_failure():
+    command = (
+        "virsh",
+        "--connect",
+        "qemu:///system",
+        "uri",
+    )
+
+    runner = FakeCommandRunner({
+        command: (
+            1,
+            "",
+            "error: failed to connect to the hypervisor\n"
+            "error: authentication unavailable: "
+            "no polkit agent available to authenticate action "
+            "'org.libvirt.unix.manage'",
+        )
+    })
+
+    driver = VirshBackupDriver(
+        runner,
+        "qemu:///system",
+        timeout=3,
+    )
+
+    with pytest.raises(
+        LibvirtAuthorizationError,
+        match="org.libvirt.unix.manage",
+    ):
+        driver.require_manage_access()
+
+    assert runner.calls == [
+        (
+            command,
+            3,
+        )
+    ]
+
+
+def test_virsh_manage_preflight_is_exact_bounded_argv():
+    command = (
+        "virsh",
+        "--connect",
+        "test:///default",
+        "uri",
+    )
+
+    runner = FakeCommandRunner({
+        command: (
+            0,
+            "test:///default\n",
+            "",
+        )
+    })
+
+    VirshBackupDriver(
+        runner,
+        "test:///default",
+        timeout=4,
+    ).require_manage_access()
+
+    assert runner.calls == [
+        (
+            command,
+            4,
+        )
+    ]

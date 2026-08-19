@@ -1581,6 +1581,67 @@ class SQLiteRepository:
             )
         return self.get_libvirt_operation(run_id)  # type: ignore[return-value]
 
+    def reject_libvirt_start(
+        self,
+        run_id: str,
+        reason: str,
+        now: datetime,
+    ) -> LibvirtBackupOperation:
+        """Undo START_REQUESTED after a definite pre-execution rejection.
+
+        This is deliberately separate from the normal forward-only external
+        state transition API.  It is valid only when libvirt authentication
+        rejected the connection, so no backup command could have reached the
+        hypervisor.
+        """
+
+        operation = self.get_libvirt_operation(run_id)
+
+        if operation is None:
+            raise DomainInvariantError(
+                "run has no libvirt operation"
+            )
+
+        if (
+            operation.external_state
+            is not LibvirtExternalState.START_REQUESTED
+        ):
+            raise DomainInvariantError(
+                "only START_REQUESTED may be rejected"
+            )
+
+        if (
+            operation.started_at is not None
+            or operation.completed_at is not None
+            or operation.active_match_observed_at is not None
+        ):
+            raise DomainInvariantError(
+                "started libvirt operation cannot be rejected"
+            )
+
+        with self.connection:
+            self.connection.execute(
+                """UPDATE libvirt_backup_operations
+                   SET external_state = 'PLANNED',
+                       last_polled_at = ?
+                   WHERE run_id = ?""",
+                (
+                    now.isoformat(),
+                    run_id,
+                ),
+            )
+
+            self._insert_event(
+                Event(
+                    job_run_id=run_id,
+                    event_type="LIBVIRT_BACKUP_START_REJECTED",
+                    message=reason,
+                    created_at=now,
+                )
+            )
+
+        return self.get_libvirt_operation(run_id)
+
     def record_libvirt_active_match(
         self, run_id: str, now: datetime,
     ) -> LibvirtBackupOperation:

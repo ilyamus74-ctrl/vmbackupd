@@ -24,6 +24,7 @@ Requires:       qemu-img
 Requires:       libvirt-daemon-driver-qemu
 Requires:       systemd
 Requires:       acl
+Requires:       polkit
 Requires(pre):  systemd
 Requires(pre):  shadow-utils
 Requires(pre):  glibc-common
@@ -59,6 +60,8 @@ install -Dpm 0644 %{SOURCE1} %{buildroot}%{_unitdir}/vmbackupd.service
 install -Dpm 0644 %{SOURCE2} %{buildroot}%{_sysusersdir}/vmbackupd.conf
 install -Dpm 0644 %{SOURCE3} %{buildroot}%{_tmpfilesdir}/vmbackupd.conf
 install -Dpm 0644 %{SOURCE4} %{buildroot}%{_sysconfdir}/vmbackupd/vmbackupd.toml
+install -Dpm 0644 packaging/vmbackupd-libvirt.rules \
+    %{buildroot}%{_datadir}/polkit-1/rules.d/60-vmbackupd-libvirt.rules
 
 install -Dpm 0755 packaging/vmbackupd-storage-helper \
     %{buildroot}%{_libexecdir}/vmbackupd-storage-helper
@@ -136,6 +139,8 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-resolver@.service \
 
 %config(noreplace) %{_sysconfdir}/vmbackupd/vmbackupd.toml
 %config(noreplace) %{_sysconfdir}/vmbackupd/receiver_sshd_config
+
+%{_datadir}/polkit-1/rules.d/60-vmbackupd-libvirt.rules
 
 %{_unitdir}/vmbackupd.service
 %{_unitdir}/vmbackupd-storage-helper.socket
