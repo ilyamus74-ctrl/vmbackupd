@@ -4,6 +4,11 @@ set -euo pipefail
 root=/var/lib/vmbackupd/receiver-host
 private="$root/ssh_host_ed25519_key"
 public="$private.pub"
+published=/var/lib/vmbackupd/receiver/host_public_key
+
+publish_public_key() {
+    install         -m 0644         -o vmbackupd         -g vmbackupd         "$public"         "$published"
+}
 
 install -d -m 0700 -o root -g root "$root"
 
@@ -21,6 +26,7 @@ if [[ -e "$private" || -e "$public" ]]; then
     chmod 0600 "$private"
     chmod 0644 "$public"
     chown root:root "$private" "$public"
+    publish_public_key
 
     exit 0
 fi
@@ -45,5 +51,7 @@ chown root:root "$tmp" "$tmp.pub"
 
 mv -T "$tmp" "$private"
 mv -T "$tmp.pub" "$public"
+
+publish_public_key
 
 trap - EXIT

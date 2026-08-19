@@ -575,7 +575,19 @@ minimum_free_percent = 5
 
     second = compose(config)
     values = second.repository.list_storage_destinations(second.application.node.id)
-    assert {item.name for item in values} == {"renamed", "api-created"}
+    assert {
+        item.name
+        for item in values
+        if item.name != "__vmbackupd_ssh_identity__"
+    } == {"renamed", "api-created"}
+
+    system_identities = [
+        item
+        for item in values
+        if item.name == "__vmbackupd_ssh_identity__"
+    ]
+    assert len(system_identities) == 1
+    assert system_identities[0].is_default is False
     assert next(item for item in values if item.name == "renamed").minimum_free_bytes == 123
     assert second.repository.get_default_storage_destination(second.application.node.id).id == created["id"]
     second.repository.close()

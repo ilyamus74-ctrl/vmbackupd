@@ -76,7 +76,7 @@ def test_cockpit_success_waits_for_normal_close_and_rejects_lifecycle_errors():
     assert "channel.close()" not in close_handler
 
 
-def test_cockpit_method_allow_list_is_exactly_phase3e6_boundary():
+def test_cockpit_method_allow_list_matches_current_supported_boundary():
     api = source("api.js")
     match = re.search(
         r"const ALLOWED_METHODS = Object\.freeze\(\[(.*?)\]\);",
@@ -100,6 +100,10 @@ def test_cockpit_method_allow_list_is_exactly_phase3e6_boundary():
         "ssh.hostkey.show",
         "ssh.hostkey.add",
         "ssh.hostkey.revoke",
+        "receiver.info",
+        "receiver.key.list",
+        "receiver.key.add",
+        "receiver.key.revoke",
         "job.list",
         "run.list",
         "restore_point.list",

@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import os
+from .models import new_id
+
 import shutil
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
@@ -16,6 +22,7 @@ from .models import (
 from .repository import DomainInvariantError, SQLiteRepository
 from .ssh_identity import SSHIdentityError
 from .ssh_known_hosts import SSHKnownHostsError
+from .ssh_preflight import SSHPreflightError
 from .ssh_receiver import SSHReceiverError
 from .storage import LocalStorageTester, lexical_storage_path, storage_path_has_symlink
 
@@ -38,6 +45,7 @@ class VmbackupApplication:
         self.storage_tester = storage_tester or LocalStorageTester()
         self.ssh_identity_manager = ssh_identity_manager
         self.ssh_known_hosts_manager = ssh_known_hosts_manager
+        self.ssh_preflight_client = None
         self.ssh_receiver_manager = ssh_receiver_manager
 
     def dispatch(self, method: str, params: dict) -> object:
@@ -53,6 +61,7 @@ class VmbackupApplication:
             "ssh.hostkey.show": self.ssh_hostkey_show,
             "ssh.hostkey.add": self.ssh_hostkey_add,
             "ssh.hostkey.revoke": self.ssh_hostkey_revoke,
+            "receiver.info": self.receiver_info,
             "receiver.key.list": self.receiver_key_list,
             "receiver.key.add": self.receiver_key_add,
             "receiver.key.revoke": self.receiver_key_revoke,
@@ -133,8 +142,16 @@ class VmbackupApplication:
         )
 
     def storage_list(self):
-        return [self._serialize_storage(x)
-                for x in self.repository.list_storage_destinations(self.node.id)]
+        system_identity_id = getattr(
+            self.ssh_identity_manager,
+            "shared_identity_id",
+            None,
+        )
+        return [
+            self._serialize_storage(value)
+            for value in self.repository.list_storage_destinations(self.node.id)
+            if value.id != system_identity_id
+        ]
 
     def storage_show(self, id):
         value = self.repository.get_storage_destination(self.node.id, id)
@@ -170,31 +187,88 @@ class VmbackupApplication:
         )
         return configured
 
-    def storage_create(self, name, backup_data_root,
+    def _create_managed_ssh_staging(self, profile, destination_id):
+        seed_root = lexical_storage_path(profile.backup_data_root)
+        staging_base = seed_root.parent / "vmbackupd-staging"
+        staging_root = staging_base / destination_id
+
+        mode = int(profile.backup_data_mode)
+
+        try:
+            staging_base.mkdir(parents=True, exist_ok=True, mode=mode)
+            os.chmod(staging_base, mode)
+
+            if profile.backup_data_gid is not None:
+                os.chown(staging_base, -1, int(profile.backup_data_gid))
+
+            staging_root.mkdir(mode=mode)
+            os.chmod(staging_root, mode)
+
+            if profile.backup_data_gid is not None:
+                os.chown(staging_root, -1, int(profile.backup_data_gid))
+        except OSError as exc:
+            raise ApplicationError(
+                "SSH_STAGING_PREPARE_FAILED",
+                f"cannot prepare managed SSH staging: "
+                f"{exc.strerror or type(exc).__name__}",
+            ) from None
+
+        return str(staging_root)
+
+    def storage_create(self, name, backup_data_root=None,
                        minimum_free_bytes=0, minimum_free_percent=5,
                        make_default=False, storage_type="LOCAL",
                        ssh_host=None, ssh_port=None, ssh_user=None,
                        ssh_remote_root=None):
         if not isinstance(make_default, bool):
-            raise ApplicationError("INVALID_PARAMS", "make_default must be boolean")
-        name, backup_data_root, free_bytes, free_percent = (
-            self._validate_storage_values(name, backup_data_root,
-                                          minimum_free_bytes, minimum_free_percent)
-        )
+            raise ApplicationError(
+                "INVALID_PARAMS",
+                "make_default must be boolean",
+            )
+
         if not isinstance(storage_type, str):
             raise ApplicationError(
-                "INVALID_PARAMS", "storage_type must be LOCAL or SSH"
+                "INVALID_PARAMS",
+                "storage_type must be LOCAL or SSH",
             )
+
         try:
             transport = StorageType(storage_type.strip().upper())
         except ValueError:
             raise ApplicationError(
-                "INVALID_PARAMS", "storage_type must be LOCAL or SSH"
+                "INVALID_PARAMS",
+                "storage_type must be LOCAL or SSH",
             ) from None
 
         profile = self._seed_access_profile()
+        destination_id = new_id()
+        managed_staging = False
+
+        if transport is StorageType.SSH and backup_data_root is None:
+            backup_data_root = self._create_managed_ssh_staging(
+                profile,
+                destination_id,
+            )
+            managed_staging = True
+        elif backup_data_root is None:
+            raise ApplicationError(
+                "INVALID_PARAMS",
+                "backup_data_root is required for LOCAL storage",
+            )
+
+        name, backup_data_root, free_bytes, free_percent = (
+            self._validate_storage_values(
+                name,
+                backup_data_root,
+                minimum_free_bytes,
+                minimum_free_percent,
+            )
+        )
+
         value = StorageDestination(
-            node_id=self.node.id, name=name,
+            id=destination_id,
+            node_id=self.node.id,
+            name=name,
             backup_data_root=backup_data_root,
             backup_data_mode=profile.backup_data_mode,
             backup_data_uid=profile.backup_data_uid,
@@ -207,9 +281,21 @@ class VmbackupApplication:
             ssh_user=ssh_user,
             ssh_remote_root=ssh_remote_root,
         )
-        return self._serialize_storage(
-            self.repository.create_storage_destination(value, make_default=make_default)
-        )
+
+        try:
+            created = self.repository.create_storage_destination(
+                value,
+                make_default=make_default,
+            )
+        except Exception:
+            if managed_staging:
+                try:
+                    Path(backup_data_root).rmdir()
+                except OSError:
+                    pass
+            raise
+
+        return self._serialize_storage(created)
 
     def storage_update(self, id, name=None, backup_data_root=None,
                        minimum_free_bytes=None, minimum_free_percent=None,
@@ -310,10 +396,18 @@ class VmbackupApplication:
                 raise ApplicationError("INVALID_PARAMS", "test by ID or candidate, not both")
             value = self.repository.get_storage_destination(self.node.id, id)
             if value.storage_type is StorageType.SSH:
-                raise ApplicationError(
-                    "REMOTE_TRANSPORT_NOT_IMPLEMENTED",
-                    "SSH destination connection testing is not implemented yet",
-                )
+                if self.ssh_preflight_client is None:
+                    raise ApplicationError(
+                        "SSH_PREFLIGHT_UNAVAILABLE",
+                        "SSH preflight client is not configured",
+                    )
+                try:
+                    return self.ssh_preflight_client.check(value)
+                except SSHPreflightError as exc:
+                    raise ApplicationError(
+                        exc.code,
+                        str(exc),
+                    ) from None
             backup_data_root = value.backup_data_root
             minimum_free_bytes = value.minimum_free_bytes
             minimum_free_percent = value.minimum_free_percent
@@ -329,33 +423,51 @@ class VmbackupApplication:
         return self.storage_tester.test(
             backup_data_root, free_bytes, free_percent,
         )
-    def _require_ssh_identity_destination(self, destination_id):
-        destination = self.repository.get_storage_destination(
-            self.node.id, destination_id
-        )
-        if destination.storage_type is not StorageType.SSH:
-            raise ApplicationError(
-                "SSH_DESTINATION_REQUIRED",
-                "SSH identity operations require an SSH storage destination",
-            )
+    def _ssh_identity_target(self, destination_id=None):
         if self.ssh_identity_manager is None:
             raise ApplicationError(
                 "SSH_IDENTITY_UNAVAILABLE",
                 "SSH identity manager is not configured",
             )
-        return destination
 
-    def ssh_identity_show(self, destination_id):
-        self._require_ssh_identity_destination(destination_id)
-        return self.ssh_identity_manager.show(destination_id)
+        if destination_id is not None:
+            destination = self.repository.get_storage_destination(
+                self.node.id,
+                destination_id,
+            )
+            if destination.storage_type is not StorageType.SSH:
+                raise ApplicationError(
+                    "SSH_DESTINATION_REQUIRED",
+                    "SSH identity operations require an SSH storage destination",
+                )
 
-    def ssh_identity_generate(self, destination_id):
-        self._require_ssh_identity_destination(destination_id)
-        return self.ssh_identity_manager.generate(destination_id)
+        shared_identity_id = getattr(
+            self.ssh_identity_manager,
+            "shared_identity_id",
+            None,
+        )
+        if shared_identity_id is not None:
+            return shared_identity_id
 
-    def ssh_identity_rotate(self, destination_id):
-        self._require_ssh_identity_destination(destination_id)
-        return self.ssh_identity_manager.rotate(destination_id)
+        if destination_id is None:
+            raise ApplicationError(
+                "SSH_DESTINATION_REQUIRED",
+                "SSH identity is not configured as a shared node identity",
+            )
+
+        return destination_id
+
+    def ssh_identity_show(self, destination_id=None):
+        target = self._ssh_identity_target(destination_id)
+        return self.ssh_identity_manager.show(target)
+
+    def ssh_identity_generate(self, destination_id=None):
+        target = self._ssh_identity_target(destination_id)
+        return self.ssh_identity_manager.generate(target)
+
+    def ssh_identity_rotate(self, destination_id=None):
+        target = self._ssh_identity_target(destination_id)
+        return self.ssh_identity_manager.rotate(target)
 
     def _require_ssh_hostkey_destination(self, destination_id):
         destination = self.repository.get_storage_destination(
@@ -433,6 +545,63 @@ class VmbackupApplication:
                 "SSH receiver registry is not configured",
             )
         return self.ssh_receiver_manager
+
+    def receiver_info(self):
+        public_key_path = (
+            self.config.daemon.database_path.parent
+            / "receiver"
+            / "host_public_key"
+        )
+
+        result = {
+            "account": "vmbackupd-transfer",
+            "port": 22022,
+            "backup_root": "/srv/vmbackupd",
+            "host_key_exists": False,
+            "host_key_type": None,
+            "host_public_key": None,
+            "host_fingerprint": None,
+        }
+
+        try:
+            raw = public_key_path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return result
+        except OSError as exc:
+            raise ApplicationError(
+                "RECEIVER_HOST_IDENTITY_UNAVAILABLE",
+                f"cannot read receiver host public key: "
+                f"{exc.strerror or type(exc).__name__}",
+            ) from None
+
+        parts = raw.split()
+        if len(parts) < 2 or parts[0] != "ssh-ed25519":
+            raise ApplicationError(
+                "RECEIVER_HOST_IDENTITY_INVALID",
+                "receiver host public key is invalid",
+            )
+
+        try:
+            blob = base64.b64decode(parts[1], validate=True)
+        except (ValueError, binascii.Error):
+            raise ApplicationError(
+                "RECEIVER_HOST_IDENTITY_INVALID",
+                "receiver host public key is invalid",
+            ) from None
+
+        digest = hashlib.sha256(blob).digest()
+        fingerprint = (
+            "SHA256:"
+            + base64.b64encode(digest).decode("ascii").rstrip("=")
+        )
+
+        result.update({
+            "host_key_exists": True,
+            "host_key_type": "ssh-ed25519",
+            "host_public_key": f"ssh-ed25519 {parts[1]}",
+            "host_fingerprint": fingerprint,
+        })
+        return result
 
     def receiver_key_list(self):
         return self._require_ssh_receiver_manager().list()

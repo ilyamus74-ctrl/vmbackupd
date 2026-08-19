@@ -40,11 +40,11 @@ def test_storage_form_exposes_local_and_ssh_destination_types():
     assert "vmbackupd-transfer" in html
 
 
-def test_ssh_destination_shows_remote_path_and_local_staging_separately():
+def test_ssh_destination_shows_remote_path_and_managed_staging():
     javascript = source("vmbackupd.js")
 
     assert "destination.ssh_remote_root : destination.backup_data_root" in javascript
-    assert "Local staging:" in javascript
+    assert "Staging managed automatically" in javascript
     assert "sshTarget(destination)" in javascript
     assert "Not checked" in javascript
 
@@ -52,16 +52,15 @@ def test_ssh_destination_shows_remote_path_and_local_staging_separately():
 def test_ssh_create_sends_complete_transport_identity():
     javascript = source("vmbackupd.js")
 
-    assert "params.storage_type = type;" in javascript
+    assert 'params.storage_type = "SSH";' in javascript
     assert "params.ssh_host =" in javascript
     assert "params.ssh_port =" in javascript
     assert "params.ssh_user =" in javascript
     assert "params.ssh_remote_root =" in javascript
 
-    # Editing preserves the immutable destination type rather than asking
-    # the backend to convert LOCAL <-> SSH.
-    assert '''        if (!editingStorageId)
-            params.storage_type = type;''' in javascript
+    # SSH creation explicitly sends the SSH transport type.
+    assert 'if (type === "LOCAL") {' in javascript
+    assert 'params.storage_type = "SSH";' in javascript
 
 
 def test_ssh_destination_type_is_locked_during_edit():
@@ -89,7 +88,11 @@ def test_ssh_candidate_never_calls_local_storage_probe():
     storage_test = function.index('"storage.test"', return_statement)
 
     assert ssh_guard < return_statement < storage_test
-    assert "SSH connection testing is not available until SSH.4." in function
+    assert (
+        "Save this SSH destination first, then use Test in the Storage table "
+        "to run receiver preflight."
+        in function
+    )
 
 
 def test_stored_ssh_destination_never_calls_local_storage_probe():
@@ -103,11 +106,11 @@ def test_stored_ssh_destination_never_calls_local_storage_probe():
         1,
     )[0]
 
-    ssh_guard = function.index('storageType(destination) === "SSH"')
-    return_statement = function.index("return;", ssh_guard)
-    storage_test = function.index('"storage.test"', return_statement)
-
-    assert ssh_guard < return_statement < storage_test
+    assert '"storage.test"' in function
+    assert (
+        "SSH connection testing is not available until SSH.4."
+        not in function
+    )
 
 
 def test_ssh_destination_is_not_selectable_for_backup_job_yet():
@@ -151,8 +154,15 @@ def test_ssh3a_does_not_claim_remote_connection_or_capacity_success():
 
     combined = html + "\n" + javascript
 
-    assert "SSH remote capacity is not queried" in combined
-    assert "SSH connection testing is not available until SSH.4." in combined
+    assert (
+        "SSH Test performs authenticated receiver preflight "
+        "and remote capacity checks."
+        in combined
+    )
+    assert (
+        "SSH connection testing is not available until SSH.4."
+        not in combined
+    )
 
     for false_claim in (
         "SSH connected",
@@ -161,3 +171,26 @@ def test_ssh3a_does_not_claim_remote_connection_or_capacity_success():
         "Remote free space:",
     ):
         assert false_claim not in combined
+
+
+def test_ssh4_cockpit_exposes_shared_identity_and_saved_preflight():
+    html = source("index.html")
+    javascript = source("vmbackupd.js")
+
+    assert 'id="client-identity-open"' in html
+    assert 'id="client-identity-dialog"' in html
+    assert 'id="client-identity-public-key"' in html
+
+    assert 'api.request("ssh.identity.show")' in javascript
+    assert 'api.request("ssh.identity.generate")' in javascript
+    assert 'api.request("ssh.identity.rotate")' in javascript
+
+    start = javascript.index("function renderStorage")
+    end = javascript.index("function exactByteParts", start)
+    function = javascript[start:end]
+
+    assert function.index('"Test"') < function.index('"SSH setup"')
+    assert "testStoredDestination(destination)" in function
+
+    assert "SSH preflight" in javascript
+    assert "backup transfer" in javascript

@@ -228,3 +228,8 @@ summary { cursor: pointer; font-size: 1.1rem; font-weight: 700; }
     font-weight: 400;
     color: #6a6e73;
 }
+
+/* SSH destinations use daemon-managed local staging. */
+#storage-data-root-label[hidden] {
+    display: none !important;
+}

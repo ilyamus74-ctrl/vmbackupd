@@ -72,7 +72,7 @@
         </table>
       </div>
       <p id="storage-test-result" class="probe-result" role="status" hidden></p>
-      <p class="table-note">Local free space is measured by this node. SSH remote capacity is not queried until SSH connection preflight is implemented; reserve values on SSH destinations currently apply to local staging.</p>
+      <p class="table-note">Local free space is measured by this node. SSH staging is managed automatically. SSH Test performs authenticated receiver preflight and remote capacity checks. SSH backup transfer is not enabled yet.</p>
     </section>
 
     <section aria-labelledby="vms-title">
@@ -86,7 +86,39 @@
     </section>
 
     <section aria-labelledby="details-title">
-      <details>
+
+    <section id="receiver-section">
+      <div class="receiver-heading">
+        <h2>SSH</h2>
+        <div class="row-actions">
+          <button id="client-identity-open" type="button">Client SSH identity</button>
+          <button id="receiver-open" type="button">Receiver setup</button>
+        </div>
+      </div>
+      <p class="table-note">
+        Authorize source servers that may send backups to this node.
+        Private SSH keys are never exposed through Cockpit.
+      </p>
+
+      <div class="table-wrap">
+        <table class="operational-table">
+          <thead>
+            <tr>
+              <th>Source</th>
+              <th>Fingerprint</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="receiver-sources-summary">
+            <tr>
+              <td colspan="3">Loading authorized sources…</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+<details>
         <summary id="details-title">System details</summary>
         <dl id="system-details" class="details-grid"></dl>
       </details>
@@ -289,5 +321,139 @@
       </div>
     </div>
   </dialog>
+
+  <dialog id="client-identity-dialog"
+          aria-labelledby="client-identity-title">
+    <div id="client-identity-setup">
+      <h2 id="client-identity-title">Client SSH identity</h2>
+
+      <p class="form-note">
+        Shared by all outgoing SSH backup destinations.
+        The private key is daemon-owned and is never exposed through Cockpit.
+      </p>
+
+      <section class="ssh-setup-section">
+        <dl class="details-grid">
+          <dt>Status</dt>
+          <dd id="client-identity-status">—</dd>
+
+          <dt>Fingerprint</dt>
+          <dd id="client-identity-fingerprint">—</dd>
+
+          <dt>Public key</dt>
+          <dd>
+            <textarea id="client-identity-public-key"
+                      class="key-material"
+                      readonly
+                      rows="4"
+                      aria-label="SSH client public key"></textarea>
+          </dd>
+        </dl>
+
+        <div class="ssh-section-actions">
+          <button id="client-identity-generate"
+                  type="button">Generate key</button>
+          <button id="client-identity-rotate"
+                  type="button">Rotate key</button>
+        </div>
+      </section>
+
+      <p id="client-identity-error"
+         class="form-error"
+         role="alert"></p>
+
+      <div class="dialog-actions">
+        <button id="client-identity-close"
+                type="button">Close</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="receiver-dialog" aria-labelledby="receiver-dialog-title">
+    <div id="receiver-setup">
+      <h2 id="receiver-dialog-title">SSH receiver</h2>
+
+      <section class="ssh-setup-section">
+        <h3>Receiver identity</h3>
+
+        <dl class="details-grid">
+          <dt>Account</dt>
+          <dd id="receiver-account">—</dd>
+
+          <dt>Port</dt>
+          <dd id="receiver-port">—</dd>
+
+          <dt>Backup root</dt>
+          <dd id="receiver-backup-root">—</dd>
+
+          <dt>Host key</dt>
+          <dd id="receiver-hostkey-status">—</dd>
+
+          <dt>Fingerprint</dt>
+          <dd id="receiver-hostkey-fingerprint">—</dd>
+
+          <dt>Host public key</dt>
+          <dd>
+            <textarea id="receiver-host-public-key"
+                      class="key-material"
+                      readonly
+                      rows="4"
+                      aria-label="Receiver SSH host public key"></textarea>
+          </dd>
+        </dl>
+      </section>
+
+      <section class="ssh-setup-section">
+        <h3>Authorized sources</h3>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Source</th>
+                <th>Fingerprint</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="receiver-sources"></tbody>
+          </table>
+        </div>
+
+        <label>
+          Source name
+          <input id="receiver-source-label"
+                 maxlength="128"
+                 autocomplete="off"
+                 placeholder="maker">
+        </label>
+
+        <label>
+          Source public key
+          <textarea id="receiver-source-key"
+                    class="key-material"
+                    rows="4"
+                    placeholder="ssh-ed25519 AAAAC3..."></textarea>
+          <small>
+            Paste the Client identity public key from the source
+            vmbackupd server.
+          </small>
+        </label>
+
+        <div class="ssh-section-actions">
+          <button id="receiver-source-add"
+                  type="button">Authorize source</button>
+        </div>
+      </section>
+
+      <p id="receiver-setup-error"
+         class="form-error"
+         role="alert"></p>
+
+      <div class="dialog-actions">
+        <button id="receiver-close" type="button">Close</button>
+      </div>
+    </div>
+  </dialog>
+
 </body>
 </html>

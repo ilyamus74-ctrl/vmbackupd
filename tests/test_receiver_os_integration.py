@@ -114,7 +114,7 @@ def test_receiver_session_does_not_claim_transport_readiness():
     )
 
     assert '"transport_ready": False' in value
-    assert '"preflight_ready": False' in value
+    assert '"preflight_ready": True' in value
 
 
 def test_receiver_is_part_of_unified_package():

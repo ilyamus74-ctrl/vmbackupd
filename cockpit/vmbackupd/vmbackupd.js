@@ -10,6 +10,14 @@
     const jobForm = document.getElementById("job-form");
     const storageDialog = document.getElementById("storage-dialog");
     const storageForm = document.getElementById("storage-form");
+    const receiverDialog =
+        document.getElementById("receiver-dialog");
+    const receiverOpenButton =
+        document.getElementById("receiver-open");
+    const clientIdentityDialog =
+        document.getElementById("client-identity-dialog");
+    const clientIdentityOpenButton =
+        document.getElementById("client-identity-open");
     const sshDialog = document.getElementById("ssh-dialog");
     const TERMINAL_STATES = new Set(["SUCCESS", "FAILED"]);
     const RECENT_RUN_LIMIT = 20;
@@ -389,7 +397,7 @@
         if (storageType(destination) === "SSH") {
             container.append(element(
                 "div",
-                `Local staging: ${text(destination.backup_data_root)}`,
+                "Staging managed automatically",
                 "storage-secondary",
             ));
         }
@@ -408,19 +416,19 @@
                 actionButton("Edit", () => openStorageDialog(destination), false),
             );
 
+            actions.append(
+                actionButton(
+                    "Test",
+                    () => testStoredDestination(destination),
+                    false,
+                ),
+            );
+
             if (isSSH)
                 actions.append(
                     actionButton(
                         "SSH setup",
                         () => openSSHSetup(destination),
-                        false,
-                    ),
-                );
-            else
-                actions.append(
-                    actionButton(
-                        "Test",
-                        () => testStoredDestination(destination),
                         false,
                     ),
                 );
@@ -435,7 +443,7 @@
                 text(model.status.node_name);
 
             const reserve = isSSH ?
-                `Local staging: ${bytes(destination.minimum_free_bytes)} / ${text(destination.minimum_free_percent)}%` :
+                `Staging: ${bytes(destination.minimum_free_bytes)} / ${text(destination.minimum_free_percent)}%` :
                 `${bytes(destination.minimum_free_bytes)} / ${text(destination.minimum_free_percent)}%`;
 
             return tableRow([
@@ -479,12 +487,58 @@
         return result;
     }
 
-    function showProbeResult(node, result, failedMessage = null) {
+    function showProbeResult(
+        node,
+        result,
+        failedMessage = null,
+    ) {
         node.hidden = false;
+
+        if (failedMessage) {
+            node.className = "probe-result error";
+            node.textContent = failedMessage;
+            return;
+        }
+
         node.className = `probe-result ${result && result.ok ? "success" : "error"}`;
-        node.textContent = failedMessage ||
+
+        if (result && result.storage_type === "SSH") {
+            const values = [
+                `authenticated ${result.authenticated === true ? "yes" : "no"}`,
+                `host key verified ${result.host_key_verified === true ? "yes" : "no"}`,
+                `receiver preflight ${result.preflight_ready === true ? "ready" : "not ready"}`,
+            ];
+
+            if (result.backup_root)
+                values.push(`root ${text(result.backup_root)}`);
+
+            if (result.writable !== undefined)
+                values.push(`writable ${result.writable ? "yes" : "no"}`);
+
+            if (result.free_bytes !== undefined)
+                values.push(`free ${bytes(result.free_bytes)}`);
+
+            if (result.total_bytes !== undefined)
+                values.push(`total ${bytes(result.total_bytes)}`);
+
+            values.push(
+                `backup transfer ${
+                    result.transport_ready === true ?
+                        "ready" :
+                        "not enabled yet"
+                }`
+            );
+
+            node.textContent =
+                `SSH preflight ${result.ok ? "passed" : "failed"}; ` +
+                `${values.join("; ")}.`;
+            return;
+        }
+
+        node.textContent =
             `${result.message}; free ${bytes(result.free_bytes)}. ` +
-            "Daemon-side Backup-location filesystem test only; no VM backup was run.";
+            "Daemon-side Backup-location filesystem test only; " +
+            "no VM backup was run.";
     }
 
     function updateStorageTransportFields() {
@@ -504,17 +558,22 @@
             field.required = isSSH;
         }
 
-        document.getElementById("storage-data-root-title").textContent =
-            isSSH ? "Local staging path" : "Destination path";
+        const dataRootLabel =
+            document.getElementById("storage-data-root-label");
+        const dataRoot =
+            document.getElementById("storage-data-root");
 
+        dataRootLabel.hidden = isSSH;
+        dataRoot.required = !isSSH;
+
+        document.getElementById("storage-data-root-title").textContent =
+            "Destination path";
         document.getElementById("storage-data-root-help").textContent =
-            isSSH ?
-                "Local controlled staging area used before future SSH transfer." :
-                "Stores the complete VM backup bundle on this node.";
+            "Stores the complete VM backup bundle on this node.";
 
         document.getElementById("storage-reserve-note").textContent =
             isSSH ?
-                "Reserve currently applies to local staging. Remote capacity checking is introduced with SSH connection preflight." :
+                "SSH Test evaluates reserve against receiver capacity. Local staging is managed automatically." :
                 "Reserve applies to the local destination filesystem.";
 
         const testButton = document.getElementById("storage-test-candidate");
@@ -538,7 +597,7 @@
             resultNode.hidden = false;
             resultNode.className = "probe-result";
             resultNode.textContent =
-                "SSH connection is not tested in this phase. Identity and host trust are configured separately; network preflight is introduced in SSH.4.";
+                "Save this SSH destination, configure Client identity and host trust, then use Test in the Storage table to run receiver preflight.";
         } else {
             resultNode.hidden = true;
         }
@@ -634,29 +693,30 @@
 
         const params = {
             name: document.getElementById("storage-name").value.trim(),
-            backup_data_root:
-                document.getElementById("storage-data-root").value,
-            minimum_free_bytes: minimumFreeBytes(),
+            minimum_free_bytes: storageMinimumFreeBytes(),
             minimum_free_percent:
                 Number(document.getElementById("storage-minimum-percent").value),
             make_default:
                 document.getElementById("storage-default").checked,
         };
 
-        if (!editingStorageId)
-            params.storage_type = type;
-
-        if (type === "SSH") {
+        if (type === "LOCAL") {
+            params.backup_data_root = cleanPath(
+                document.getElementById("storage-data-root").value
+            );
+        } else {
+            params.storage_type = "SSH";
             params.ssh_host =
                 document.getElementById("storage-ssh-host").value.trim();
             params.ssh_port =
                 Number(document.getElementById("storage-ssh-port").value);
             params.ssh_user =
                 document.getElementById("storage-ssh-user").value.trim();
-            params.ssh_remote_root =
+            params.ssh_remote_root = cleanPath(
                 document.getElementById(
                     "storage-ssh-remote-root"
-                ).value;
+                ).value
+            );
         }
 
         return params;
@@ -683,19 +743,14 @@
     async function testStoredDestination(destination) {
         const resultNode = document.getElementById("storage-test-result");
 
-        if (storageType(destination) === "SSH") {
-            resultNode.hidden = false;
-            resultNode.className = "probe-result";
-            resultNode.textContent =
-                "SSH connection testing is not available until SSH.4.";
-            return;
-        }
 
         try {
             resultNode.hidden = false;
             resultNode.className = "probe-result";
+            const typeLabel =
+                storageType(destination) === "SSH" ? "SSH" : "Local";
             resultNode.textContent =
-                `Testing Local destination ${destination.name}…`;
+                `Testing ${typeLabel} destination ${destination.name}…`;
             const result = await api.request(
                 "storage.test",
                 { id: destination.id },
@@ -718,7 +773,7 @@
             resultNode.hidden = false;
             resultNode.className = "probe-result";
             resultNode.textContent =
-                "SSH connection testing is not available until SSH.4.";
+                "Save this SSH destination first, then use Test in the Storage table to run receiver preflight.";
             return;
         }
 
@@ -742,6 +797,99 @@
                 null,
                 failureMessage(error),
             );
+        }
+    }
+
+    function setClientIdentityError(message) {
+        document.getElementById(
+            "client-identity-error"
+        ).textContent = message || "";
+    }
+
+    function renderClientIdentity(identity) {
+        const exists = Boolean(identity && identity.exists);
+
+        document.getElementById(
+            "client-identity-status"
+        ).textContent = exists ? "Generated" : "Not generated";
+
+        document.getElementById(
+            "client-identity-fingerprint"
+        ).textContent =
+            exists ? text(identity.fingerprint) : "—";
+
+        document.getElementById(
+            "client-identity-public-key"
+        ).value =
+            exists ? text(identity.public_key) : "";
+
+        document.getElementById(
+            "client-identity-generate"
+        ).hidden = exists;
+
+        document.getElementById(
+            "client-identity-rotate"
+        ).hidden = !exists;
+    }
+
+    async function refreshClientIdentity() {
+        setClientIdentityError("");
+
+        try {
+            const identity = await api.request("ssh.identity.show");
+            renderClientIdentity(identity);
+        } catch (error) {
+            setClientIdentityError(failureMessage(error));
+        }
+    }
+
+    async function openClientIdentity() {
+        renderClientIdentity({
+            exists: false,
+            fingerprint: null,
+            public_key: null,
+        });
+
+        setClientIdentityError("");
+        clientIdentityDialog.showModal();
+        await refreshClientIdentity();
+    }
+
+    async function generateClientIdentity() {
+        setClientIdentityError("");
+
+        try {
+            await api.request("ssh.identity.generate");
+            await refreshClientIdentity();
+            setNotice(
+                "Shared Client SSH identity generated",
+                "success",
+            );
+        } catch (error) {
+            setClientIdentityError(failureMessage(error));
+        }
+    }
+
+    async function rotateClientIdentity() {
+        if (!window.confirm(
+            "Rotate this SSH client identity? " +
+            "It is shared by all outgoing SSH destinations. " +
+            "Every receiver authorized with the current public key " +
+            "must be updated."
+        ))
+            return;
+
+        setClientIdentityError("");
+
+        try {
+            await api.request("ssh.identity.rotate");
+            await refreshClientIdentity();
+            setNotice(
+                "Shared Client SSH identity rotated",
+                "success",
+            );
+        } catch (error) {
+            setClientIdentityError(failureMessage(error));
         }
     }
 
@@ -880,7 +1028,7 @@
             await refreshSSHSetup();
 
             setNotice(
-                `SSH identity generated for ${sshSetupDestination.name}`,
+                "Shared Client SSH identity generated",
                 "success",
             );
         } catch (error) {
@@ -893,7 +1041,7 @@
             return;
 
         if (!window.confirm(
-            "Rotate this SSH client identity? The old public key will stop authenticating after receiver authorization is updated."
+            "Rotate this SSH client identity? It is shared by all outgoing SSH destinations. Every receiver authorized with the current public key must be updated."
         ))
             return;
 
@@ -908,7 +1056,7 @@
             await refreshSSHSetup();
 
             setNotice(
-                `SSH identity rotated for ${sshSetupDestination.name}`,
+                "Shared Client SSH identity rotated",
                 "success",
             );
         } catch (error) {
@@ -981,6 +1129,189 @@
         }
     }
 
+    function setReceiverSetupError(message) {
+        document.getElementById("receiver-setup-error").textContent =
+            message || "";
+    }
+
+    function renderReceiverInfo(info) {
+        document.getElementById("receiver-account").textContent =
+            text(info.account);
+        document.getElementById("receiver-port").textContent =
+            text(info.port);
+        document.getElementById("receiver-backup-root").textContent =
+            text(info.backup_root);
+
+        document.getElementById("receiver-hostkey-status").textContent =
+            info.host_key_exists ? "Available" : "Not generated";
+
+        document.getElementById(
+            "receiver-hostkey-fingerprint"
+        ).textContent = info.host_fingerprint || "—";
+
+        document.getElementById(
+            "receiver-host-public-key"
+        ).value = info.host_public_key || "";
+    }
+
+    function renderReceiverSources(sources) {
+        for (const bodyId of [
+            "receiver-sources-summary",
+            "receiver-sources",
+        ]) {
+            const body = document.getElementById(bodyId);
+            if (!body)
+                continue;
+
+            const rows = [];
+
+            for (const source of sources) {
+                const row = document.createElement("tr");
+
+                const label = document.createElement("td");
+                label.textContent = source.label;
+
+                const fingerprint = document.createElement("td");
+                fingerprint.textContent = source.fingerprint;
+
+                const actions = document.createElement("td");
+                const revoke = document.createElement("button");
+                revoke.type = "button";
+                revoke.textContent = "Revoke";
+                revoke.addEventListener("click", () => {
+                    void revokeReceiverSource(source);
+                });
+
+                actions.appendChild(revoke);
+                row.append(label, fingerprint, actions);
+                rows.push(row);
+            }
+
+            if (rows.length === 0) {
+                const row = document.createElement("tr");
+                const cell = document.createElement("td");
+                cell.colSpan = 3;
+                cell.textContent = "No authorized sources";
+                row.appendChild(cell);
+                rows.push(row);
+            }
+
+            body.replaceChildren(...rows);
+        }
+    }
+
+    async function refreshReceiverSourcesSummary() {
+        try {
+            const sources = await api.request("receiver.key.list");
+            renderReceiverSources(sources);
+        } catch (error) {
+            const body =
+                document.getElementById("receiver-sources-summary");
+            if (!body)
+                return;
+
+            const row = document.createElement("tr");
+            const cell = document.createElement("td");
+            cell.colSpan = 3;
+            cell.textContent =
+                `Unable to load authorized sources: ${failureMessage(error)}`;
+            row.appendChild(cell);
+            body.replaceChildren(row);
+        }
+    }
+
+    async function refreshReceiverSetup() {
+        setReceiverSetupError("");
+
+        try {
+            const [info, sources] = await Promise.all([
+                api.request("receiver.info"),
+                api.request("receiver.key.list"),
+            ]);
+
+            renderReceiverInfo(info);
+            renderReceiverSources(sources);
+        } catch (error) {
+            setReceiverSetupError(failureMessage(error));
+        }
+    }
+
+    async function openReceiverSetup() {
+        document.getElementById("receiver-source-label").value = "";
+        document.getElementById("receiver-source-key").value = "";
+        setReceiverSetupError("");
+
+        receiverDialog.showModal();
+        await refreshReceiverSetup();
+    }
+
+    async function addReceiverSource() {
+        const label =
+            document.getElementById("receiver-source-label").value.trim();
+        const key =
+            document.getElementById("receiver-source-key").value.trim();
+
+        if (!label) {
+            setReceiverSetupError("Enter a source name.");
+            return;
+        }
+
+        if (!key) {
+            setReceiverSetupError(
+                "Paste the source Client identity public key."
+            );
+            return;
+        }
+
+        setReceiverSetupError("");
+
+        try {
+            await api.request(
+                "receiver.key.add",
+                {
+                    label: label,
+                    key: key,
+                },
+            );
+
+            document.getElementById(
+                "receiver-source-label"
+            ).value = "";
+            document.getElementById(
+                "receiver-source-key"
+            ).value = "";
+
+            await refreshReceiverSetup();
+            setNotice(`Authorized SSH source ${label}`, "success");
+        } catch (error) {
+            setReceiverSetupError(failureMessage(error));
+        }
+    }
+
+    async function revokeReceiverSource(source) {
+        if (!window.confirm(
+            `Revoke SSH authorization for ${source.label}?`
+        ))
+            return;
+
+        setReceiverSetupError("");
+
+        try {
+            await api.request(
+                "receiver.key.revoke",
+                { fingerprint: source.fingerprint },
+            );
+
+            await refreshReceiverSetup();
+            setNotice(
+                `Revoked SSH source ${source.label}`,
+                "success",
+            );
+        } catch (error) {
+            setReceiverSetupError(failureMessage(error));
+        }
+    }
+
     async function setDefaultStorage(destination) {
         try {
             setNotice(`Setting ${destination.name} as default…`, "loading");
@@ -1027,6 +1358,7 @@
         renderStorage(model);
         renderDiscoveredVms(model);
         renderSystemDetails(model.status);
+        void refreshReceiverSourcesSummary();
     }
 
     function populateJobOptions(editingJob) {
@@ -1320,6 +1652,47 @@
         updateStorageTransportFields,
     );
     storageForm.addEventListener("submit", saveStorage);
+
+    clientIdentityOpenButton.addEventListener(
+        "click",
+        openClientIdentity,
+    );
+
+    document.getElementById(
+        "client-identity-close"
+    ).addEventListener(
+        "click",
+        () => clientIdentityDialog.close(),
+    );
+
+    document.getElementById(
+        "client-identity-generate"
+    ).addEventListener(
+        "click",
+        generateClientIdentity,
+    );
+
+    document.getElementById(
+        "client-identity-rotate"
+    ).addEventListener(
+        "click",
+        rotateClientIdentity,
+    );
+
+    receiverOpenButton.addEventListener(
+        "click",
+        openReceiverSetup,
+    );
+
+    document.getElementById("receiver-close").addEventListener(
+        "click",
+        () => receiverDialog.close(),
+    );
+
+    document.getElementById("receiver-source-add").addEventListener(
+        "click",
+        addReceiverSource,
+    );
 
     document.getElementById("ssh-close").addEventListener(
         "click",

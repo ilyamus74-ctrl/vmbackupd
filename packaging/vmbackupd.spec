@@ -2,7 +2,7 @@
 
 Name:           vmbackupd
 Version:        %{upstream_version}
-Release:        2%{?dist}
+Release:        3%{?dist}
 Summary:        Local KVM/libvirt backup management daemon
 License:        LicenseRef-Proprietary
 Source0:        %{name}-%{version}.tar.gz
@@ -125,6 +125,10 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-sshd.service \
 %{_datadir}/cockpit/vmbackupd/
 
 %changelog
+* Tue Aug 18 2026 vmbackupd packagers <packagers@example.invalid> - 0.1.0-3
+- Add Cockpit SSH receiver authorization controls
+- Manage SSH staging paths automatically
+
 * Tue Aug 18 2026 vmbackupd packagers <packagers@example.invalid> - 0.1.0-2
 - Merge daemon, Cockpit frontend, and SSH receiver into one RPM
 

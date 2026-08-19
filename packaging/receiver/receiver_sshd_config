@@ -45,4 +45,6 @@ MaxSessions 1
 MaxAuthTries 3
 
 UseDNS no
+PrintMotd no
+PrintLastLog no
 LogLevel VERBOSE

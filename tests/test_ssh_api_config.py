@@ -208,6 +208,30 @@ ssh_remote_root = "/srv/vmbackupd\"""",
 
     components = compose(config)
 
+    system_identity = (
+        components.repository.get_storage_destination_by_name(
+            components.application.node.id,
+            "__vmbackupd_ssh_identity__",
+        )
+    )
+    assert system_identity is not None
+    assert system_identity.storage_type is StorageType.SSH
+    assert system_identity.is_default is False
+
+    visible_storage = components.application.storage_list()
+    assert all(
+        item["id"] != system_identity.id
+        for item in visible_storage
+    )
+
+    shared_identity = components.application.dispatch(
+        "ssh.identity.show",
+        {},
+    )
+    assert shared_identity["exists"] is True
+    assert shared_identity["fingerprint"].startswith("SHA256:")
+    assert shared_identity["public_key"].startswith("ssh-ed25519 ")
+
     destination = components.repository.get_default_storage_destination(
         components.application.node.id
     )
@@ -292,10 +316,48 @@ def test_ssh_storage_test_is_fail_closed(tmp_path):
     with pytest.raises(ApplicationError) as caught:
         app.dispatch("storage.test", {"id": ssh.id})
 
-    assert caught.value.code == "REMOTE_TRANSPORT_NOT_IMPLEMENTED"
+    assert caught.value.code == "SSH_PREFLIGHT_UNAVAILABLE"
 
     repository.close()
 
+
+
+def test_storage_test_ssh_delegates_to_preflight_client(tmp_path):
+    repository, node, _, ssh = catalog(tmp_path)
+    app = application_for(repository, node)
+
+    class Preflight:
+        def __init__(self):
+            self.destination = None
+
+        def check(self, destination):
+            self.destination = destination
+            return {
+                "ok": True,
+                "storage_type": "SSH",
+                "authenticated": True,
+                "host_key_verified": True,
+                "preflight_ready": True,
+                "transport_ready": False,
+                "free_bytes": 123456,
+            }
+
+    preflight = Preflight()
+    app.ssh_preflight_client = preflight
+
+    result = app.dispatch(
+        "storage.test",
+        {"id": ssh.id},
+    )
+
+    assert preflight.destination == ssh
+    assert result["ok"] is True
+    assert result["authenticated"] is True
+    assert result["host_key_verified"] is True
+    assert result["preflight_ready"] is True
+    assert result["transport_ready"] is False
+
+    repository.close()
 
 def test_api_job_create_refuses_ssh_destination_without_creating_job(tmp_path):
     repository, node, _, ssh = catalog(tmp_path)
@@ -430,3 +492,54 @@ def test_runtime_router_refuses_ssh_before_building_local_executor(tmp_path):
         router._for_run("run")
 
     assert built == []
+
+
+def test_api_create_ssh_destination_assigns_managed_staging(tmp_path):
+    from pathlib import Path
+
+    repository, node, _, _ = catalog(tmp_path)
+    app = application_for(repository, node)
+
+    created = app.dispatch(
+        "storage.create",
+        {
+            "name": "managed-staging",
+            "storage_type": "SSH",
+            "ssh_host": "backup.example.test",
+            "ssh_port": 22022,
+            "ssh_user": "vmbackupd-transfer",
+            "ssh_remote_root": "/srv/vmbackupd",
+        },
+    )
+
+    root = Path(created["backup_data_root"])
+
+    assert root.name == created["id"]
+    assert root.parent.name == "vmbackupd-staging"
+    assert root.is_dir()
+
+    repository.close()
+
+
+def test_api_preserves_explicit_legacy_ssh_staging_path(tmp_path):
+    repository, node, _, _ = catalog(tmp_path)
+    app = application_for(repository, node)
+
+    legacy = tmp_path / "legacy-staging"
+
+    created = app.dispatch(
+        "storage.create",
+        {
+            "name": "legacy-staging",
+            "backup_data_root": str(legacy),
+            "storage_type": "SSH",
+            "ssh_host": "backup.example.test",
+            "ssh_port": 22022,
+            "ssh_user": "vmbackupd-transfer",
+            "ssh_remote_root": "/srv/vmbackupd",
+        },
+    )
+
+    assert created["backup_data_root"] == str(legacy)
+
+    repository.close()

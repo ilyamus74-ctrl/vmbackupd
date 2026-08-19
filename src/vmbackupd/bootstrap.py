@@ -16,13 +16,21 @@ from .libvirt_execution import (
     StagingFilesystem, VirshBackupDriver,
 )
 from .local_api import ApiServer
-from .models import StorageDestination
+from .models import StorageDestination, StorageType
 from .repository import DomainInvariantError, SQLiteRepository
 from .runtime import DaemonRuntime
 from .ssh_identity import SSHIdentityManager
 from .ssh_known_hosts import SSHKnownHostsManager
 from .ssh_receiver import SSHReceiverRegistry
+from .ssh_preflight import SSHPreflightClient
 from .version import __version__
+
+
+SYSTEM_SSH_IDENTITY_NAME = "__vmbackupd_ssh_identity__"
+
+
+def _system_ssh_identity_id(node_id: str) -> str:
+    return f"ssh-identity-{node_id}"
 
 
 @dataclass(slots=True)
@@ -230,15 +238,56 @@ def compose(config: AppConfig) -> Components:
     repository.bootstrap_storage_destinations(
         node.id, intended, config.storage.default_destination
     )
+
+    system_ssh_identity = repository.get_storage_destination_by_name(
+        node.id,
+        SYSTEM_SSH_IDENTITY_NAME,
+    )
+    if system_ssh_identity is None:
+        seed = repository.get_default_storage_destination(node.id)
+        system_ssh_identity = repository.create_storage_destination(
+            StorageDestination(
+                id=_system_ssh_identity_id(node.id),
+                node_id=node.id,
+                name=SYSTEM_SSH_IDENTITY_NAME,
+                backup_data_root=str(
+                    config.daemon.database_path.parent
+                    / "ssh"
+                    / "system-staging"
+                ),
+                backup_data_mode=seed.backup_data_mode,
+                backup_data_uid=seed.backup_data_uid,
+                backup_data_gid=seed.backup_data_gid,
+                minimum_free_bytes=0,
+                minimum_free_percent=0,
+                storage_type=StorageType.SSH,
+                ssh_host="localhost",
+                ssh_port=22022,
+                ssh_user="vmbackupd-transfer",
+                ssh_remote_root="/srv/vmbackupd",
+            ),
+            make_default=False,
+        )
+
     read_driver = VirshLibvirtDriver(SubprocessCommandRunner(), config.libvirt.uri)
     runtime = RuntimeWorker(config, node.id)
     ssh_root = config.daemon.database_path.parent / "ssh"
     ssh_identity_manager = SSHIdentityManager(
         ssh_root,
         SubprocessCommandRunner(),
+        shared_identity_id=system_ssh_identity.id,
     )
+
+    identity_state = ssh_identity_manager.show(system_ssh_identity.id)
+    if not identity_state["exists"]:
+        ssh_identity_manager.generate(system_ssh_identity.id)
     ssh_known_hosts_manager = SSHKnownHostsManager(
         ssh_root,
+    )
+    ssh_preflight_client = SSHPreflightClient(
+        SubprocessCommandRunner(),
+        ssh_identity_manager,
+        ssh_known_hosts_manager,
     )
     ssh_receiver_manager = SSHReceiverRegistry(
         config.daemon.database_path.parent / "receiver",
@@ -250,5 +299,6 @@ def compose(config: AppConfig) -> Components:
         ssh_known_hosts_manager=ssh_known_hosts_manager,
         ssh_receiver_manager=ssh_receiver_manager,
     )
+    application.ssh_preflight_client = ssh_preflight_client
     server = ApiServer(application, config.daemon.socket_path, config.daemon.socket_mode)
     return Components(config, repository, runtime, application, server)

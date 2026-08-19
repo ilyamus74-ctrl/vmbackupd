@@ -23,7 +23,7 @@ def test_spec_has_expected_identity_and_modern_python_build_macros():
     spec = text("vmbackupd.spec")
     assert "Name:           vmbackupd" in spec
     assert "Version:        %{upstream_version}" in spec
-    assert "Release:        2%{?dist}" in spec
+    assert "Release:        3%{?dist}" in spec
     assert "BuildArch:      noarch" in spec
     for macro in ("%pyproject_wheel", "%pyproject_install", "%pyproject_save_files"):
         assert macro in spec

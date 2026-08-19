@@ -1,4 +1,4 @@
-"""Persistent per-destination SSH client identities."""
+"""Persistent daemon-owned SSH client identities."""
 
 from __future__ import annotations
 
@@ -26,10 +26,21 @@ class SSHIdentityError(RuntimeError):
 class SSHIdentityManager:
     """Manage daemon-owned Ed25519 identities outside SQLite."""
 
-    def __init__(self, ssh_root: str | Path, runner: CommandRunner) -> None:
+    def __init__(
+        self,
+        ssh_root: str | Path,
+        runner: CommandRunner,
+        *,
+        shared_identity_id: str | None = None,
+    ) -> None:
         self.ssh_root = Path(ssh_root)
         self.identities_root = self.ssh_root / "identities"
         self.runner = runner
+        self.shared_identity_id = (
+            None
+            if shared_identity_id is None
+            else self._validate_destination_id(shared_identity_id)
+        )
 
     @staticmethod
     def _validate_destination_id(destination_id: str) -> str:
@@ -74,7 +85,8 @@ class SSHIdentityManager:
 
     def _directory(self, destination_id: str) -> Path:
         destination_id = self._validate_destination_id(destination_id)
-        return self.identities_root / destination_id
+        identity_id = self.shared_identity_id or destination_id
+        return self.identities_root / identity_id
 
     @staticmethod
     def _lstat(path: Path):

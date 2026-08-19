@@ -251,6 +251,34 @@ def test_rotation_requires_existing_identity(tmp_path):
     assert caught.value.code == "SSH_IDENTITY_MISSING"
 
 
+
+def test_shared_identity_uses_one_key_for_all_destinations(tmp_path):
+    runner = KeygenRunner()
+    value = SSHIdentityManager(
+        tmp_path / "ssh",
+        runner,
+        shared_identity_id="system-identity",
+    )
+
+    created = value.generate("system-identity")
+    first = value.show("destination-a")
+    second = value.show("destination-b")
+
+    assert created["public_key"] == first["public_key"]
+    assert first["public_key"] == second["public_key"]
+    assert first["fingerprint"] == second["fingerprint"]
+
+    assert value.private_key_path("destination-a") == (
+        tmp_path
+        / "ssh"
+        / "identities"
+        / "system-identity"
+        / "id_ed25519"
+    )
+    assert value.private_key_path("destination-b") == (
+        value.private_key_path("destination-a")
+    )
+
 def application(tmp_path):
     repository = SQLiteRepository()
     node = Node(name="local")
