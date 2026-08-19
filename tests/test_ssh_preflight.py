@@ -274,3 +274,85 @@ def test_receiver_storage_list_is_protocol_v2_and_path_free(
     assert "receiver_directory" not in output
     assert "/srv/" not in output
     assert "/mnt/" not in output
+
+
+def test_receiver_dispatches_exact_transfer_command(
+    tmp_path,
+):
+    calls = []
+
+    def transfer_runner():
+        calls.append(True)
+        return 23
+
+    result = receiver_main(
+        [],
+        environ={
+            "SSH_ORIGINAL_COMMAND":
+                "vmbackupd-transfer-v1",
+        },
+        receiver_root=tmp_path,
+        transfer_runner=transfer_runner,
+    )
+
+    assert result == 23
+    assert calls == [True]
+
+
+def test_receiver_rejects_transfer_command_with_arguments(
+    tmp_path,
+    capsys,
+):
+    calls = []
+
+    def transfer_runner():
+        calls.append(True)
+        return 0
+
+    result = receiver_main(
+        [],
+        environ={
+            "SSH_ORIGINAL_COMMAND":
+                "vmbackupd-transfer-v1 "
+                "--storage /tmp",
+        },
+        receiver_root=tmp_path,
+        transfer_runner=transfer_runner,
+    )
+
+    assert result == 64
+    assert calls == []
+
+    assert (
+        "command is not allowed"
+        in capsys.readouterr().err
+    )
+
+
+def test_receiver_rejects_transfer_shell_metacharacters(
+    tmp_path,
+    capsys,
+):
+    calls = []
+
+    def transfer_runner():
+        calls.append(True)
+        return 0
+
+    result = receiver_main(
+        [],
+        environ={
+            "SSH_ORIGINAL_COMMAND":
+                "vmbackupd-transfer-v1; id",
+        },
+        receiver_root=tmp_path,
+        transfer_runner=transfer_runner,
+    )
+
+    assert result == 64
+    assert calls == []
+
+    assert (
+        "command is not allowed"
+        in capsys.readouterr().err
+    )

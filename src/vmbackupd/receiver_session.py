@@ -1,7 +1,11 @@
 """Restricted SSH receiver protocol entry point.
 
-SSH.4 provides authenticated read-only receiver/capacity preflight.
-Data transfer remains disabled until SSH.5.
+The receiver exposes exact, fail-closed SSH operations for preflight,
+storage discovery, and receiver-side replica staging.
+
+Staging completion does not publish a replica Restore Point. Sender-side
+execution, semantic verification, and final publication remain separate
+later phases.
 """
 
 from __future__ import annotations
@@ -16,6 +20,10 @@ from pathlib import Path
 from .receiver_catalog import (
     ReceiverCatalogClient,
     ReceiverCatalogError,
+)
+from .receiver_transfer import (
+    TRANSFER_COMMAND,
+    run_receiver_transfer,
 )
 
 
@@ -121,6 +129,7 @@ def main(
     environ=None,
     receiver_root=None,
     catalog_client=None,
+    transfer_runner=None,
 ) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
 
@@ -149,6 +158,14 @@ def main(
             else catalog_client
         )
         return _storage_list(client)
+
+    if original == TRANSFER_COMMAND:
+        runner = (
+            run_receiver_transfer
+            if transfer_runner is None
+            else transfer_runner
+        )
+        return runner()
 
     if original:
         print(
