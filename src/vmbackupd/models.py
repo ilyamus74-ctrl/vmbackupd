@@ -49,6 +49,26 @@ class RestorePointStatus(StrEnum):
     AVAILABLE = "AVAILABLE"
 
 
+class RestorePointLocationRole(StrEnum):
+    PRIMARY = "PRIMARY"
+    REPLICA = "REPLICA"
+
+
+class RestorePointLocationState(StrEnum):
+    AVAILABLE = "AVAILABLE"
+    DEGRADED = "DEGRADED"
+    MISSING = "MISSING"
+
+
+class ReplicaTaskState(StrEnum):
+    PENDING = "PENDING"
+    BLOCKED = "BLOCKED"
+    TRANSFERRING = "TRANSFERRING"
+    VERIFYING = "VERIFYING"
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+
+
 class ArtifactKind(StrEnum):
     DISK = "DISK"
     DOMAIN_XML = "DOMAIN_XML"
@@ -459,6 +479,19 @@ class BackupJob:
     created_at: datetime = field(default_factory=utcnow)
 
 
+@dataclass(frozen=True, slots=True)
+class BackupJobReplica:
+    job_id: str
+    destination_id: str
+    ordinal: int
+    enabled: bool = True
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        if self.ordinal < 0:
+            raise ValueError("replica ordinal must be non-negative")
+
+
 class StorageType(StrEnum):
     LOCAL = "LOCAL"
     SSH = "SSH"
@@ -508,6 +541,17 @@ class JobRun:
 
 
 @dataclass(frozen=True, slots=True)
+class JobRunReplica:
+    run_id: str
+    destination_id: str
+    ordinal: int
+
+    def __post_init__(self) -> None:
+        if self.ordinal < 0:
+            raise ValueError("replica ordinal must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
 class BackupChain:
     vm_id: str
     status: BackupChainStatus = BackupChainStatus.ACTIVE
@@ -529,6 +573,51 @@ class RestorePoint:
     status: RestorePointStatus = RestorePointStatus.AVAILABLE
     id: str = field(default_factory=new_id)
     created_at: datetime = field(default_factory=utcnow)
+
+
+@dataclass(frozen=True, slots=True)
+class RestorePointLocation:
+    restore_point_id: str
+    destination_id: str
+    role: RestorePointLocationRole
+    state: RestorePointLocationState
+    bundle_object_id: str | None = None
+    verified_at: datetime | None = None
+    created_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "role",
+            RestorePointLocationRole(self.role),
+        )
+        object.__setattr__(
+            self,
+            "state",
+            RestorePointLocationState(self.state),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ReplicaTask:
+    restore_point_id: str
+    destination_id: str
+    state: ReplicaTaskState = ReplicaTaskState.PENDING
+    attempts: int = 0
+    last_error: str | None = None
+    next_retry_at: datetime | None = None
+    id: str = field(default_factory=new_id)
+    created_at: datetime = field(default_factory=utcnow)
+    updated_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "state",
+            ReplicaTaskState(self.state),
+        )
+        if self.attempts < 0:
+            raise ValueError("replica attempts must be non-negative")
 
 
 @dataclass(frozen=True, slots=True)

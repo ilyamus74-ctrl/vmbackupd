@@ -9,13 +9,15 @@ from pathlib import Path
 from .bundle import BundlePathPlanner
 from .models import (
     ArtifactKind, ArtifactState, BackupArtifact, BackupChain, BackupChainStatus,
-    BackupJob, BackupKind, BackupPolicy, CatchUpMode, DaemonInstance, Event,
-    ExecutionLease, JobRun, LibvirtBackupOperation, LibvirtExternalState, Node,
-    NodeControllerLease, OverlapPolicy, PersistedLibvirtPlan, ReclaimBundle,
-    ReclaimBundleState, ReclaimChain, ReclaimOperation, ReclaimOperationState,
-    RestorePoint, RestorePointStatus, RetentionPolicy, RunDisk, RunState,
-    SchedulePolicy, SpaceReclaimMode, StorageDestination, StorageType, VM,
-    new_id, utcnow,
+    BackupJob, BackupJobReplica, BackupKind, BackupPolicy, CatchUpMode,
+    DaemonInstance, Event, ExecutionLease, JobRun, JobRunReplica,
+    LibvirtBackupOperation, LibvirtExternalState, Node, NodeControllerLease,
+    OverlapPolicy, PersistedLibvirtPlan, ReclaimBundle, ReclaimBundleState,
+    ReclaimChain, ReclaimOperation, ReclaimOperationState, ReplicaTask,
+    ReplicaTaskState, RestorePoint, RestorePointLocation,
+    RestorePointLocationRole, RestorePointLocationState, RestorePointStatus,
+    RetentionPolicy, RunDisk, RunState, SchedulePolicy, SpaceReclaimMode,
+    StorageDestination, StorageType, VM, new_id, utcnow,
 )
 from .state_machine import InvalidStateTransition, validate_transition
 from .schema import ensure_current_schema, get_schema_version
@@ -586,8 +588,52 @@ class SQLiteRepository:
 
             if self.connection.execute(
                 """SELECT 1
+                   FROM backup_job_replicas
+                   WHERE destination_id = ?
+                   LIMIT 1""",
+                (destination_id,),
+            ).fetchone():
+                raise DomainInvariantError(
+                    "STORAGE_DELETE_IN_USE"
+                )
+
+            if self.connection.execute(
+                """SELECT 1
                    FROM job_runs
                    WHERE storage_destination_id = ?
+                   LIMIT 1""",
+                (destination_id,),
+            ).fetchone():
+                raise DomainInvariantError(
+                    "STORAGE_DELETE_HAS_HISTORY"
+                )
+
+            if self.connection.execute(
+                """SELECT 1
+                   FROM job_run_replicas
+                   WHERE destination_id = ?
+                   LIMIT 1""",
+                (destination_id,),
+            ).fetchone():
+                raise DomainInvariantError(
+                    "STORAGE_DELETE_HAS_HISTORY"
+                )
+
+            if self.connection.execute(
+                """SELECT 1
+                   FROM restore_point_locations
+                   WHERE destination_id = ?
+                   LIMIT 1""",
+                (destination_id,),
+            ).fetchone():
+                raise DomainInvariantError(
+                    "STORAGE_DELETE_HAS_HISTORY"
+                )
+
+            if self.connection.execute(
+                """SELECT 1
+                   FROM replica_tasks
+                   WHERE destination_id = ?
                    LIMIT 1""",
                 (destination_id,),
             ).fetchone():
@@ -616,6 +662,173 @@ class SQLiteRepository:
                 raise KeyError(destination_id)
 
         return current
+
+    def list_job_replicas(
+        self,
+        job_id: str,
+    ) -> list[BackupJobReplica]:
+        self.get_job(job_id)
+
+        rows = self.connection.execute(
+            """SELECT *
+               FROM backup_job_replicas
+               WHERE job_id = ?
+               ORDER BY ordinal, destination_id""",
+            (job_id,),
+        )
+
+        return [
+            self._backup_job_replica(row)
+            for row in rows
+        ]
+
+    def set_job_replicas(
+        self,
+        job_id: str,
+        local_node_id: str,
+        destination_ids: list[str],
+        now: datetime,
+    ) -> list[BackupJobReplica]:
+        """Atomically replace future replica targets for a job."""
+
+        requested = list(destination_ids)
+
+        if len(requested) != len(set(requested)):
+            raise DomainInvariantError(
+                "REPLICA_DESTINATION_DUPLICATE"
+            )
+
+        self.connection.execute("BEGIN IMMEDIATE")
+
+        try:
+            job = self.get_job(job_id)
+            vm = self.get_vm(job.vm_id)
+
+            if vm.node_id != local_node_id:
+                raise DomainInvariantError(
+                    "JOB_NOT_LOCAL"
+                )
+
+            if job.storage_destination_id is None:
+                raise DomainInvariantError(
+                    "STORAGE_DESTINATION_REQUIRED"
+                )
+
+            primary = self.get_storage_destination(
+                local_node_id,
+                job.storage_destination_id,
+            )
+
+            if primary.storage_type is not StorageType.LOCAL:
+                raise DomainInvariantError(
+                    "PRIMARY_STORAGE_MUST_BE_LOCAL"
+                )
+
+            replicas: list[StorageDestination] = []
+
+            for destination_id in requested:
+                if destination_id == primary.id:
+                    raise DomainInvariantError(
+                        "REPLICA_MATCHES_PRIMARY"
+                    )
+
+                try:
+                    destination = self.get_storage_destination(
+                        local_node_id,
+                        destination_id,
+                    )
+                except KeyError as exc:
+                    raise DomainInvariantError(
+                        "REPLICA_DESTINATION_NOT_LOCAL"
+                    ) from exc
+
+                replicas.append(destination)
+
+            self.connection.execute(
+                """DELETE FROM backup_job_replicas
+                   WHERE job_id = ?""",
+                (job_id,),
+            )
+
+            for ordinal, destination in enumerate(replicas):
+                self.connection.execute(
+                    """INSERT INTO backup_job_replicas (
+                           job_id,
+                           destination_id,
+                           ordinal,
+                           enabled,
+                           created_at
+                       )
+                       VALUES (?, ?, ?, 1, ?)""",
+                    (
+                        job_id,
+                        destination.id,
+                        ordinal,
+                        now.isoformat(),
+                    ),
+                )
+
+            self.connection.commit()
+
+        except Exception:
+            self.connection.rollback()
+            raise
+
+        return self.list_job_replicas(job_id)
+
+    def list_run_replicas(
+        self,
+        run_id: str,
+    ) -> list[JobRunReplica]:
+        self.get_run(run_id)
+
+        rows = self.connection.execute(
+            """SELECT *
+               FROM job_run_replicas
+               WHERE run_id = ?
+               ORDER BY ordinal, destination_id""",
+            (run_id,),
+        )
+
+        return [
+            self._job_run_replica(row)
+            for row in rows
+        ]
+
+    def _snapshot_job_replicas(
+        self,
+        run_id: str,
+        job_id: str,
+        primary_destination_id: str,
+    ) -> None:
+        rows = self.connection.execute(
+            """SELECT destination_id, ordinal
+               FROM backup_job_replicas
+               WHERE job_id = ?
+                 AND enabled = 1
+               ORDER BY ordinal, destination_id""",
+            (job_id,),
+        ).fetchall()
+
+        for row in rows:
+            if row["destination_id"] == primary_destination_id:
+                raise DomainInvariantError(
+                    "REPLICA_MATCHES_PRIMARY"
+                )
+
+            self.connection.execute(
+                """INSERT INTO job_run_replicas (
+                       run_id,
+                       destination_id,
+                       ordinal
+                   )
+                   VALUES (?, ?, ?)""",
+                (
+                    run_id,
+                    row["destination_id"],
+                    row["ordinal"],
+                ),
+            )
 
     def add_job(self, value: BackupJob) -> None:
         vm = self.get_vm(value.vm_id)
@@ -826,27 +1039,85 @@ class SQLiteRepository:
         self.connection.commit()
 
     def add_run(self, value: JobRun) -> None:
-        destination_id = value.storage_destination_id or self.get_job(
-            value.job_id
-        ).storage_destination_id
-        if destination_id is None:
-            raise DomainInvariantError("STORAGE_DESTINATION_REQUIRED")
-        self.connection.execute(
-            """INSERT INTO job_runs
-               (id, job_id, storage_destination_id, state, planned_kind, planned_chain_id, planned_sequence,
-                parent_restore_point_id, error, cleanup_error, cleanup_attempts,
-                scheduled_for, is_catch_up, missed_schedule_slots,
-                recovery_required, recovery_reason, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (value.id, value.job_id, destination_id, value.state, value.planned_kind, value.planned_chain_id,
-             value.planned_sequence, value.parent_restore_point_id, value.error,
-             value.cleanup_error, value.cleanup_attempts,
-             value.scheduled_for.isoformat() if value.scheduled_for else None,
-             int(value.is_catch_up), value.missed_schedule_slots,
-             int(value.recovery_required), value.recovery_reason, value.created_at.isoformat(),
-             value.updated_at.isoformat()),
+        job = self.get_job(value.job_id)
+
+        destination_id = (
+            value.storage_destination_id
+            or job.storage_destination_id
         )
-        self.connection.commit()
+
+        if destination_id is None:
+            raise DomainInvariantError(
+                "STORAGE_DESTINATION_REQUIRED"
+            )
+
+        vm = self.get_vm(job.vm_id)
+
+        try:
+            self.get_storage_destination(
+                vm.node_id,
+                destination_id,
+            )
+        except KeyError as exc:
+            raise DomainInvariantError(
+                "STORAGE_DESTINATION_NOT_LOCAL"
+            ) from exc
+
+        try:
+            self.connection.execute(
+                "BEGIN IMMEDIATE"
+            )
+
+            self.connection.execute(
+                """INSERT INTO job_runs
+                   (id, job_id, storage_destination_id, state,
+                    planned_kind, planned_chain_id,
+                    planned_sequence,
+                    parent_restore_point_id, error,
+                    cleanup_error, cleanup_attempts,
+                    scheduled_for, is_catch_up,
+                    missed_schedule_slots,
+                    recovery_required, recovery_reason,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    value.id,
+                    value.job_id,
+                    destination_id,
+                    value.state,
+                    value.planned_kind,
+                    value.planned_chain_id,
+                    value.planned_sequence,
+                    value.parent_restore_point_id,
+                    value.error,
+                    value.cleanup_error,
+                    value.cleanup_attempts,
+                    (
+                        value.scheduled_for.isoformat()
+                        if value.scheduled_for
+                        else None
+                    ),
+                    int(value.is_catch_up),
+                    value.missed_schedule_slots,
+                    int(value.recovery_required),
+                    value.recovery_reason,
+                    value.created_at.isoformat(),
+                    value.updated_at.isoformat(),
+                ),
+            )
+
+            self._snapshot_job_replicas(
+                value.id,
+                value.job_id,
+                destination_id,
+            )
+
+            self.connection.commit()
+
+        except Exception:
+            self.connection.rollback()
+            raise
 
     def _insert(self, table: str, value: object, columns: tuple[str, ...]) -> None:
         raw = []
@@ -1310,6 +1581,356 @@ class SQLiteRepository:
             raise KeyError(restore_point_id)
         return self._restore_point(row)
 
+    def list_restore_point_locations(
+        self,
+        restore_point_id: str,
+    ) -> list[RestorePointLocation]:
+        self.get_restore_point(restore_point_id)
+
+        rows = self.connection.execute(
+            """SELECT *
+               FROM restore_point_locations
+               WHERE restore_point_id = ?
+               ORDER BY
+                   CASE role
+                       WHEN 'PRIMARY' THEN 0
+                       ELSE 1
+                   END,
+                   destination_id""",
+            (restore_point_id,),
+        )
+
+        return [
+            self._restore_point_location(row)
+            for row in rows
+        ]
+
+    def get_restore_point_location(
+        self,
+        restore_point_id: str,
+        destination_id: str,
+    ) -> RestorePointLocation:
+        row = self.connection.execute(
+            """SELECT *
+               FROM restore_point_locations
+               WHERE restore_point_id = ?
+                 AND destination_id = ?""",
+            (
+                restore_point_id,
+                destination_id,
+            ),
+        ).fetchone()
+
+        if row is None:
+            raise KeyError(
+                (restore_point_id, destination_id)
+            )
+
+        return self._restore_point_location(row)
+
+    def add_restore_point_location(
+        self,
+        value: RestorePointLocation,
+    ) -> RestorePointLocation:
+        context = self.connection.execute(
+            """SELECT
+                   rp.parent_restore_point_id,
+                   jr.storage_destination_id
+                       AS primary_destination_id,
+                   vm.node_id
+                       AS vm_node_id
+               FROM restore_points rp
+               JOIN job_runs jr
+                 ON jr.id = rp.job_run_id
+               JOIN backup_jobs bj
+                 ON bj.id = jr.job_id
+               JOIN vms vm
+                 ON vm.id = bj.vm_id
+               WHERE rp.id = ?""",
+            (value.restore_point_id,),
+        ).fetchone()
+
+        if context is None:
+            raise KeyError(value.restore_point_id)
+
+        destination = self.connection.execute(
+            """SELECT node_id
+               FROM storage_destinations
+               WHERE id = ?""",
+            (value.destination_id,),
+        ).fetchone()
+
+        if (
+            destination is None
+            or destination["node_id"]
+            != context["vm_node_id"]
+        ):
+            raise DomainInvariantError(
+                "REPLICA_DESTINATION_NOT_LOCAL"
+            )
+
+        if (
+            value.role
+            is RestorePointLocationRole.PRIMARY
+        ):
+            if (
+                value.destination_id
+                != context["primary_destination_id"]
+            ):
+                raise DomainInvariantError(
+                    "PRIMARY_LOCATION_DESTINATION_MISMATCH"
+                )
+
+            if (
+                value.state
+                is not RestorePointLocationState.AVAILABLE
+            ):
+                raise DomainInvariantError(
+                    "PRIMARY_LOCATION_MUST_BE_AVAILABLE"
+                )
+
+        elif (
+            value.destination_id
+            == context["primary_destination_id"]
+        ):
+            raise DomainInvariantError(
+                "REPLICA_MATCHES_PRIMARY"
+            )
+
+        try:
+            with self.connection:
+                self.connection.execute(
+                    """INSERT INTO restore_point_locations (
+                           restore_point_id,
+                           destination_id,
+                           role,
+                           state,
+                           bundle_object_id,
+                           verified_at,
+                           created_at
+                       )
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        value.restore_point_id,
+                        value.destination_id,
+                        value.role,
+                        value.state,
+                        value.bundle_object_id,
+                        (
+                            value.verified_at.isoformat()
+                            if value.verified_at
+                            else None
+                        ),
+                        value.created_at.isoformat(),
+                    ),
+                )
+
+                if (
+                    value.role
+                    is RestorePointLocationRole.REPLICA
+                    and value.state
+                    is RestorePointLocationState.AVAILABLE
+                ):
+                    self.connection.execute(
+                        """UPDATE replica_tasks
+                           SET state = 'PENDING',
+                               last_error = NULL,
+                               next_retry_at = NULL,
+                               updated_at = ?
+                           WHERE destination_id = ?
+                             AND state = 'BLOCKED'
+                             AND restore_point_id IN (
+                                 SELECT id
+                                 FROM restore_points
+                                 WHERE parent_restore_point_id = ?
+                             )""",
+                        (
+                            value.created_at.isoformat(),
+                            value.destination_id,
+                            value.restore_point_id,
+                        ),
+                    )
+
+        except sqlite3.IntegrityError as exc:
+            raise DomainInvariantError(
+                f"restore-point location rejected: {exc}"
+            ) from exc
+
+        return self.get_restore_point_location(
+            value.restore_point_id,
+            value.destination_id,
+        )
+
+    def get_replica_task(
+        self,
+        task_id: str,
+    ) -> ReplicaTask:
+        row = self.connection.execute(
+            """SELECT *
+               FROM replica_tasks
+               WHERE id = ?""",
+            (task_id,),
+        ).fetchone()
+
+        if row is None:
+            raise KeyError(task_id)
+
+        return self._replica_task(row)
+
+    def list_replica_tasks(
+        self,
+        restore_point_id: str | None = None,
+    ) -> list[ReplicaTask]:
+        sql = """SELECT *
+                 FROM replica_tasks"""
+        params: tuple[str, ...] = ()
+
+        if restore_point_id is not None:
+            sql += " WHERE restore_point_id = ?"
+            params = (restore_point_id,)
+
+        sql += " ORDER BY created_at, id"
+
+        return [
+            self._replica_task(row)
+            for row in self.connection.execute(
+                sql,
+                params,
+            )
+        ]
+
+    def _insert_replica_task(
+        self,
+        restore_point_id: str,
+        destination_id: str,
+        now: datetime,
+    ) -> ReplicaTask:
+        context = self.connection.execute(
+            """SELECT
+                   rp.parent_restore_point_id,
+                   jr.storage_destination_id
+                       AS primary_destination_id,
+                   vm.node_id
+                       AS vm_node_id
+               FROM restore_points rp
+               JOIN job_runs jr
+                 ON jr.id = rp.job_run_id
+               JOIN backup_jobs bj
+                 ON bj.id = jr.job_id
+               JOIN vms vm
+                 ON vm.id = bj.vm_id
+               WHERE rp.id = ?""",
+            (restore_point_id,),
+        ).fetchone()
+
+        if context is None:
+            raise KeyError(restore_point_id)
+
+        destination = self.connection.execute(
+            """SELECT node_id
+               FROM storage_destinations
+               WHERE id = ?""",
+            (destination_id,),
+        ).fetchone()
+
+        if (
+            destination is None
+            or destination["node_id"]
+            != context["vm_node_id"]
+        ):
+            raise DomainInvariantError(
+                "REPLICA_DESTINATION_NOT_LOCAL"
+            )
+
+        if (
+            destination_id
+            == context["primary_destination_id"]
+        ):
+            raise DomainInvariantError(
+                "REPLICA_MATCHES_PRIMARY"
+            )
+
+        state = ReplicaTaskState.PENDING
+
+        parent_id = context[
+            "parent_restore_point_id"
+        ]
+
+        if parent_id is not None:
+            parent_available = (
+                self.connection.execute(
+                    """SELECT 1
+                       FROM restore_point_locations
+                       WHERE restore_point_id = ?
+                         AND destination_id = ?
+                         AND state = 'AVAILABLE'
+                       LIMIT 1""",
+                    (
+                        parent_id,
+                        destination_id,
+                    ),
+                ).fetchone()
+            )
+
+            if parent_available is None:
+                state = ReplicaTaskState.BLOCKED
+
+        task = ReplicaTask(
+            restore_point_id=restore_point_id,
+            destination_id=destination_id,
+            state=state,
+            created_at=now,
+            updated_at=now,
+        )
+
+        self.connection.execute(
+            """INSERT INTO replica_tasks (
+                   id,
+                   restore_point_id,
+                   destination_id,
+                   state,
+                   attempts,
+                   last_error,
+                   next_retry_at,
+                   created_at,
+                   updated_at
+               )
+               VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?)""",
+            (
+                task.id,
+                task.restore_point_id,
+                task.destination_id,
+                task.state,
+                task.attempts,
+                task.created_at.isoformat(),
+                task.updated_at.isoformat(),
+            ),
+        )
+
+        return task
+
+    def create_replica_task(
+        self,
+        restore_point_id: str,
+        destination_id: str,
+        now: datetime,
+    ) -> ReplicaTask:
+        """Create an explicit task; also supports future backfill."""
+
+        try:
+            with self.connection:
+                task = self._insert_replica_task(
+                    restore_point_id,
+                    destination_id,
+                    now,
+                )
+        except sqlite3.IntegrityError as exc:
+            raise DomainInvariantError(
+                f"replica task rejected: {exc}"
+            ) from exc
+
+        return self.get_replica_task(task.id)
+
     def finalize_success(self, run_id: str, backup_object_id: str | None = None) -> JobRun:
         """Atomically publish verified artifacts, restore point, chain, event, and SUCCESS."""
         now = utcnow()
@@ -1402,6 +2023,39 @@ class SQLiteRepository:
                      point.libvirt_checkpoint_name, point.status,
                      point.created_at.isoformat(), point.bundle_object_id),
                 )
+                self.connection.execute(
+                    """INSERT INTO restore_point_locations (
+                           restore_point_id,
+                           destination_id,
+                           role,
+                           state,
+                           bundle_object_id,
+                           verified_at,
+                           created_at
+                       )
+                       VALUES (?, ?, 'PRIMARY', 'AVAILABLE', ?, ?, ?)""",
+                    (
+                        point.id,
+                        row["storage_destination_id"],
+                        point.bundle_object_id,
+                        now.isoformat(),
+                        now.isoformat(),
+                    ),
+                )
+
+                for replica in self.connection.execute(
+                    """SELECT destination_id
+                       FROM job_run_replicas
+                       WHERE run_id = ?
+                       ORDER BY ordinal, destination_id""",
+                    (run_id,),
+                ).fetchall():
+                    self._insert_replica_task(
+                        point.id,
+                        replica["destination_id"],
+                        now,
+                    )
+
                 self.connection.execute(
                     """UPDATE backup_artifacts SET restore_point_id = ?, state = 'PUBLISHED'
                        WHERE job_run_id = ?""", (point.id, run_id),
@@ -1586,6 +2240,12 @@ class SQLiteRepository:
                 (run.id, run.job_id, run.storage_destination_id, run.state, due.isoformat(), int(is_catch_up),
                  run.missed_schedule_slots, now.isoformat(), now.isoformat()),
             )
+            self._snapshot_job_replicas(
+                run.id,
+                job.id,
+                run.storage_destination_id,
+            )
+
             self.connection.execute(
                 "UPDATE backup_jobs SET next_run_at = ? WHERE id = ?",
                 (next_run_at.isoformat(), job.id),
@@ -1662,6 +2322,12 @@ class SQLiteRepository:
                            NULL, 0, 0, 0, NULL, ?, ?)""",
                 (run.id, job.id, run.storage_destination_id, now.isoformat(), now.isoformat()),
             )
+            self._snapshot_job_replicas(
+                run.id,
+                job.id,
+                run.storage_destination_id,
+            )
+
             self._insert_event(Event(job_run_id=run.id, event_type="MANUAL_BACKUP_REQUESTED",
                                      message="manual backup run created", created_at=now))
             self.connection.commit()
@@ -4401,6 +5067,82 @@ class SQLiteRepository:
             source_device=row["source_device"],
             source_inode=row["source_inode"],
             state=ReclaimBundleState(row["state"]),
+        )
+
+    @staticmethod
+    def _backup_job_replica(
+        row: sqlite3.Row,
+    ) -> BackupJobReplica:
+        return BackupJobReplica(
+            job_id=row["job_id"],
+            destination_id=row["destination_id"],
+            ordinal=row["ordinal"],
+            enabled=bool(row["enabled"]),
+            created_at=datetime.fromisoformat(
+                row["created_at"]
+            ),
+        )
+
+    @staticmethod
+    def _job_run_replica(
+        row: sqlite3.Row,
+    ) -> JobRunReplica:
+        return JobRunReplica(
+            run_id=row["run_id"],
+            destination_id=row["destination_id"],
+            ordinal=row["ordinal"],
+        )
+
+    @staticmethod
+    def _restore_point_location(
+        row: sqlite3.Row,
+    ) -> RestorePointLocation:
+        return RestorePointLocation(
+            restore_point_id=row["restore_point_id"],
+            destination_id=row["destination_id"],
+            role=RestorePointLocationRole(
+                row["role"]
+            ),
+            state=RestorePointLocationState(
+                row["state"]
+            ),
+            bundle_object_id=row["bundle_object_id"],
+            verified_at=(
+                datetime.fromisoformat(
+                    row["verified_at"]
+                )
+                if row["verified_at"]
+                else None
+            ),
+            created_at=datetime.fromisoformat(
+                row["created_at"]
+            ),
+        )
+
+    @staticmethod
+    def _replica_task(
+        row: sqlite3.Row,
+    ) -> ReplicaTask:
+        return ReplicaTask(
+            id=row["id"],
+            restore_point_id=row["restore_point_id"],
+            destination_id=row["destination_id"],
+            state=ReplicaTaskState(row["state"]),
+            attempts=row["attempts"],
+            last_error=row["last_error"],
+            next_retry_at=(
+                datetime.fromisoformat(
+                    row["next_retry_at"]
+                )
+                if row["next_retry_at"]
+                else None
+            ),
+            created_at=datetime.fromisoformat(
+                row["created_at"]
+            ),
+            updated_at=datetime.fromisoformat(
+                row["updated_at"]
+            ),
         )
 
     @staticmethod

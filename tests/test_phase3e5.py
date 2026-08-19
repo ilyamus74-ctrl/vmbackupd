@@ -63,6 +63,13 @@ def application(repository, node, clock):
     return VmbackupApplication(repository, runtime, None, config, node, clock, "test")
 
 
+def drop_v12_replica_tables(connection):
+    connection.execute("DROP TABLE replica_tasks")
+    connection.execute("DROP TABLE restore_point_locations")
+    connection.execute("DROP TABLE job_run_replicas")
+    connection.execute("DROP TABLE backup_job_replicas")
+
+
 def version_one_database(path):
     repository = SQLiteRepository(path)
     node, first, _, vm = catalog(repository)
@@ -72,6 +79,7 @@ def version_one_database(path):
     repository.close()
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = OFF")
+    drop_v12_replica_tables(connection)
     drop_v9_schedule_columns(connection)
     drop_v6_reclaim_tables(connection)
     connection.execute("DROP TRIGGER job_runs_destination_required_insert")

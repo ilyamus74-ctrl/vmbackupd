@@ -78,6 +78,13 @@ def drop_v10_storage_transport(connection):
         )
 
 
+def drop_v12_replica_tables(connection):
+    connection.execute("DROP TABLE replica_tasks")
+    connection.execute("DROP TABLE restore_point_locations")
+    connection.execute("DROP TABLE job_run_replicas")
+    connection.execute("DROP TABLE backup_job_replicas")
+
+
 def version_three_database(path, tmp_path):
     repository = SQLiteRepository(path)
     node, destination, vm = catalog(repository, tmp_path)
@@ -95,6 +102,7 @@ def version_three_database(path, tmp_path):
     ))
     repository.close()
     connection = sqlite3.connect(path)
+    drop_v12_replica_tables(connection)
     drop_v9_schedule_columns(connection)
     drop_v6_reclaim_tables(connection)
     drop_v10_storage_transport(connection)
@@ -132,6 +140,7 @@ def published_version_three_database(path, tmp_path):
     }
     repository.close()
     connection = sqlite3.connect(path)
+    drop_v12_replica_tables(connection)
     drop_v9_schedule_columns(connection)
     drop_v6_reclaim_tables(connection)
     drop_v10_storage_transport(connection)

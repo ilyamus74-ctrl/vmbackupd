@@ -16,6 +16,13 @@ from vmbackupd.schema import (
 )
 
 
+def drop_v12_replica_tables(connection):
+    connection.execute("DROP TABLE replica_tasks")
+    connection.execute("DROP TABLE restore_point_locations")
+    connection.execute("DROP TABLE job_run_replicas")
+    connection.execute("DROP TABLE backup_job_replicas")
+
+
 def drop_v6_reclaim_tables(connection):
     connection.execute("DROP TABLE reclaim_bundles")
     connection.execute("DROP TABLE reclaim_chains")
@@ -42,6 +49,8 @@ VERSION_9_STORAGE_IDENTITY_TRIGGER_SQL = """CREATE TRIGGER
 
 def drop_v10_storage_transport(connection):
     """Restore the exact schema-v9 LOCAL-only storage shape."""
+
+    drop_v12_replica_tables(connection)
 
     connection.execute(
         "DROP TRIGGER storage_destination_transport_contract_insert"
@@ -96,6 +105,7 @@ EXPECTED_INDEXES = {
     "one_default_storage_destination", "one_active_chain_per_vm",
     "one_libvirt_uuid_per_node", "one_nondisk_artifact_kind_per_run",
     "one_disk_artifact_target_per_run",
+    "one_primary_location_per_restore_point",
 }
 
 
@@ -1119,6 +1129,7 @@ def test_v10_to_v11_adds_stable_remote_storage_identity_without_data_loss(
     repository.close()
 
     connection = sqlite3.connect(path)
+    drop_v12_replica_tables(connection)
 
     for trigger in (
         "storage_destination_transport_contract_insert",
@@ -1154,7 +1165,7 @@ def test_v10_to_v11_adds_stable_remote_storage_identity_without_data_loss(
     migrated = SQLiteRepository(path)
 
     assert migrated.schema_version == CURRENT_SCHEMA_VERSION
-    assert CURRENT_SCHEMA_VERSION == 11
+    assert CURRENT_SCHEMA_VERSION == 12
 
     columns = {
         row[1]
@@ -1210,5 +1221,126 @@ def test_v10_to_v11_adds_stable_remote_storage_identity_without_data_loss(
 
     assert created.remote_storage_id == stable_id
     assert created.ssh_remote_root is None
+
+    migrated.close()
+
+
+def test_v11_to_v12_adds_replica_topology_and_backfills_primary_locations(
+    tmp_path,
+):
+    path = tmp_path / "v11-to-v12.db"
+
+    (
+        node,
+        destination,
+        vm,
+        job,
+        run,
+        point,
+        artifact_ids,
+    ) = populated_database(path)
+
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA foreign_keys = OFF")
+
+    # Reconstruct exact v11 shape from a fresh v12 database.
+    drop_v12_replica_tables(connection)
+
+    connection.execute(
+        "UPDATE schema_version SET version = 11 WHERE id = 1"
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = SQLiteRepository(path)
+
+    assert migrated.schema_version == 12
+    assert migrated.get_database_schema_version() == 12
+
+    tables = {
+        row[0]
+        for row in migrated.connection.execute(
+            """SELECT name
+               FROM sqlite_master
+               WHERE type = 'table'
+                 AND name NOT LIKE 'sqlite_%'"""
+        )
+    }
+
+    assert {
+        "backup_job_replicas",
+        "job_run_replicas",
+        "restore_point_locations",
+        "replica_tasks",
+    } <= tables
+
+    # Existing primary backup identity must remain untouched.
+    migrated_job = migrated.get_job(job.id)
+    migrated_run = migrated.get_run(run.id)
+    migrated_point = migrated.get_restore_point(point.id)
+
+    assert migrated_job.storage_destination_id == destination.id
+    assert migrated_run.storage_destination_id == destination.id
+
+    assert migrated_point.id == point.id
+    assert migrated_point.chain_id == point.chain_id
+    assert migrated_point.kind == point.kind
+    assert migrated_point.sequence == point.sequence
+    assert (
+        migrated_point.parent_restore_point_id
+        == point.parent_restore_point_id
+    )
+    assert (
+        migrated_point.libvirt_checkpoint_name
+        == point.libvirt_checkpoint_name
+    )
+    assert migrated_point.bundle_object_id == point.bundle_object_id
+
+    location = migrated.connection.execute(
+        """SELECT
+               restore_point_id,
+               destination_id,
+               role,
+               state,
+               bundle_object_id
+           FROM restore_point_locations
+           WHERE restore_point_id = ?""",
+        (point.id,),
+    ).fetchone()
+
+    assert location is not None
+    assert tuple(location) == (
+        point.id,
+        destination.id,
+        "PRIMARY",
+        "AVAILABLE",
+        point.bundle_object_id,
+    )
+
+    # Migration must not invent replicas for historical backups.
+    assert migrated.connection.execute(
+        "SELECT COUNT(*) FROM backup_job_replicas"
+    ).fetchone()[0] == 0
+
+    assert migrated.connection.execute(
+        "SELECT COUNT(*) FROM job_run_replicas"
+    ).fetchone()[0] == 0
+
+    assert migrated.connection.execute(
+        "SELECT COUNT(*) FROM replica_tasks"
+    ).fetchone()[0] == 0
+
+    assert {
+        item.id
+        for item in migrated.list_artifacts_for_run(run.id)
+    } == set(artifact_ids)
+
+    assert migrated.connection.execute(
+        "PRAGMA foreign_key_check"
+    ).fetchall() == []
+
+    assert migrated.connection.execute(
+        "PRAGMA integrity_check"
+    ).fetchone()[0] == "ok"
 
     migrated.close()

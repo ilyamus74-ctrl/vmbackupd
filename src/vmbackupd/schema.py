@@ -9,7 +9,7 @@ import sqlite3
 from collections.abc import Callable, Mapping
 
 
-CURRENT_SCHEMA_VERSION = 11
+CURRENT_SCHEMA_VERSION = 12
 
 
 class SchemaError(RuntimeError):
@@ -166,6 +166,75 @@ VERSION_6_RECLAIM_SCHEMA_STATEMENTS = (
 )
 
 
+REPLICA_SCHEMA_STATEMENTS = (
+    """CREATE TABLE backup_job_replicas (
+        job_id TEXT NOT NULL
+            REFERENCES backup_jobs(id) ON DELETE CASCADE,
+        destination_id TEXT NOT NULL
+            REFERENCES storage_destinations(id),
+        ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+        enabled INTEGER NOT NULL DEFAULT 1
+            CHECK(enabled IN (0, 1)),
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(job_id, destination_id),
+        UNIQUE(job_id, ordinal)
+    )""",
+
+    """CREATE TABLE job_run_replicas (
+        run_id TEXT NOT NULL
+            REFERENCES job_runs(id) ON DELETE CASCADE,
+        destination_id TEXT NOT NULL
+            REFERENCES storage_destinations(id),
+        ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+        PRIMARY KEY(run_id, destination_id),
+        UNIQUE(run_id, ordinal)
+    )""",
+
+    """CREATE TABLE restore_point_locations (
+        restore_point_id TEXT NOT NULL
+            REFERENCES restore_points(id) ON DELETE CASCADE,
+        destination_id TEXT NOT NULL
+            REFERENCES storage_destinations(id),
+        role TEXT NOT NULL
+            CHECK(role IN ('PRIMARY', 'REPLICA')),
+        state TEXT NOT NULL
+            CHECK(state IN ('AVAILABLE', 'DEGRADED', 'MISSING')),
+        bundle_object_id TEXT,
+        verified_at TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(restore_point_id, destination_id)
+    )""",
+
+    """CREATE TABLE replica_tasks (
+        id TEXT PRIMARY KEY,
+        restore_point_id TEXT NOT NULL
+            REFERENCES restore_points(id) ON DELETE CASCADE,
+        destination_id TEXT NOT NULL
+            REFERENCES storage_destinations(id),
+        state TEXT NOT NULL
+            CHECK(state IN (
+                'PENDING',
+                'BLOCKED',
+                'TRANSFERRING',
+                'VERIFYING',
+                'SUCCESS',
+                'FAILED'
+            )),
+        attempts INTEGER NOT NULL DEFAULT 0
+            CHECK(attempts >= 0),
+        last_error TEXT,
+        next_retry_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(restore_point_id, destination_id)
+    )""",
+
+    """CREATE UNIQUE INDEX one_primary_location_per_restore_point
+        ON restore_point_locations(restore_point_id)
+        WHERE role = 'PRIMARY'""",
+)
+
+
 CURRENT_SCHEMA_STATEMENTS = (
     """CREATE TABLE nodes (
         id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
@@ -259,6 +328,7 @@ CURRENT_SCHEMA_STATEMENTS = (
         bundle_object_id TEXT,
         UNIQUE(chain_id, sequence)
     )""",
+    *REPLICA_SCHEMA_STATEMENTS,
     """CREATE TABLE backup_artifacts (
         id TEXT PRIMARY KEY, job_run_id TEXT NOT NULL REFERENCES job_runs(id),
         restore_point_id TEXT REFERENCES restore_points(id),
@@ -477,6 +547,21 @@ CURRENT_COLUMNS = {
                        "backup_object_id", "parent_restore_point_id",
                        "libvirt_checkpoint_name", "status", "created_at",
                        "bundle_object_id"},
+    "backup_job_replicas": {
+        "job_id", "destination_id", "ordinal", "enabled", "created_at",
+    },
+    "job_run_replicas": {
+        "run_id", "destination_id", "ordinal",
+    },
+    "restore_point_locations": {
+        "restore_point_id", "destination_id", "role", "state",
+        "bundle_object_id", "verified_at", "created_at",
+    },
+    "replica_tasks": {
+        "id", "restore_point_id", "destination_id", "state",
+        "attempts", "last_error", "next_retry_at",
+        "created_at", "updated_at",
+    },
     "backup_artifacts": {"id", "job_run_id", "restore_point_id", "kind", "disk_target",
                          "object_id", "published_object_id", "format", "size_bytes",
                          "checksum_algorithm", "checksum",
@@ -513,8 +598,19 @@ CURRENT_COLUMNS = {
     },
 }
 
-VERSION_10_COLUMNS = {
+VERSION_11_COLUMNS = {
     name: set(columns) for name, columns in CURRENT_COLUMNS.items()
+}
+for _table in (
+    "backup_job_replicas",
+    "job_run_replicas",
+    "restore_point_locations",
+    "replica_tasks",
+):
+    VERSION_11_COLUMNS.pop(_table)
+
+VERSION_10_COLUMNS = {
+    name: set(columns) for name, columns in VERSION_11_COLUMNS.items()
 }
 VERSION_10_COLUMNS["storage_destinations"].remove(
     "remote_storage_id"
@@ -582,6 +678,22 @@ REQUIRED_FOREIGN_KEYS = {
     "backup_chains": {("vm_id", "vms", "id")},
     "restore_points": {("chain_id", "backup_chains", "id"),
                        ("job_run_id", "job_runs", "id")},
+    "backup_job_replicas": {
+        ("job_id", "backup_jobs", "id"),
+        ("destination_id", "storage_destinations", "id"),
+    },
+    "job_run_replicas": {
+        ("run_id", "job_runs", "id"),
+        ("destination_id", "storage_destinations", "id"),
+    },
+    "restore_point_locations": {
+        ("restore_point_id", "restore_points", "id"),
+        ("destination_id", "storage_destinations", "id"),
+    },
+    "replica_tasks": {
+        ("restore_point_id", "restore_points", "id"),
+        ("destination_id", "storage_destinations", "id"),
+    },
     "backup_artifacts": {("job_run_id", "job_runs", "id"),
                          ("restore_point_id", "restore_points", "id")},
     "run_disks": {("run_id", "job_runs", "id"),
@@ -617,6 +729,8 @@ REQUIRED_INDEXES = {
         ("backup_artifacts", ("job_run_id", "kind"), True, True),
     "one_disk_artifact_target_per_run":
         ("backup_artifacts", ("job_run_id", "disk_target"), True, True),
+    "one_primary_location_per_restore_point":
+        ("restore_point_locations", ("restore_point_id",), True, True),
 }
 
 REQUIRED_TRIGGERS = {
@@ -842,6 +956,8 @@ def _validate_fingerprint(
         if not required <= actual:
             raise UnsupportedSchemaError(f"schema foreign-key fingerprint mismatch for {table}")
     for name, (table, columns, unique, partial) in REQUIRED_INDEXES.items():
+        if table not in expected_columns:
+            continue
         rows = [row for row in connection.execute(f'PRAGMA index_list("{table}")')
                 if row[1] == name]
         if len(rows) != 1 or bool(rows[0][2]) != unique or bool(rows[0][4]) != partial:
@@ -1570,6 +1686,60 @@ def migrate_10_to_11(connection: sqlite3.Connection) -> None:
     connection.execute(STORAGE_IDENTITY_TRIGGER_SQL)
 
 
+def migrate_11_to_12(connection: sqlite3.Connection) -> None:
+    """Add restore-point-centric replica topology and location catalog."""
+
+    _validate_fingerprint(
+        connection,
+        VERSION_11_COLUMNS,
+    )
+
+    for statement in REPLICA_SCHEMA_STATEMENTS:
+        connection.execute(statement)
+
+    # Existing restore points already represent successful primary
+    # publications. Backfill their physical PRIMARY location from the
+    # immutable destination snapshot stored in job_runs.
+    connection.execute(
+        """INSERT INTO restore_point_locations (
+               restore_point_id,
+               destination_id,
+               role,
+               state,
+               bundle_object_id,
+               verified_at,
+               created_at
+           )
+           SELECT
+               rp.id,
+               jr.storage_destination_id,
+               'PRIMARY',
+               'AVAILABLE',
+               rp.bundle_object_id,
+               NULL,
+               rp.created_at
+           FROM restore_points rp
+           JOIN job_runs jr
+             ON jr.id = rp.job_run_id
+           WHERE jr.storage_destination_id IS NOT NULL"""
+    )
+
+    missing_primary = connection.execute(
+        """SELECT rp.id
+           FROM restore_points rp
+           LEFT JOIN restore_point_locations location
+             ON location.restore_point_id = rp.id
+            AND location.role = 'PRIMARY'
+           WHERE location.restore_point_id IS NULL
+           LIMIT 1"""
+    ).fetchone()
+
+    if missing_primary is not None:
+        raise SchemaMigrationError(
+            "cannot backfill primary restore-point location"
+        )
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: migrate_0_to_1,
     1: migrate_1_to_2,
@@ -1582,6 +1752,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     8: migrate_8_to_9,
     9: migrate_9_to_10,
     10: migrate_10_to_11,
+    11: migrate_11_to_12,
 }
 
 
