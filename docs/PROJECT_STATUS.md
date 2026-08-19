@@ -85,6 +85,97 @@ Implemented live refresh of active backup state in Cockpit.
 
 ---
 
+## Managed local storage lifecycle (R1)
+
+Status: CLOSED
+
+Closing commit:
+
+    4fe1f11
+
+Implemented the managed LOCAL storage foundation used by both local backup
+destinations and the later SSH receiver storage catalog.
+
+Key properties:
+
+- LOCAL storage remains an ordinary `StorageDestination` in the unified
+  storage catalog;
+- creating or changing a LOCAL destination prepares the storage root
+  automatically through a narrow privileged helper;
+- the main vmbackupd daemon remains unprivileged;
+- the privileged helper is exposed only through its dedicated AF_UNIX
+  systemd socket;
+- storage paths are validated as absolute paths and symlink traversal is
+  rejected;
+- arbitrary recursive ownership changes are not performed;
+- only the final managed storage root is created automatically;
+- managed storage root ownership is `vmbackupd:qemu` with mode `0750`;
+- each managed root receives a `.vmbackupd-receiver` namespace for future
+  incoming replicas;
+- the receiver namespace is owned by `vmbackupd-transfer:qemu`, uses SGID,
+  and carries ACLs allowing vmbackupd to consume received data;
+- inherited receiver files retain group access required by vmbackupd;
+- Cockpit administrative operations use Cockpit Administrative access
+  through the privileged Cockpit bridge rather than requiring direct
+  frontend access to the daemon socket;
+- LOCAL `Test local path` supports a non-mutating preflight for a storage
+  root that does not yet exist;
+- preflight reports total capacity, free capacity, required reserve and
+  usable capacity after reserve;
+- preflight does not create the requested storage directory;
+- `Save destination` performs the actual managed preparation and verifies
+  the resulting root using the unprivileged daemon credentials;
+- destination deletion is exposed only inside the Edit destination popup;
+- `storage.delete` removes catalog metadata only and never deletes the
+  storage directory or backup files;
+- default, referenced and historical storage destinations remain protected
+  by repository invariants.
+
+Cockpit privilege model:
+
+    Cockpit user
+        -> Cockpit Administrative access
+        -> privileged cockpit-bridge
+        -> /run/vmbackupd/vmbackupd.sock
+        -> unprivileged vmbackupd daemon
+        -> narrow storage helper when filesystem preparation is required
+
+Live acceptance on `maker` verified:
+
+- managed `/mnt` storage roots were created successfully;
+- resulting storage-root ownership/mode was `vmbackupd:qemu 0750`;
+- resulting receiver namespace ownership/mode was
+  `vmbackupd-transfer:qemu 2770` with the required ACL inheritance;
+- a new missing LOCAL path returned green `Ready to create` capacity
+  preflight without creating the directory;
+- saving the destination created and registered the storage successfully;
+- deleting a destination removed its vmbackupd catalog entry while its
+  physical directory remained intact;
+- Delete is not exposed as a main Storage-table action;
+- existing SSH preflight frontend behavior remained intact;
+- focused regression tests passed;
+- the full pytest suite passed;
+- unified Release 3 RPM build and live installation passed.
+
+Scope deliberately not included in R1:
+
+- `/home` remains outside the currently allowed managed-storage path policy;
+- remote storage discovery is not implemented here;
+- SSH receiver protocol still does not expose the local storage catalog;
+- SSH destinations still persist the interim remote-root model;
+- remote backup transfer and replication are not implemented here.
+
+Next storage/SSH dependency:
+
+    receiver LOCAL storage catalog
+        -> SSH storage.list
+        -> stable remote_storage_id selection
+        -> preflight(remote_storage_id)
+        -> SSH transfer by storage ID
+        -> primary + replica destination model
+
+---
+
 # 3E.8 — Capacity-aware retention and reclaim
 
 ## 3E.8a.1 — Capacity-aware retention policy controls
