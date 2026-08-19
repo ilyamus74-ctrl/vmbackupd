@@ -1,0 +1,29 @@
+[Unit]
+Description=vmbackupd privileged managed storage preparation
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/vmbackupd-storage-helper
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+
+User=root
+Group=root
+UMask=0077
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_FSETID

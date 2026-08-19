@@ -495,6 +495,68 @@ class SQLiteRepository:
             raise
         return self.get_storage_destination(node_id, destination_id)
 
+    def delete_storage_destination(
+        self,
+        node_id: str,
+        destination_id: str,
+    ) -> StorageDestination:
+        """Delete only catalog metadata; never touch filesystem content."""
+
+        with self.connection:
+            current = self.get_storage_destination(
+                node_id,
+                destination_id,
+            )
+
+            if current.is_default:
+                raise DomainInvariantError(
+                    "STORAGE_DELETE_DEFAULT"
+                )
+
+            if self.connection.execute(
+                """SELECT 1
+                   FROM backup_jobs
+                   WHERE storage_destination_id = ?
+                   LIMIT 1""",
+                (destination_id,),
+            ).fetchone():
+                raise DomainInvariantError(
+                    "STORAGE_DELETE_IN_USE"
+                )
+
+            if self.connection.execute(
+                """SELECT 1
+                   FROM job_runs
+                   WHERE storage_destination_id = ?
+                   LIMIT 1""",
+                (destination_id,),
+            ).fetchone():
+                raise DomainInvariantError(
+                    "STORAGE_DELETE_HAS_HISTORY"
+                )
+
+            if self.connection.execute(
+                """SELECT 1
+                   FROM reclaim_operations
+                   WHERE storage_destination_id = ?
+                   LIMIT 1""",
+                (destination_id,),
+            ).fetchone():
+                raise DomainInvariantError(
+                    "STORAGE_DELETE_HAS_HISTORY"
+                )
+
+            deleted = self.connection.execute(
+                """DELETE FROM storage_destinations
+                   WHERE node_id = ? AND id = ?""",
+                (node_id, destination_id),
+            )
+
+            if deleted.rowcount != 1:
+                raise KeyError(destination_id)
+
+        return current
+
     def add_job(self, value: BackupJob) -> None:
         vm = self.get_vm(value.vm_id)
         if value.storage_destination_id is None:

@@ -91,14 +91,31 @@ class LocalStorageTester:
                            int(total_bytes * minimum_free_percent / 100))
         percent_ok = (free_bytes is not None and percent_reserve is not None
                       and free_bytes >= percent_reserve)
+        required_reserve = (
+            None
+            if percent_reserve is None
+            else max(minimum_free_bytes, percent_reserve)
+        )
+        usable_after_reserve = (
+            None
+            if free_bytes is None or required_reserve is None
+            else max(0, free_bytes - required_reserve)
+        )
         errors = [item for item in (data_error, usage_error) if item]
         ok = data_writable and byte_ok and percent_ok
         return {
+            "probe_type": "LOCAL",
             "ok": ok,
+            "ready_to_prepare": ok,
+            "will_create": False,
             "backup_data_root_exists": data_exists,
             "backup_data_root_writable": data_writable,
+            "total_bytes": total_bytes,
             "free_bytes": free_bytes,
             "minimum_free_bytes": minimum_free_bytes,
+            "percent_reserve_bytes": percent_reserve,
+            "required_reserve_bytes": required_reserve,
+            "usable_after_reserve_bytes": usable_after_reserve,
             "minimum_free_percent": minimum_free_percent,
             "byte_reserve_ok": byte_ok,
             "percent_reserve_ok": percent_ok,

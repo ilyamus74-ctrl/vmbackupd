@@ -233,3 +233,14 @@ summary { cursor: pointer; font-size: 1.1rem; font-weight: 700; }
 #storage-data-root-label[hidden] {
     display: none !important;
 }
+
+
+.danger-action {
+    border-color: #c9190b;
+    color: #c9190b;
+}
+
+.danger-action:hover:not(:disabled) {
+    background: #c9190b;
+    color: #fff;
+}

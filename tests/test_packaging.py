@@ -134,7 +134,7 @@ def test_service_uses_unprivileged_account_and_expected_lifecycle():
 def test_service_hardening_keeps_only_known_write_roots():
     unit = text("vmbackupd.service")
     for directive in (
-        "NoNewPrivileges=yes", "PrivateTmp=yes", "ProtectSystem=strict",
+        "NoNewPrivileges=yes", "PrivateTmp=yes", "ProtectSystem=full",
         "ProtectHome=true", "ProtectKernelTunables=yes", "ProtectKernelModules=yes",
         "ProtectControlGroups=yes", "RestrictSUIDSGID=yes", "LockPersonality=yes",
     ):
@@ -301,3 +301,71 @@ def test_packaging_document_keeps_future_components_explicitly_deferred():
     assert "cockpit-vmbackupd" in documentation and "separate" in documentation
     assert "SELinux Enforcing" in documentation and "blocker" in documentation
     assert "state.db" in documentation and "preserved" in documentation
+
+
+def test_managed_storage_helper_is_narrow_and_socket_activated():
+    spec = text("vmbackupd.spec")
+    daemon = text("vmbackupd.service")
+    helper = text("vmbackupd-storage-helper@.service")
+    helper_socket = text("vmbackupd-storage-helper.socket")
+    executable = text("vmbackupd-storage-helper")
+
+    assert "Requires:       acl" in spec
+
+    assert "%{_libexecdir}/vmbackupd-storage-helper" in spec
+    assert "%{_unitdir}/vmbackupd-storage-helper.socket" in spec
+    assert "%{_unitdir}/vmbackupd-storage-helper@.service" in spec
+
+    assert "%systemd_post vmbackupd-storage-helper.socket" in spec
+    assert "%systemd_preun vmbackupd-storage-helper.socket" in spec
+    assert "%systemd_postun vmbackupd-storage-helper.socket" in spec
+
+    assert "Requires=vmbackupd-storage-helper.socket" in daemon
+    assert "ProtectSystem=full" in daemon
+    assert "ProtectSystem=strict" not in daemon
+    assert "User=vmbackupd" in daemon
+
+    assert (
+        "ListenStream=/run/vmbackupd/storage-helper.sock"
+        in helper_socket
+    )
+    assert "Accept=yes" in helper_socket
+    assert "SocketUser=vmbackupd" in helper_socket
+    assert "SocketMode=0600" in helper_socket
+
+    assert "User=root" in helper
+    assert "ProtectSystem=full" in helper
+    assert "RestrictSUIDSGID=yes" not in helper
+    assert (
+        "CapabilityBoundingSet="
+        "CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_FSETID"
+        in helper
+    )
+    assert "RestrictAddressFamilies=AF_UNIX" in helper
+
+    assert executable.startswith("#!/usr/bin/python3\n")
+    assert "vmbackupd.storage_prepare" in executable
+
+
+def test_managed_storage_helper_executable_is_in_rpm_files():
+    spec = text("vmbackupd.spec")
+
+    marker = "%files -f %{pyproject_files}"
+    assert marker in spec
+
+    files = spec.split(marker, 1)[1]
+
+    assert (
+        files.count(
+            "%{_libexecdir}/vmbackupd-storage-helper\n"
+        )
+        == 1
+    )
+    assert (
+        "%{_unitdir}/vmbackupd-storage-helper.socket"
+        in files
+    )
+    assert (
+        "%{_unitdir}/vmbackupd-storage-helper@.service"
+        in files
+    )

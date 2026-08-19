@@ -1,0 +1,13 @@
+[Unit]
+Description=vmbackupd managed storage preparation socket
+
+[Socket]
+ListenStream=/run/vmbackupd/storage-helper.sock
+Accept=yes
+SocketUser=vmbackupd
+SocketGroup=vmbackupd
+SocketMode=0600
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

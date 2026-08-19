@@ -1,0 +1,4 @@
+#!/usr/bin/python3
+from vmbackupd.storage_prepare import helper_main
+
+raise SystemExit(helper_main())

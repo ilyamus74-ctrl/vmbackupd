@@ -22,8 +22,12 @@ from .runtime import DaemonRuntime
 from .ssh_identity import SSHIdentityManager
 from .ssh_known_hosts import SSHKnownHostsManager
 from .ssh_receiver import SSHReceiverRegistry
+from .storage_prepare import StoragePrepareClient
 from .ssh_preflight import SSHPreflightClient
 from .version import __version__
+
+
+_DEFAULT_STORAGE_PREPARER = object()
 
 
 SYSTEM_SSH_IDENTITY_NAME = "__vmbackupd_ssh_identity__"
@@ -214,7 +218,11 @@ class RuntimeWorker:
                 self._set_state(RuntimeWorkerState.STOPPED)
 
 
-def compose(config: AppConfig) -> Components:
+def compose(
+    config: AppConfig,
+    *,
+    storage_preparer=_DEFAULT_STORAGE_PREPARER,
+) -> Components:
     config.daemon.database_path.parent.mkdir(parents=True, exist_ok=True)
     repository = SQLiteRepository(config.daemon.database_path)
     clock = SystemClock()
@@ -293,8 +301,12 @@ def compose(config: AppConfig) -> Components:
         config.daemon.database_path.parent / "receiver",
         clock,
     )
+    if storage_preparer is _DEFAULT_STORAGE_PREPARER:
+        storage_preparer = StoragePrepareClient()
+
     application = VmbackupApplication(
         repository, runtime, read_driver, config, node, clock, __version__,
+        storage_preparer=storage_preparer,
         ssh_identity_manager=ssh_identity_manager,
         ssh_known_hosts_manager=ssh_known_hosts_manager,
         ssh_receiver_manager=ssh_receiver_manager,

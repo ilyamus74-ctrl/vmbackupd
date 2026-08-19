@@ -23,6 +23,7 @@ Requires:       libvirt-client
 Requires:       qemu-img
 Requires:       libvirt-daemon-driver-qemu
 Requires:       systemd
+Requires:       acl
 Requires(pre):  systemd
 Requires(pre):  shadow-utils
 Requires(pre):  glibc-common
@@ -58,6 +59,13 @@ install -Dpm 0644 %{SOURCE1} %{buildroot}%{_unitdir}/vmbackupd.service
 install -Dpm 0644 %{SOURCE2} %{buildroot}%{_sysusersdir}/vmbackupd.conf
 install -Dpm 0644 %{SOURCE3} %{buildroot}%{_tmpfilesdir}/vmbackupd.conf
 install -Dpm 0644 %{SOURCE4} %{buildroot}%{_sysconfdir}/vmbackupd/vmbackupd.toml
+
+install -Dpm 0755 packaging/vmbackupd-storage-helper \
+    %{buildroot}%{_libexecdir}/vmbackupd-storage-helper
+install -Dpm 0644 packaging/vmbackupd-storage-helper.socket \
+    %{buildroot}%{_unitdir}/vmbackupd-storage-helper.socket
+install -Dpm 0644 packaging/vmbackupd-storage-helper@.service \
+    %{buildroot}%{_unitdir}/vmbackupd-storage-helper@.service
 install -d -m 0755 %{buildroot}%{_datadir}/cockpit/vmbackupd
 install -pm 0644 cockpit/vmbackupd/{manifest.json,index.html,api.js,vmbackupd.js,vmbackupd.css} \
     %{buildroot}%{_datadir}/cockpit/vmbackupd/
@@ -86,6 +94,7 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-sshd.service \
 
 %post
 %systemd_post vmbackupd.service
+%systemd_post vmbackupd-storage-helper.socket
 %systemd_post vmbackupd-receiver-sshd.service
 
 %tmpfiles_create %{_tmpfilesdir}/vmbackupd.conf
@@ -93,10 +102,12 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-sshd.service \
 
 %preun
 %systemd_preun vmbackupd.service
+%systemd_preun vmbackupd-storage-helper.socket
 %systemd_preun vmbackupd-receiver-sshd.service
 
 %postun
 %systemd_postun vmbackupd.service
+%systemd_postun vmbackupd-storage-helper.socket
 %systemd_postun vmbackupd-receiver-sshd.service
 
 %files -f %{pyproject_files}
@@ -109,6 +120,8 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-sshd.service \
 %config(noreplace) %{_sysconfdir}/vmbackupd/receiver_sshd_config
 
 %{_unitdir}/vmbackupd.service
+%{_unitdir}/vmbackupd-storage-helper.socket
+%{_unitdir}/vmbackupd-storage-helper@.service
 %{_unitdir}/vmbackupd-receiver-sshd.service
 
 %{_sysusersdir}/vmbackupd.conf
@@ -117,6 +130,7 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-sshd.service \
 %{_tmpfilesdir}/vmbackupd.conf
 %{_tmpfilesdir}/vmbackupd-receiver.conf
 
+%{_libexecdir}/vmbackupd-storage-helper
 %{_libexecdir}/vmbackupd-authorized-keys
 %{_libexecdir}/vmbackupd-transfer-shell
 %{_libexecdir}/vmbackupd-receiver-session

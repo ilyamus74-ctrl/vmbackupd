@@ -25,6 +25,9 @@ from .ssh_known_hosts import SSHKnownHostsError
 from .ssh_preflight import SSHPreflightError
 from .ssh_receiver import SSHReceiverError
 from .storage import LocalStorageTester, lexical_storage_path, storage_path_has_symlink
+from .storage_prepare import (
+    ManagedStorageError, probe_managed_storage_root,
+)
 
 
 _UNSET = object()
@@ -38,11 +41,13 @@ class ApplicationError(RuntimeError):
 
 class VmbackupApplication:
     def __init__(self, repository: SQLiteRepository, runtime, driver, config, node, clock: Clock,
-                 version: str, storage_tester=None, ssh_identity_manager=None,
-                 ssh_known_hosts_manager=None, ssh_receiver_manager=None) -> None:
+                 version: str, storage_tester=None, storage_preparer=None,
+                 ssh_identity_manager=None, ssh_known_hosts_manager=None,
+                 ssh_receiver_manager=None) -> None:
         self.repository, self.runtime, self.driver = repository, runtime, driver
         self.config, self.node, self.clock, self.version = config, node, clock, version
         self.storage_tester = storage_tester or LocalStorageTester()
+        self.storage_preparer = storage_preparer
         self.ssh_identity_manager = ssh_identity_manager
         self.ssh_known_hosts_manager = ssh_known_hosts_manager
         self.ssh_preflight_client = None
@@ -53,6 +58,7 @@ class VmbackupApplication:
             "daemon.status": self.daemon_status, "node.list": self.node_list,
             "storage.list": self.storage_list, "storage.show": self.storage_show,
             "storage.create": self.storage_create, "storage.update": self.storage_update,
+            "storage.delete": self.storage_delete,
             "storage.set_default": self.storage_set_default,
             "storage.test": self.storage_test,
             "ssh.identity.show": self.ssh_identity_show,
@@ -174,6 +180,60 @@ class VmbackupApplication:
             raise ApplicationError("INVALID_PARAMS", "storage reserve is outside valid range")
         return name.strip(), str(data), free_bytes, free_percent
 
+    def _prepare_local_storage(self, backup_data_root):
+        """Prepare and verify one LOCAL storage root.
+
+        Tests and explicitly constructed application instances may omit the
+        privileged preparer. Production compose() always supplies it.
+        """
+        if self.storage_preparer is None:
+            return None
+
+        root = str(lexical_storage_path(backup_data_root))
+
+        try:
+            result = self.storage_preparer.prepare(root)
+        except ManagedStorageError as exc:
+            raise ApplicationError(
+                exc.code,
+                str(exc),
+            ) from None
+
+        if (
+            not isinstance(result, dict)
+            or result.get("ok") is not True
+            or result.get("path") != root
+        ):
+            raise ApplicationError(
+                "STORAGE_HELPER_PROTOCOL_ERROR",
+                "managed storage helper returned inconsistent storage identity",
+            )
+
+        # Verify with the actual unprivileged daemon credentials.
+        # Deliberately test with zero reserve: a storage may be registered even
+        # when its configured reserve currently makes it unavailable for backup.
+        probe = self.storage_tester.test(
+            root,
+            0,
+            0,
+        )
+
+        if not (
+            probe.get("backup_data_root_exists") is True
+            and probe.get("backup_data_root_writable") is True
+            and probe.get("free_bytes") is not None
+        ):
+            errors = probe.get("errors") or []
+            detail = "; ".join(str(item) for item in errors) or "verification failed"
+
+            raise ApplicationError(
+                "STORAGE_PREPARE_VERIFY_FAILED",
+                "managed storage is not writable by vmbackupd after preparation: "
+                + detail,
+            )
+
+        return result
+
     def _seed_access_profile(self):
         values = self.repository.list_storage_destinations(self.node.id)
         if values:
@@ -264,6 +324,9 @@ class VmbackupApplication:
                 minimum_free_percent,
             )
         )
+
+        if transport is StorageType.LOCAL:
+            self._prepare_local_storage(backup_data_root)
 
         value = StorageDestination(
             id=destination_id,
@@ -356,6 +419,12 @@ class VmbackupApplication:
                 "minimum_free_percent is outside valid range",
             )
 
+        if (
+            current.storage_type is StorageType.LOCAL
+            and backup_data_root is not None
+        ):
+            self._prepare_local_storage(backup_data_root)
+
         transport_patch = {}
         for key, candidate in (
             ("ssh_host", ssh_host),
@@ -381,6 +450,31 @@ class VmbackupApplication:
             **transport_patch,
         )
         return self._serialize_storage(value)
+
+    def storage_delete(self, id):
+        destination = self.repository.get_storage_destination(
+            self.node.id,
+            id,
+        )
+
+        if destination.name == "__vmbackupd_ssh_identity__":
+            raise ApplicationError(
+                "STORAGE_SYSTEM_DESTINATION",
+                "system-managed SSH identity destination cannot be deleted",
+            )
+
+        removed = self.repository.delete_storage_destination(
+            self.node.id,
+            id,
+        )
+
+        return {
+            "id": removed.id,
+            "name": removed.name,
+            "backup_data_root": removed.backup_data_root,
+            "removed": True,
+            "filesystem_preserved": True,
+        }
 
     def storage_set_default(self, id):
         return self._serialize_storage(
@@ -420,6 +514,37 @@ class VmbackupApplication:
             self._validate_storage_values("candidate", backup_data_root,
                                           minimum_free_bytes, minimum_free_percent)
         )
+        candidate_path = lexical_storage_path(backup_data_root)
+
+        if self.storage_preparer is not None and not candidate_path.exists():
+            try:
+                return probe_managed_storage_root(
+                    backup_data_root,
+                    minimum_free_bytes=free_bytes,
+                    minimum_free_percent=free_percent,
+                )
+            except ManagedStorageError as exc:
+                return {
+                    "probe_type": "LOCAL",
+                    "ok": False,
+                    "ready_to_prepare": False,
+                    "will_create": False,
+                    "backup_data_root_exists": False,
+                    "backup_data_root_writable": False,
+                    "total_bytes": None,
+                    "free_bytes": None,
+                    "minimum_free_bytes": free_bytes,
+                    "minimum_free_percent": free_percent,
+                    "percent_reserve_bytes": None,
+                    "required_reserve_bytes": None,
+                    "usable_after_reserve_bytes": None,
+                    "byte_reserve_ok": False,
+                    "percent_reserve_ok": False,
+                    "message": "Local storage preflight failed",
+                    "errors": [str(exc)],
+                    "error_code": exc.code,
+                }
+
         return self.storage_tester.test(
             backup_data_root, free_bytes, free_percent,
         )

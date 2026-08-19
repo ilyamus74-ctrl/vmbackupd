@@ -29,6 +29,7 @@ def test_cockpit_transport_is_raw_bounded_unix_json_lines():
     assert "const PROTOCOL_VERSION = 1;" in api
     assert 'payload: "stream"' in api
     assert "unix: SOCKET_PATH" in api
+    assert 'superuser: "require"' in api
     assert '}) + "\\n";' in api
     assert 'buffer.indexOf("\\n")' in api
     assert "MAX_RESPONSE_BYTES" in api
@@ -92,6 +93,7 @@ def test_cockpit_method_allow_list_matches_current_supported_boundary():
         "storage.list",
         "storage.create",
         "storage.update",
+        "storage.delete",
         "storage.set_default",
         "storage.test",
         "ssh.identity.show",
@@ -113,11 +115,11 @@ def test_cockpit_method_allow_list_matches_current_supported_boundary():
         "job.update",
         "backup.run",
     ]
-    for forbidden in ("storage.delete", "restore.run", "retention.run", "recovery.update"):
+    for forbidden in ("restore.run", "retention.run", "recovery.update"):
         assert forbidden not in api
 
 
-def test_cockpit_frontend_has_no_privileged_or_direct_backend_path():
+def test_cockpit_frontend_has_no_direct_backend_bypass():
     active = "\n".join(source(name) for name in ("index.html", "api.js", "vmbackupd.js"))
     lowered = active.lower()
     for forbidden in (
@@ -125,6 +127,10 @@ def test_cockpit_frontend_has_no_privileged_or_direct_backend_path():
         "sqlite", "state.db", "fetch(", "websocket", "http://", "https://",
         "sudo", "innerhtml", "eval(", "new function",
     ):
+        # Cockpit's bounded privileged channel is explicitly allowed.
+        # All other direct/backend privilege bypasses remain forbidden.
+        if forbidden == "superuser":
+            continue
         assert forbidden not in lowered
 
 
@@ -139,7 +145,7 @@ def test_cockpit_ui_has_operational_sections_and_no_destructive_controls():
     assert '"Local"' in javascript
     assert "Mutation disabled" in javascript
     assert "Mutation enabled" in javascript
-    assert "vmbackupd-admin" in javascript
+    assert "Cockpit administrative API channel failed" in javascript
     assert ".textContent" in javascript
     assert "Refresh" in html
     assert "clearViews();" in javascript
@@ -308,7 +314,6 @@ def test_cockpit_storage_management_is_explicit_and_non_destructive():
     assert "if (!isSSH && !destination.is_default)" in javascript
 
     # No destructive storage lifecycle is exposed.
-    assert "storage.delete" not in javascript
 
     assert 'await refresh();' in javascript
     assert "currentModel.storage.map" in javascript
@@ -461,3 +466,74 @@ def test_cockpit_live_refresh_does_not_invent_byte_progress():
     javascript = source("vmbackupd.js")
     assert "bytes_processed" not in javascript
     assert "bytes_total" not in javascript
+
+
+def test_cockpit_uses_administrative_access_for_daemon_api():
+    api = source("api.js")
+    javascript = source("vmbackupd.js")
+
+    assert 'payload: "stream"' in api
+    assert "unix: SOCKET_PATH" in api
+    assert 'superuser: "require"' in api
+
+    # Do not bypass the daemon API with arbitrary privileged subprocesses.
+    assert "cockpit.spawn" not in api
+    assert "vmbackupctl" not in api
+
+    # UI errors must describe the Cockpit administrative boundary rather
+    # than incorrectly demanding supplementary group enrollment.
+    assert "Cockpit administrative API channel failed" in javascript
+    assert (
+        "logged-in session must belong to vmbackupd-admin"
+        not in javascript
+    )
+
+
+def test_storage_reserve_frontend_uses_defined_minimum_free_bytes_helper():
+    javascript = source("vmbackupd.js")
+
+    assert "function minimumFreeBytes()" in javascript
+    assert "storageMinimumFreeBytes" not in javascript
+    assert "minimumFreeBytes()" in javascript
+
+
+def test_storage_frontend_uses_defined_clean_path_helper():
+    javascript = source("vmbackupd.js")
+
+    assert "function cleanPath(value)" in javascript
+    assert "cleanPath(" in javascript
+    assert 'String(value ?? "").trim()' in javascript
+
+
+def test_storage_delete_is_available_only_inside_destination_popup():
+    html = source("index.html")
+    javascript = source("vmbackupd.js")
+    api = source("api.js")
+
+    assert '"storage.delete"' in api
+    assert 'id="storage-delete"' in html
+    assert "Delete destination" in html
+
+    assert "storageDeleteButton.hidden = !destination;" in javascript
+    assert "deleteStorageDestination" in javascript
+    assert '"storage.delete"' in javascript
+
+    # Main Storage table must not grow a Delete action.
+    assert 'actionButton("Delete"' not in javascript
+
+    # Delete is catalog-only.
+    assert "Filesystem contents were preserved" in javascript
+
+
+def test_local_storage_preflight_reports_capacity_without_replacing_ssh_ui():
+    javascript = source("vmbackupd.js")
+
+    assert "function localStorageProbeSummary(result)" in javascript
+    assert '"Ready to create"' in javascript
+    assert '"Not ready"' in javascript
+    assert "result.total_bytes" in javascript
+    assert "required reserve" in javascript
+    assert "usable after reserve" in javascript
+
+    # Existing SSH preflight rendering must survive LOCAL UI changes.
+    assert "SSH preflight" in javascript

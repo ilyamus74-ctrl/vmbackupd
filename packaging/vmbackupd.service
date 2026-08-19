@@ -1,7 +1,8 @@
 [Unit]
 Description=vmbackupd virtual machine backup daemon
 Documentation=file:///usr/share/doc/vmbackupd/packaging.md
-After=local-fs.target systemd-tmpfiles-setup.service libvirtd.service virtqemud.socket
+Requires=vmbackupd-storage-helper.socket
+After=local-fs.target systemd-tmpfiles-setup.service libvirtd.service virtqemud.socket vmbackupd-storage-helper.socket
 
 [Service]
 Type=simple
@@ -18,7 +19,7 @@ UMask=0007
 
 NoNewPrivileges=yes
 PrivateTmp=yes
-ProtectSystem=strict
+ProtectSystem=full
 ProtectHome=true
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

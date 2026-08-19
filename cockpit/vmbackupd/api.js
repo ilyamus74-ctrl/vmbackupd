@@ -12,6 +12,7 @@
         "storage.list",
         "storage.create",
         "storage.update",
+        "storage.delete",
         "storage.set_default",
         "storage.test",
         "ssh.identity.show",
@@ -91,6 +92,7 @@
             const channel = global.cockpit.channel({
                 payload: "stream",
                 unix: SOCKET_PATH,
+                superuser: "require",
             });
             let buffer = "";
             let trailing = "";

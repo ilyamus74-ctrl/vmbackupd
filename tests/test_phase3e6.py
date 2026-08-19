@@ -562,7 +562,7 @@ minimum_free_bytes = 0
 minimum_free_percent = 5
 ''')
     config = load_config(config_path)
-    first = compose(config)
+    first = compose(config, storage_preparer=None)
     original = first.repository.get_default_storage_destination(first.application.node.id)
     first.application.dispatch("storage.update", {
         "id": original.id, "name": "renamed", "minimum_free_bytes": 123,
@@ -573,7 +573,7 @@ minimum_free_percent = 5
     })
     first.repository.close()
 
-    second = compose(config)
+    second = compose(config, storage_preparer=None)
     values = second.repository.list_storage_destinations(second.application.node.id)
     assert {
         item.name

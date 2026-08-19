@@ -10,6 +10,8 @@
     const jobForm = document.getElementById("job-form");
     const storageDialog = document.getElementById("storage-dialog");
     const storageForm = document.getElementById("storage-form");
+    const storageDeleteButton =
+        document.getElementById("storage-delete");
     const receiverDialog =
         document.getElementById("receiver-dialog");
     const receiverOpenButton =
@@ -478,6 +480,15 @@
         return { value: bytesValue, unit: 1 };
     }
 
+    function cleanPath(value) {
+        const path = String(value ?? "").trim();
+
+        if (!path || path === "/")
+            return path;
+
+        return path.replace(/\/+$/, "");
+    }
+
     function minimumFreeBytes() {
         const value = Number(document.getElementById("storage-minimum-value").value);
         const unit = Number(document.getElementById("storage-minimum-unit").value);
@@ -485,6 +496,24 @@
         if (!Number.isSafeInteger(value) || value < 0 || !Number.isSafeInteger(result))
             throw new Error("Minimum free space must be an exact non-negative integer");
         return result;
+    }
+
+    function localStorageProbeSummary(result) {
+        const state = result.ok ?
+            (result.will_create ? "Ready to create" : "Ready") :
+            "Not ready";
+
+        let value =
+            `${state}. ` +
+            `Total ${bytes(result.total_bytes)}; ` +
+            `free ${bytes(result.free_bytes)}; ` +
+            `required reserve ${bytes(result.required_reserve_bytes)}; ` +
+            `usable after reserve ${bytes(result.usable_after_reserve_bytes)}.`;
+
+        if (Array.isArray(result.errors) && result.errors.length)
+            value += ` ${result.errors.join("; ")}`;
+
+        return value;
     }
 
     function showProbeResult(
@@ -501,6 +530,19 @@
         }
 
         node.className = `probe-result ${result && result.ok ? "success" : "error"}`;
+
+        if (
+            result &&
+            result.probe_type === "LOCAL" &&
+            Object.prototype.hasOwnProperty.call(
+                result,
+                "total_bytes",
+            )
+        ) {
+            node.textContent = localStorageProbeSummary(result);
+            return;
+        }
+
 
         if (result && result.storage_type === "SSH") {
             const values = [
@@ -606,6 +648,15 @@
     function openStorageDialog(destination = null) {
         editingStorageId = destination ? destination.id : null;
 
+        storageDeleteButton.hidden = !destination;
+        storageDeleteButton.disabled = Boolean(
+            destination && destination.is_default
+        );
+        storageDeleteButton.title =
+            destination && destination.is_default ?
+                "Set another destination as default before deleting this one." :
+                "";
+
         document.getElementById("storage-dialog-title").textContent =
             destination ? "Edit destination" : "Add destination";
 
@@ -693,7 +744,7 @@
 
         const params = {
             name: document.getElementById("storage-name").value.trim(),
-            minimum_free_bytes: storageMinimumFreeBytes(),
+            minimum_free_bytes: minimumFreeBytes(),
             minimum_free_percent:
                 Number(document.getElementById("storage-minimum-percent").value),
             make_default:
@@ -1312,6 +1363,55 @@
         }
     }
 
+    async function deleteStorageDestination() {
+        const errorNode =
+            document.getElementById("storage-form-error");
+
+        errorNode.textContent = "";
+
+        if (!editingStorageId) {
+            errorNode.textContent =
+                "No destination is selected for deletion.";
+            return;
+        }
+
+        const name =
+            document.getElementById("storage-name").value.trim();
+
+        const path =
+            document.getElementById("storage-data-root").value.trim();
+
+        if (!window.confirm(
+            `Remove destination "${name}" from vmbackupd?\n\n` +
+            `Filesystem path: ${path}\n\n` +
+            "Only the vmbackupd catalog entry will be removed. " +
+            "The directory and all files inside it will be preserved."
+        ))
+            return;
+
+        storageDeleteButton.disabled = true;
+
+        try {
+            await api.request(
+                "storage.delete",
+                { id: editingStorageId },
+            );
+
+            storageDialog.close();
+            await refresh();
+
+            setNotice(
+                `${name} was removed from the vmbackupd catalog. ` +
+                "Filesystem contents were preserved.",
+                "success",
+            );
+        } catch (error) {
+            errorNode.textContent = failureMessage(error);
+        } finally {
+            storageDeleteButton.disabled = false;
+        }
+    }
+
     async function setDefaultStorage(destination) {
         try {
             setNotice(`Setting ${destination.name} as default…`, "loading");
@@ -1540,7 +1640,10 @@
             return `Malformed API response: ${error.message}`;
         if (error instanceof api.ApiError)
             return `API error ${error.code}: ${error.message}`;
-        return "Daemon unavailable or permission denied. The logged-in session must belong to vmbackupd-admin; after enrollment, start a fresh Cockpit login session.";
+        if (error instanceof api.TransportError)
+            return `Cockpit administrative API channel failed: ${error.message}. Enable Administrative access and retry.`;
+        const detail = error && error.message ? `: ${error.message}` : "";
+        return `Unexpected frontend error${detail}`;
     }
 
     function hasActiveRuns() {
@@ -1647,6 +1750,10 @@
     jobForm.addEventListener("submit", saveJob);
     document.getElementById("storage-cancel").addEventListener("click", () => storageDialog.close());
     document.getElementById("storage-test-candidate").addEventListener("click", testStorageCandidate);
+    storageDeleteButton.addEventListener(
+        "click",
+        deleteStorageDestination,
+    );
     document.getElementById("storage-type").addEventListener(
         "change",
         updateStorageTransportFields,
