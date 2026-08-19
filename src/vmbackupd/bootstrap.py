@@ -191,17 +191,31 @@ class RuntimeWorker:
             )
 
             if str(database_path) != ":memory:":
-                replica_worker = ReplicaWorker(
-                    database_path,
-                    self.node_id,
-                    database_path.parent / "ssh",
-                    _system_ssh_identity_id(
-                        self.node_id
-                    ),
-                    tick_seconds=1.0,
-                )
+                try:
+                    replica_worker = ReplicaWorker(
+                        database_path,
+                        self.node_id,
+                        database_path.parent / "ssh",
+                        _system_ssh_identity_id(
+                            self.node_id
+                        ),
+                        tick_seconds=1.0,
+                    )
 
-                replica_worker.start()
+                    replica_worker.start()
+
+                except Exception:
+                    # Replica transport is subordinate to the primary
+                    # backup controller.  Failure to start the sender
+                    # must not surrender controller ownership or stop
+                    # primary backup polling/lease renewal.
+                    try:
+                        if replica_worker is not None:
+                            replica_worker.stop()
+                    except Exception:
+                        pass
+
+                    replica_worker = None
 
         except BaseException as exc:
             self._startup_error = exc
@@ -241,16 +255,9 @@ class RuntimeWorker:
         runtime_failure: str | None = None
         try:
             while not self._stop.is_set():
-                if (
-                    replica_worker is not None
-                    and replica_worker.last_error
-                    is not None
-                ):
-                    raise RuntimeError(
-                        "replica worker failed: "
-                        f"{replica_worker.last_error}"
-                    )
-
+                # Replica-worker health is intentionally not promoted
+                # to a primary runtime failure.  The primary controller
+                # must keep polling backups and renewing its leases.
                 if self.before_tick:
                     self.before_tick()
 

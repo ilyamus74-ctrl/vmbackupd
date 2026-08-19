@@ -648,3 +648,195 @@ def test_runtime_tick_failure_enters_diagnostic_mode_and_blocks_backup(tmp_path)
         stop.set(); await task
 
     asyncio.run(scenario())
+
+
+
+def test_replica_startup_failure_does_not_stop_primary_runtime(
+    tmp_path,
+    monkeypatch,
+):
+    from vmbackupd.bootstrap import (
+        RuntimeWorkerState,
+        compose,
+    )
+
+    class FailingReplicaWorker:
+        def __init__(self, *args, **kwargs):
+            self.last_error = None
+
+        def start(self):
+            raise RuntimeError(
+                "replica startup boom"
+            )
+
+        def stop(self):
+            return None
+
+    monkeypatch.setattr(
+        "vmbackupd.bootstrap.ReplicaWorker",
+        FailingReplicaWorker,
+    )
+
+    config = load_config(
+        write_config(tmp_path)
+    )
+    components = compose(config)
+
+    ticked = threading.Event()
+    components.runtime.before_tick = ticked.set
+
+    try:
+        instance = components.runtime.start()
+
+        assert instance
+        assert ticked.wait(timeout=2)
+
+        assert (
+            components.runtime.runtime_state
+            is RuntimeWorkerState.RUNNING
+        )
+        assert components.runtime.last_error is None
+
+        node_id = components.application.node.id
+
+        first = components.repository.connection.execute(
+            """SELECT heartbeat_at
+               FROM node_controller_leases
+               WHERE node_id = ?""",
+            (node_id,),
+        ).fetchone()
+
+        assert first is not None
+
+        first_heartbeat = first["heartbeat_at"]
+
+        time.sleep(
+            config.daemon.tick_interval_seconds * 6
+        )
+
+        second = components.repository.connection.execute(
+            """SELECT heartbeat_at
+               FROM node_controller_leases
+               WHERE node_id = ?""",
+            (node_id,),
+        ).fetchone()
+
+        assert second is not None
+        assert second["heartbeat_at"] != first_heartbeat
+
+        assert (
+            components.runtime.runtime_state
+            is RuntimeWorkerState.RUNNING
+        )
+
+    finally:
+        components.runtime.stop()
+        components.repository.close()
+
+
+def test_later_replica_failure_does_not_stop_primary_runtime(
+    tmp_path,
+    monkeypatch,
+):
+    from vmbackupd.bootstrap import (
+        RuntimeWorkerState,
+        compose,
+    )
+
+    class LaterFailingReplicaWorker:
+        instance = None
+
+        def __init__(self, *args, **kwargs):
+            self.last_error = None
+            self.failed = threading.Event()
+            self._stop = threading.Event()
+            self._thread = None
+
+            type(self).instance = self
+
+        def start(self):
+            def fail_later():
+                if not self._stop.wait(0.04):
+                    self.last_error = (
+                        "RuntimeError: replica thread boom"
+                    )
+                    self.failed.set()
+
+            self._thread = threading.Thread(
+                target=fail_later,
+                name="test-replica-failure",
+                daemon=True,
+            )
+            self._thread.start()
+
+        def stop(self):
+            self._stop.set()
+
+            if self._thread is not None:
+                self._thread.join()
+                self._thread = None
+
+    monkeypatch.setattr(
+        "vmbackupd.bootstrap.ReplicaWorker",
+        LaterFailingReplicaWorker,
+    )
+
+    config = load_config(
+        write_config(tmp_path)
+    )
+    components = compose(config)
+
+    ticks = [0]
+
+    def before_tick():
+        ticks[0] += 1
+
+    components.runtime.before_tick = before_tick
+
+    try:
+        components.runtime.start()
+
+        worker = LaterFailingReplicaWorker.instance
+        assert worker is not None
+        assert worker.failed.wait(timeout=2)
+        assert worker.last_error is not None
+
+        ticks_after_failure = ticks[0]
+
+        node_id = components.application.node.id
+
+        first = components.repository.connection.execute(
+            """SELECT heartbeat_at
+               FROM node_controller_leases
+               WHERE node_id = ?""",
+            (node_id,),
+        ).fetchone()
+
+        assert first is not None
+        first_heartbeat = first["heartbeat_at"]
+
+        time.sleep(
+            config.daemon.tick_interval_seconds * 8
+        )
+
+        second = components.repository.connection.execute(
+            """SELECT heartbeat_at
+               FROM node_controller_leases
+               WHERE node_id = ?""",
+            (node_id,),
+        ).fetchone()
+
+        assert second is not None
+
+        assert ticks[0] > ticks_after_failure
+        assert second["heartbeat_at"] != first_heartbeat
+
+        assert (
+            components.runtime.runtime_state
+            is RuntimeWorkerState.RUNNING
+        )
+        assert components.runtime.last_error is None
+
+    finally:
+        components.runtime.stop()
+        components.repository.close()
