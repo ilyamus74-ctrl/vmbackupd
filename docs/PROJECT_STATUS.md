@@ -176,6 +176,110 @@ Next storage/SSH dependency:
 
 ---
 
+## SSH storage discovery (R2.1)
+
+Status: CLOSED
+
+Closing commit:
+
+    217d7d3
+
+Implemented read-only discovery of receiver-eligible LOCAL storage through the
+restricted SSH receiver protocol.
+
+Key properties:
+
+- added restricted SSH command `vmbackupd-storage-list`;
+- existing `vmbackupd-preflight` remains protocol version 1 and unchanged in
+  scope;
+- `vmbackupd-storage-list` uses protocol version 2;
+- the SSH transfer account does not receive direct access to the main
+  vmbackupd administrative UNIX socket;
+- a dedicated systemd socket exposes a narrow catalog bridge to
+  `vmbackupd-transfer`;
+- the catalog worker runs as `vmbackupd` with the daemon-side `qemu`
+  supplementary group;
+- the bridge may call only the local storage-list/test operations required to
+  build receiver storage metadata;
+- only LOCAL storage destinations are exposed;
+- SSH destinations and internal staging destinations are not exposed;
+- remote peers receive stable storage IDs rather than selectable filesystem
+  paths;
+- the public response does not expose `backup_data_root`,
+  `.vmbackupd-receiver`, `ssh_remote_root`, or arbitrary local paths;
+- each published storage includes its stable ID, name, capacity, configured
+  reserve and receiver readiness;
+- readiness fails closed unless both the LOCAL storage and its managed
+  `.vmbackupd-receiver` namespace are usable;
+- legacy LOCAL destinations without the managed receiver namespace remain
+  visible but report `ready=false`;
+- no database schema change and no `remote_storage_id` persistence were
+  introduced in this phase;
+- existing `ssh_remote_root` behavior remains temporarily intact for
+  compatibility with the earlier SSH.4 preflight.
+
+Security boundary:
+
+    remote SSH client
+        -> dedicated sshd :22022
+        -> public-key authentication
+        -> ForceCommand vmbackupd-receiver-session
+        -> vmbackupd-storage-list
+        -> /run/vmbackupd-receiver-catalog.sock
+        -> socket-activated worker as vmbackupd
+        -> bounded local storage.list/storage.test
+        -> sanitized LOCAL storage catalog
+
+Acceptance:
+
+- focused receiver/catalog/packaging tests passed;
+- full pytest suite passed;
+- unified Release 3 RPM build passed on Fedora 41;
+- SRPM rebuild produced the Fedora 44 unified package successfully;
+- package upgrade preserved the existing SSH identity/trust state;
+- receiver catalog socket activation worked on both maker and the Fedora 44
+  receiver;
+- maker local acceptance published managed LOCAL storage as `ready=true`;
+- Fedora 44 receiver exposed managed storage `STOR_HDD` with stable ID:
+
+      540459e8-2555-43eb-8527-99853ba96ea7
+
+- `STOR_HDD` reported approximately 4.2 TB total capacity and 3.57 TB free
+  capacity with the configured 200 GiB reserve;
+- the live remote response reported `STOR_HDD` as `ready=true`;
+- real end-to-end SSH acceptance succeeded from maker to
+  `62.205.155.66:22022`;
+- strict host-key checking and the shared vmbackupd SSH client identity were
+  used for the real SSH acceptance;
+- the end-to-end response contained the stable remote storage ID and no local
+  receiver filesystem path.
+
+An infrastructure issue discovered during acceptance was corrected separately:
+the Fedora 44 receiver filesystem root `/` had mode `0777`, causing OpenSSH to
+reject `AuthorizedKeysCommand` as unsafe. Restoring `/` to root-owned mode
+`0755` restored the intended OpenSSH security boundary. This was not a
+vmbackupd protocol or key-registry defect.
+
+Not implemented in R2.1:
+
+- persistence of `remote_storage_id` in SSH destinations;
+- Cockpit live selection of remote LOCAL storage;
+- preflight keyed by remote storage ID;
+- removal of the interim manually configured `ssh_remote_root`;
+- SSH backup data transfer;
+- replica fan-out and retry tracking.
+
+Next:
+
+    remote storage discovery
+        -> persist remote_storage_id
+        -> Cockpit live remote-storage selector
+        -> preflight(remote_storage_id)
+        -> SSH transfer by storage ID
+        -> primary + replica destinations
+
+---
+
 # 3E.8 — Capacity-aware retention and reclaim
 
 ## 3E.8a.1 — Capacity-aware retention policy controls
