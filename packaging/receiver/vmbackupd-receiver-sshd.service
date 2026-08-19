@@ -1,4 +1,6 @@
 [Unit]
+Requires=vmbackupd-receiver-catalog.socket
+After=vmbackupd-receiver-catalog.socket
 Description=vmbackupd restricted SSH receiver
 Documentation=file:///usr/share/doc/vmbackupd/packaging.md
 After=network.target

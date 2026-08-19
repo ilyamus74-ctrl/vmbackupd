@@ -141,6 +141,7 @@ def test_receiver_scripts_are_root_owned_package_payloads():
         "vmbackupd-authorized-keys",
         "vmbackupd-transfer-shell",
         "vmbackupd-receiver-session",
+        "vmbackupd-receiver-catalog",
     ):
         path = RECEIVER / name
         assert path.exists()
@@ -189,3 +190,81 @@ def test_receiver_hostkey_generator_does_not_replace_existing_identity():
     assert 'mv -T "$tmp" "$private"' in value
     assert 'mv -T "$tmp.pub" "$public"' in value
     assert "rm -f -- \"$private\"" not in value
+
+
+def test_receiver_catalog_bridge_is_narrow_and_socket_activated():
+    socket_unit = text(
+        RECEIVER / "vmbackupd-receiver-catalog.socket"
+    )
+    service = text(
+        RECEIVER / "vmbackupd-receiver-catalog@.service"
+    )
+    sshd_service = text(
+        RECEIVER / "vmbackupd-receiver-sshd.service"
+    )
+
+    assert (
+        "ListenStream=/run/vmbackupd-receiver-catalog.sock"
+        in socket_unit
+    )
+    assert "Accept=yes" in socket_unit
+    assert "SocketUser=vmbackupd-transfer" in socket_unit
+    assert "SocketGroup=vmbackupd-transfer" in socket_unit
+    assert "SocketMode=0600" in socket_unit
+
+    assert "User=vmbackupd" in service
+    assert "Group=vmbackupd" in service
+    assert "SupplementaryGroups=qemu" in service
+    assert "ProtectSystem=full" in service
+    assert "ProtectSystem=strict" not in service
+    assert "StandardInput=socket" in service
+    assert "StandardOutput=socket" in service
+
+    assert (
+        "ExecStart=/usr/libexec/vmbackupd-receiver-catalog"
+        in service
+    )
+
+    assert "NoNewPrivileges=yes" in service
+    assert "PrivateNetwork=yes" in service
+    assert "RestrictAddressFamilies=AF_UNIX" in service
+    assert "CapabilityBoundingSet=" in service
+
+    assert (
+        "Requires=vmbackupd-receiver-catalog.socket"
+        in sshd_service
+    )
+
+    # The SSH identity must never receive direct administrative API access.
+    assert "vmbackupd-admin" not in socket_unit
+    assert "User=vmbackupd-transfer" not in service
+
+
+def test_receiver_catalog_is_part_of_unified_package():
+    spec = text(PACKAGING / "vmbackupd.spec")
+
+    assert (
+        "packaging/receiver/vmbackupd-receiver-catalog"
+        in spec
+    )
+    assert (
+        "vmbackupd-receiver-catalog.socket"
+        in spec
+    )
+    assert (
+        "vmbackupd-receiver-catalog@.service"
+        in spec
+    )
+
+    assert (
+        "%systemd_post vmbackupd-receiver-catalog.socket"
+        in spec
+    )
+    assert (
+        "%systemd_preun vmbackupd-receiver-catalog.socket"
+        in spec
+    )
+    assert (
+        "%systemd_postun vmbackupd-receiver-catalog.socket"
+        in spec
+    )

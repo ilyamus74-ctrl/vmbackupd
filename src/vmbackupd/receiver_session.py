@@ -13,10 +13,17 @@ import stat
 import sys
 from pathlib import Path
 
+from .receiver_catalog import (
+    ReceiverCatalogClient,
+    ReceiverCatalogError,
+)
+
 
 PROTOCOL_VERSION = 1
+STORAGE_LIST_PROTOCOL_VERSION = 2
 RECEIVER_ROOT = Path("/srv/vmbackupd")
 PREFLIGHT_COMMAND = "vmbackupd-preflight"
+STORAGE_LIST_COMMAND = "vmbackupd-storage-list"
 
 
 def _emit(value: dict) -> None:
@@ -36,6 +43,28 @@ def _base_response() -> dict:
         "transport_ready": False,
         "preflight_ready": True,
     }
+
+
+def _storage_list(catalog_client) -> int:
+    try:
+        storages = catalog_client.list()
+    except ReceiverCatalogError as exc:
+        print(
+            "vmbackupd-receiver-session: "
+            f"storage catalog unavailable: {exc}",
+            file=sys.stderr,
+        )
+        return 69
+
+    _emit({
+        "service": "vmbackupd-receiver",
+        "protocol_version": STORAGE_LIST_PROTOCOL_VERSION,
+        "operation": "storage.list",
+        "transport_ready": False,
+        "storages": storages,
+    })
+
+    return 0
 
 
 def _preflight(root: Path) -> int:
@@ -91,6 +120,7 @@ def main(
     *,
     environ=None,
     receiver_root=None,
+    catalog_client=None,
 ) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
 
@@ -111,6 +141,14 @@ def main(
 
     if original == PREFLIGHT_COMMAND:
         return _preflight(root)
+
+    if original == STORAGE_LIST_COMMAND:
+        client = (
+            ReceiverCatalogClient()
+            if catalog_client is None
+            else catalog_client
+        )
+        return _storage_list(client)
 
     if original:
         print(

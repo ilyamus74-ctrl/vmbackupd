@@ -213,3 +213,64 @@ def test_receiver_rejects_unknown_remote_command(tmp_path, capsys):
 
     assert result == 64
     assert "not allowed" in capsys.readouterr().err
+
+
+class ReceiverCatalog:
+    def __init__(self, values):
+        self.values = values
+        self.calls = 0
+
+    def list(self):
+        self.calls += 1
+        return self.values
+
+
+def test_receiver_storage_list_is_protocol_v2_and_path_free(
+    tmp_path,
+    capsys,
+):
+    root = tmp_path / "receiver"
+    root.mkdir()
+
+    catalog = ReceiverCatalog([
+        {
+            "id": "storage-1",
+            "name": "HDD-Backup",
+            "storage_type": "LOCAL",
+            "is_default": False,
+            "total_bytes": 4000,
+            "free_bytes": 3300,
+            "minimum_free_bytes": 100,
+            "minimum_free_percent": 5.0,
+            "required_reserve_bytes": 200,
+            "usable_after_reserve_bytes": 3100,
+            "ready": True,
+        },
+    ])
+
+    result = receiver_main(
+        [],
+        environ={
+            "SSH_ORIGINAL_COMMAND":
+                "vmbackupd-storage-list",
+        },
+        receiver_root=root,
+        catalog_client=catalog,
+    )
+
+    assert result == 0
+    assert catalog.calls == 1
+
+    output = capsys.readouterr().out.strip()
+    payload = json.loads(output)
+
+    assert payload["service"] == "vmbackupd-receiver"
+    assert payload["protocol_version"] == 2
+    assert payload["operation"] == "storage.list"
+    assert payload["transport_ready"] is False
+    assert payload["storages"] == catalog.values
+
+    assert "backup_data_root" not in output
+    assert "receiver_directory" not in output
+    assert "/srv/" not in output
+    assert "/mnt/" not in output

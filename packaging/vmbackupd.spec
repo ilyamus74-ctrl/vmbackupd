@@ -76,6 +76,8 @@ install -Dpm 0755 packaging/receiver/vmbackupd-transfer-shell \
     %{buildroot}%{_libexecdir}/vmbackupd-transfer-shell
 install -Dpm 0755 packaging/receiver/vmbackupd-receiver-session \
     %{buildroot}%{_libexecdir}/vmbackupd-receiver-session
+install -Dpm 0755 packaging/receiver/vmbackupd-receiver-catalog \
+    %{buildroot}%{_libexecdir}/vmbackupd-receiver-catalog
 install -Dpm 0755 packaging/receiver/vmbackupd-receiver-hostkey \
     %{buildroot}%{_libexecdir}/vmbackupd-receiver-hostkey
 
@@ -87,6 +89,10 @@ install -Dpm 0644 packaging/receiver/receiver_sshd_config \
     %{buildroot}%{_sysconfdir}/vmbackupd/receiver_sshd_config
 install -Dpm 0644 packaging/receiver/vmbackupd-receiver-sshd.service \
     %{buildroot}%{_unitdir}/vmbackupd-receiver-sshd.service
+install -Dpm 0644 packaging/receiver/vmbackupd-receiver-catalog.socket \
+    %{buildroot}%{_unitdir}/vmbackupd-receiver-catalog.socket
+install -Dpm 0644 packaging/receiver/vmbackupd-receiver-catalog@.service \
+    %{buildroot}%{_unitdir}/vmbackupd-receiver-catalog@.service
 
 %pre
 %sysusers_create_compat %{SOURCE2}
@@ -96,6 +102,7 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-sshd.service \
 %systemd_post vmbackupd.service
 %systemd_post vmbackupd-storage-helper.socket
 %systemd_post vmbackupd-receiver-sshd.service
+%systemd_post vmbackupd-receiver-catalog.socket
 
 %tmpfiles_create %{_tmpfilesdir}/vmbackupd.conf
 %tmpfiles_create %{_tmpfilesdir}/vmbackupd-receiver.conf
@@ -104,11 +111,13 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-sshd.service \
 %systemd_preun vmbackupd.service
 %systemd_preun vmbackupd-storage-helper.socket
 %systemd_preun vmbackupd-receiver-sshd.service
+%systemd_preun vmbackupd-receiver-catalog.socket
 
 %postun
 %systemd_postun vmbackupd.service
 %systemd_postun vmbackupd-storage-helper.socket
 %systemd_postun vmbackupd-receiver-sshd.service
+%systemd_postun vmbackupd-receiver-catalog.socket
 
 %files -f %{pyproject_files}
 %doc docs/*.md
@@ -123,6 +132,8 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-sshd.service \
 %{_unitdir}/vmbackupd-storage-helper.socket
 %{_unitdir}/vmbackupd-storage-helper@.service
 %{_unitdir}/vmbackupd-receiver-sshd.service
+%{_unitdir}/vmbackupd-receiver-catalog.socket
+%{_unitdir}/vmbackupd-receiver-catalog@.service
 
 %{_sysusersdir}/vmbackupd.conf
 %{_sysusersdir}/vmbackupd-receiver.conf
@@ -134,6 +145,7 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-sshd.service \
 %{_libexecdir}/vmbackupd-authorized-keys
 %{_libexecdir}/vmbackupd-transfer-shell
 %{_libexecdir}/vmbackupd-receiver-session
+%{_libexecdir}/vmbackupd-receiver-catalog
 %{_libexecdir}/vmbackupd-receiver-hostkey
 
 %{_datadir}/cockpit/vmbackupd/
