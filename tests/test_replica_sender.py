@@ -515,3 +515,60 @@ def test_sender_refuses_untrusted_receiver_before_process_start(
         )
 
     assert factory.process is None
+
+
+def test_sender_shutdown_before_start_does_not_launch_ssh(
+    tmp_path,
+):
+    import threading
+
+    from vmbackupd.replica_sender import (
+        ReplicaTransferCancelledError,
+    )
+
+    source = bundle(
+        tmp_path
+    )
+
+    restore_point = point(
+        source
+    )
+
+    remote = destination()
+
+    task = ReplicaTask(
+        restore_point_id=restore_point.id,
+        destination_id=remote.id,
+    )
+
+    plan = build_transfer_plan(
+        task,
+        restore_point,
+        VM_ID,
+        remote,
+    )
+
+    factory = ProcessFactory(
+        []
+    )
+
+    client = SSHReplicaTransferClient(
+        Identity(),
+        KnownHosts(),
+        process_factory=factory,
+    )
+
+    stop = threading.Event()
+    stop.set()
+
+    with pytest.raises(
+        ReplicaTransferCancelledError,
+        match="daemon shutdown",
+    ):
+        client.transfer(
+            plan,
+            remote,
+            stop_event=stop,
+        )
+
+    assert factory.process is None

@@ -362,3 +362,490 @@ def test_explicit_replica_task_supports_future_backfill():
 
     assert task.state is ReplicaTaskState.PENDING
     assert task.destination_id == replica_one.id
+
+
+def test_ssh_replica_task_claim_is_atomic_and_advances_to_verifying():
+    from vmbackupd.models import (
+        StorageType,
+    )
+
+    (
+        repository,
+        node,
+        _,
+        _,
+        _,
+        vm,
+        job,
+    ) = catalog()
+
+    remote = StorageDestination(
+        name="ssh-replica",
+        backup_data_root="/backup/ssh-staging",
+        node_id=node.id,
+        storage_type=StorageType.SSH,
+        ssh_host="backup.example.test",
+        ssh_port=22022,
+        ssh_user="vmbackupd-transfer",
+        remote_storage_id=(
+            "22222222-2222-4222-"
+            "8222-222222222222"
+        ),
+    )
+
+    repository.add_storage_destination(
+        remote
+    )
+
+    MockBackupEngine(
+        repository
+    ).execute(
+        job.id,
+        backup_object_id="mock://primary",
+    )
+
+    point = (
+        repository
+        .list_restore_points(
+            vm.id
+        )[0]
+    )
+
+    task = repository.create_replica_task(
+        point.id,
+        remote.id,
+        NOW,
+    )
+
+    assert (
+        task.state
+        is ReplicaTaskState.PENDING
+    )
+
+    claimed = (
+        repository
+        .claim_next_ssh_replica_task(
+            node.id,
+            NOW,
+        )
+    )
+
+    assert claimed is not None
+    assert claimed.id == task.id
+    assert (
+        claimed.state
+        is ReplicaTaskState.TRANSFERRING
+    )
+    assert claimed.attempts == 1
+
+    # Already claimed: another worker cannot claim it.
+    assert (
+        repository
+        .claim_next_ssh_replica_task(
+            node.id,
+            NOW,
+        )
+        is None
+    )
+
+    verifying = (
+        repository
+        .mark_replica_task_verifying(
+            task.id,
+            NOW,
+        )
+    )
+
+    assert (
+        verifying.state
+        is ReplicaTaskState.VERIFYING
+    )
+    assert verifying.attempts == 1
+
+
+def test_replica_task_executor_uses_primary_bundle_and_receipt_identity():
+    from vmbackupd.models import (
+        StorageType,
+    )
+    from vmbackupd.replica_worker import (
+        ReplicaTaskExecutor,
+    )
+
+    (
+        repository,
+        node,
+        primary,
+        _,
+        _,
+        vm,
+        job,
+    ) = catalog()
+
+    remote = StorageDestination(
+        name="ssh-replica-worker",
+        backup_data_root="/backup/ssh-worker",
+        node_id=node.id,
+        storage_type=StorageType.SSH,
+        ssh_host="backup.example.test",
+        ssh_port=22022,
+        ssh_user="vmbackupd-transfer",
+        remote_storage_id=(
+            "33333333-3333-4333-"
+            "8333-333333333333"
+        ),
+    )
+
+    repository.add_storage_destination(
+        remote
+    )
+
+    MockBackupEngine(
+        repository
+    ).execute(
+        job.id,
+        backup_object_id="mock://primary",
+    )
+
+    point = (
+        repository
+        .list_restore_points(
+            vm.id
+        )[0]
+    )
+
+    bundle = (
+        "/backup/primary/vms/"
+        "44444444-4444-4444-"
+        "8444-444444444444"
+    )
+
+    with repository.connection:
+        repository.connection.execute(
+            """UPDATE restore_points
+               SET bundle_object_id = ?
+               WHERE id = ?""",
+            (
+                bundle,
+                point.id,
+            ),
+        )
+
+        repository.connection.execute(
+            """UPDATE restore_point_locations
+               SET bundle_object_id = ?
+               WHERE restore_point_id = ?
+                 AND destination_id = ?""",
+            (
+                bundle,
+                point.id,
+                primary.id,
+            ),
+        )
+
+    point = repository.get_restore_point(
+        point.id
+    )
+
+    task = repository.create_replica_task(
+        point.id,
+        remote.id,
+        NOW,
+    )
+
+    seen = {}
+
+    def fake_plan_builder(
+        claimed,
+        restore_point,
+        vm_id,
+        destination,
+    ):
+        seen["task"] = claimed
+        seen["point"] = restore_point
+        seen["vm_id"] = vm_id
+        seen["destination"] = destination
+
+        return object()
+
+    class Client:
+        def transfer(
+            self,
+            plan,
+            destination,
+            *,
+            stop_event=None,
+        ):
+            assert plan is not None
+            assert (
+                destination.id
+                == remote.id
+            )
+
+            return {
+                "transfer_id":
+                    task.id,
+                "storage_id":
+                    remote.remote_storage_id,
+                "restore_point_id":
+                    point.id,
+                "status":
+                    "STAGING_COMPLETE",
+            }
+
+    executor = ReplicaTaskExecutor(
+        repository,
+        node.id,
+        Client(),
+        plan_builder=fake_plan_builder,
+    )
+
+    result = executor.run_once()
+
+    assert result is not None
+    assert (
+        result.state
+        is ReplicaTaskState.VERIFYING
+    )
+    assert result.attempts == 1
+
+    assert (
+        seen["task"].id
+        == task.id
+    )
+    assert (
+        seen["point"].bundle_object_id
+        == bundle
+    )
+    assert seen["vm_id"] == vm.id
+    assert (
+        seen["destination"].id
+        == remote.id
+    )
+
+
+def test_replica_task_executor_persists_sender_failure():
+    from vmbackupd.models import (
+        StorageType,
+    )
+    from vmbackupd.replica_worker import (
+        ReplicaTaskExecutor,
+    )
+
+    (
+        repository,
+        node,
+        primary,
+        _,
+        _,
+        vm,
+        job,
+    ) = catalog()
+
+    remote = StorageDestination(
+        name="ssh-replica-failure",
+        backup_data_root="/backup/ssh-failure",
+        node_id=node.id,
+        storage_type=StorageType.SSH,
+        ssh_host="backup.example.test",
+        ssh_port=22022,
+        ssh_user="vmbackupd-transfer",
+        remote_storage_id=(
+            "55555555-5555-4555-"
+            "8555-555555555555"
+        ),
+    )
+
+    repository.add_storage_destination(
+        remote
+    )
+
+    MockBackupEngine(
+        repository
+    ).execute(
+        job.id,
+        backup_object_id="mock://primary",
+    )
+
+    point = (
+        repository
+        .list_restore_points(
+            vm.id
+        )[0]
+    )
+
+    bundle = (
+        "/backup/primary/vms/"
+        "66666666-6666-4666-"
+        "8666-666666666666"
+    )
+
+    with repository.connection:
+        repository.connection.execute(
+            """UPDATE restore_points
+               SET bundle_object_id = ?
+               WHERE id = ?""",
+            (
+                bundle,
+                point.id,
+            ),
+        )
+
+        repository.connection.execute(
+            """UPDATE restore_point_locations
+               SET bundle_object_id = ?
+               WHERE restore_point_id = ?
+                 AND destination_id = ?""",
+            (
+                bundle,
+                point.id,
+                primary.id,
+            ),
+        )
+
+    point = repository.get_restore_point(
+        point.id
+    )
+
+    task = repository.create_replica_task(
+        point.id,
+        remote.id,
+        NOW,
+    )
+
+    class BrokenClient:
+        def transfer(
+            self,
+            *_,
+            **__,
+        ):
+            raise RuntimeError(
+                "injected SSH failure"
+            )
+
+    executor = ReplicaTaskExecutor(
+        repository,
+        node.id,
+        BrokenClient(),
+        plan_builder=(
+            lambda *_: object()
+        ),
+    )
+
+    result = executor.run_once()
+
+    assert result is not None
+    assert (
+        result.state
+        is ReplicaTaskState.FAILED
+    )
+    assert result.attempts == 1
+    assert (
+        "injected SSH failure"
+        in (result.last_error or "")
+    )
+
+
+def test_replica_task_shutdown_cancellation_preserves_transferring():
+    from types import SimpleNamespace
+
+    from vmbackupd.models import (
+        ReplicaTask,
+        ReplicaTaskState,
+    )
+    from vmbackupd.replica_sender import (
+        ReplicaTransferCancelledError,
+    )
+    from vmbackupd.replica_worker import (
+        ReplicaTaskExecutor,
+    )
+
+    task = ReplicaTask(
+        restore_point_id=(
+            "11111111-1111-4111-"
+            "8111-111111111111"
+        ),
+        destination_id=(
+            "22222222-2222-4222-"
+            "8222-222222222222"
+        ),
+        state=ReplicaTaskState.TRANSFERRING,
+        attempts=1,
+    )
+
+    class Repository:
+        def __init__(self):
+            self.failed = False
+            self.claimed = False
+
+        def claim_next_ssh_replica_task(
+            self,
+            node_id,
+            now,
+        ):
+            assert not self.claimed
+            self.claimed = True
+            return task
+
+        def get_replica_task(
+            self,
+            task_id,
+        ):
+            assert task_id == task.id
+            return task
+
+        def fail_replica_task_transfer(
+            self,
+            *_,
+            **__,
+        ):
+            self.failed = True
+            raise AssertionError(
+                "shutdown cancellation must not become FAILED"
+            )
+
+    class Client:
+        def transfer(
+            self,
+            *_,
+            **__,
+        ):
+            raise ReplicaTransferCancelledError(
+                "replica transfer cancelled by daemon shutdown"
+            )
+
+    repository = Repository()
+
+    executor = ReplicaTaskExecutor(
+        repository,
+        "local-node",
+        Client(),
+        plan_builder=lambda *_: object(),
+    )
+
+    executor._context = lambda claimed: (
+        SimpleNamespace(
+            id=claimed.restore_point_id,
+        ),
+        SimpleNamespace(
+            id=(
+                "33333333-3333-4333-"
+                "8333-333333333333"
+            ),
+        ),
+        SimpleNamespace(
+            remote_storage_id=(
+                "44444444-4444-4444-"
+                "8444-444444444444"
+            ),
+        ),
+    )
+
+    result = executor.run_once()
+
+    assert result.id == task.id
+    assert (
+        result.state
+        is ReplicaTaskState.TRANSFERRING
+    )
+    assert result.attempts == 1
+    assert repository.failed is False

@@ -18,6 +18,7 @@ from .libvirt_execution import (
 from .local_api import ApiServer
 from .models import StorageDestination, StorageType
 from .repository import DomainInvariantError, SQLiteRepository
+from .replica_worker import ReplicaWorker
 from .runtime import DaemonRuntime
 from .ssh_identity import SSHIdentityManager
 from .ssh_known_hosts import SSHKnownHostsManager
@@ -150,6 +151,7 @@ class RuntimeWorker:
     def _run(self) -> None:
         repository = None
         runtime = None
+        replica_worker = None
         try:
             repository = SQLiteRepository(self.config.daemon.database_path)
             self.repository_connection_id = id(repository.connection)
@@ -183,40 +185,130 @@ class RuntimeWorker:
                 controller_lease_seconds=self.config.daemon.controller_lease_seconds,
             )
             self._instance_id = runtime.start()
+
+            database_path = (
+                self.config.daemon.database_path
+            )
+
+            if str(database_path) != ":memory:":
+                replica_worker = ReplicaWorker(
+                    database_path,
+                    self.node_id,
+                    database_path.parent / "ssh",
+                    _system_ssh_identity_id(
+                        self.node_id
+                    ),
+                    tick_seconds=1.0,
+                )
+
+                replica_worker.start()
+
         except BaseException as exc:
             self._startup_error = exc
-            self._set_state(RuntimeWorkerState.FAILED,
-                            f"{type(exc).__name__}: {exc}")
+            self._set_state(
+                RuntimeWorkerState.FAILED,
+                f"{type(exc).__name__}: {exc}",
+            )
             self._started.set()
+
+            try:
+                if replica_worker is not None:
+                    replica_worker.stop()
+            except Exception:
+                pass
+
+            try:
+                if (
+                    runtime is not None
+                    and runtime.instance_id
+                    is not None
+                ):
+                    runtime.stop()
+            except Exception:
+                pass
+
             if repository:
                 repository.close()
                 self.repository_closed = True
-                self.repository_closed_thread_id = threading.get_ident()
+                self.repository_closed_thread_id = (
+                    threading.get_ident()
+                )
+
+            self._instance_id = None
             return
         self._started.set()
         self._set_state(RuntimeWorkerState.RUNNING)
+        runtime_failure: str | None = None
         try:
             while not self._stop.is_set():
+                if (
+                    replica_worker is not None
+                    and replica_worker.last_error
+                    is not None
+                ):
+                    raise RuntimeError(
+                        "replica worker failed: "
+                        f"{replica_worker.last_error}"
+                    )
+
                 if self.before_tick:
                     self.before_tick()
+
                 runtime.tick()
-                self._stop.wait(self.config.daemon.tick_interval_seconds)
+
+                self._stop.wait(
+                    self.config.daemon.tick_interval_seconds
+                )
         except Exception as exc:
-            self._set_state(RuntimeWorkerState.FAILED,
-                            f"{type(exc).__name__}: {exc}")
+            # FAILED is published only after owned resources have
+            # completed teardown.  Callers may therefore treat FAILED
+            # as a terminal runtime state.
+            runtime_failure = (
+                f"{type(exc).__name__}: {exc}"
+            )
         finally:
+            try:
+                if replica_worker is not None:
+                    replica_worker.stop()
+            except Exception as exc:
+                detail = (
+                    "replica worker stop failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                runtime_failure = (
+                    detail
+                    if runtime_failure is None
+                    else f"{runtime_failure}; {detail}"
+                )
+
             try:
                 if runtime.instance_id is not None:
                     runtime.stop()
             except Exception as exc:
-                self._set_state(RuntimeWorkerState.FAILED,
-                                f"runtime stop failed: {type(exc).__name__}: {exc}")
+                detail = (
+                    "runtime stop failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                runtime_failure = (
+                    detail
+                    if runtime_failure is None
+                    else f"{runtime_failure}; {detail}"
+                )
+
             repository.close()
             self.repository_closed = True
             self.repository_closed_thread_id = threading.get_ident()
             self._instance_id = None
-            if self.runtime_state is not RuntimeWorkerState.FAILED:
-                self._set_state(RuntimeWorkerState.STOPPED)
+
+            if runtime_failure is not None:
+                self._set_state(
+                    RuntimeWorkerState.FAILED,
+                    runtime_failure,
+                )
+            else:
+                self._set_state(
+                    RuntimeWorkerState.STOPPED
+                )
 
 
 def compose(

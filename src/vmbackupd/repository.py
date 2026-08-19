@@ -1985,6 +1985,158 @@ class SQLiteRepository:
             )
         ]
 
+    def claim_next_ssh_replica_task(
+        self,
+        node_id: str,
+        now: datetime,
+    ) -> ReplicaTask | None:
+        """Atomically claim one ready SSH replica task for sender execution."""
+
+        try:
+            self.connection.execute(
+                "BEGIN IMMEDIATE"
+            )
+
+            row = self.connection.execute(
+                """SELECT rt.id
+                   FROM replica_tasks rt
+                   JOIN restore_points rp
+                     ON rp.id = rt.restore_point_id
+                   JOIN job_runs jr
+                     ON jr.id = rp.job_run_id
+                   JOIN backup_jobs bj
+                     ON bj.id = jr.job_id
+                   JOIN vms vm
+                     ON vm.id = bj.vm_id
+                   JOIN storage_destinations sd
+                     ON sd.id = rt.destination_id
+                   WHERE rt.state = 'PENDING'
+                     AND vm.node_id = ?
+                     AND sd.node_id = ?
+                     AND sd.storage_type = 'SSH'
+                     AND (
+                         rt.next_retry_at IS NULL
+                         OR rt.next_retry_at <= ?
+                     )
+                     AND EXISTS (
+                         SELECT 1
+                         FROM restore_point_locations rpl
+                         WHERE rpl.restore_point_id =
+                               rt.restore_point_id
+                           AND rpl.role = 'PRIMARY'
+                           AND rpl.state = 'AVAILABLE'
+                     )
+                   ORDER BY rt.created_at, rt.id
+                   LIMIT 1""",
+                (
+                    node_id,
+                    node_id,
+                    now.isoformat(),
+                ),
+            ).fetchone()
+
+            if row is None:
+                self.connection.commit()
+                return None
+
+            cursor = self.connection.execute(
+                """UPDATE replica_tasks
+                   SET state = 'TRANSFERRING',
+                       attempts = attempts + 1,
+                       last_error = NULL,
+                       next_retry_at = NULL,
+                       updated_at = ?
+                   WHERE id = ?
+                     AND state = 'PENDING'""",
+                (
+                    now.isoformat(),
+                    row["id"],
+                ),
+            )
+
+            if cursor.rowcount != 1:
+                self.connection.rollback()
+                return None
+
+            task_id = row["id"]
+            self.connection.commit()
+
+        except Exception:
+            self.connection.rollback()
+            raise
+
+        return self.get_replica_task(
+            task_id
+        )
+
+    def mark_replica_task_verifying(
+        self,
+        task_id: str,
+        now: datetime,
+    ) -> ReplicaTask:
+        with self.connection:
+            cursor = self.connection.execute(
+                """UPDATE replica_tasks
+                   SET state = 'VERIFYING',
+                       last_error = NULL,
+                       next_retry_at = NULL,
+                       updated_at = ?
+                   WHERE id = ?
+                     AND state = 'TRANSFERRING'""",
+                (
+                    now.isoformat(),
+                    task_id,
+                ),
+            )
+
+            if cursor.rowcount != 1:
+                raise DomainInvariantError(
+                    "REPLICA_TASK_NOT_TRANSFERRING"
+                )
+
+        return self.get_replica_task(
+            task_id
+        )
+
+    def fail_replica_task_transfer(
+        self,
+        task_id: str,
+        error: str,
+        now: datetime,
+    ) -> ReplicaTask:
+        message = str(error).strip()
+
+        if not message:
+            message = "replica transfer failed"
+
+        if len(message) > 2000:
+            message = message[-2000:]
+
+        with self.connection:
+            cursor = self.connection.execute(
+                """UPDATE replica_tasks
+                   SET state = 'FAILED',
+                       last_error = ?,
+                       next_retry_at = NULL,
+                       updated_at = ?
+                   WHERE id = ?
+                     AND state = 'TRANSFERRING'""",
+                (
+                    message,
+                    now.isoformat(),
+                    task_id,
+                ),
+            )
+
+            if cursor.rowcount != 1:
+                raise DomainInvariantError(
+                    "REPLICA_TASK_NOT_TRANSFERRING"
+                )
+
+        return self.get_replica_task(
+            task_id
+        )
+
     def _insert_replica_task(
         self,
         restore_point_id: str,

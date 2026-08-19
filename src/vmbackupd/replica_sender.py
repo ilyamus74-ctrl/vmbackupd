@@ -59,6 +59,10 @@ class ReplicaSenderError(RuntimeError):
     pass
 
 
+class ReplicaTransferCancelledError(ReplicaSenderError):
+    """Daemon shutdown interrupted a transfer with unknown remote progress."""
+
+
 @dataclass(frozen=True, slots=True)
 class ReplicaSourceFile:
     relative_path: str
@@ -872,12 +876,29 @@ class SSHReplicaTransferClient:
             result
         )
 
+    @staticmethod
+    def _check_cancel(
+        stop_event,
+    ) -> None:
+        if (
+            stop_event is not None
+            and stop_event.is_set()
+        ):
+            raise ReplicaTransferCancelledError(
+                "replica transfer cancelled by daemon shutdown"
+            )
+
     def _send_file(
         self,
         stdin,
         stdout,
         item: ReplicaSourceFile,
+        *,
+        stop_event=None,
     ) -> None:
+        self._check_cancel(
+            stop_event
+        )
         self._write_control(
             stdin,
             {
@@ -927,6 +948,10 @@ class SSHReplicaTransferClient:
                 position = offset
 
                 while remaining:
+                    self._check_cancel(
+                        stop_event
+                    )
+
                     chunk_length = min(
                         remaining,
                         MAX_EXTENT_BYTES,
@@ -1050,7 +1075,12 @@ class SSHReplicaTransferClient:
         self,
         plan: ReplicaTransferPlan,
         destination: StorageDestination,
+        *,
+        stop_event=None,
     ) -> dict:
+        self._check_cancel(
+            stop_event
+        )
         argv = self._ssh_argv(
             destination
         )
@@ -1103,6 +1133,7 @@ class SSHReplicaTransferClient:
                         process.stdin,
                         process.stdout,
                         item,
+                        stop_event=stop_event,
                     )
 
                 self._write_control(
