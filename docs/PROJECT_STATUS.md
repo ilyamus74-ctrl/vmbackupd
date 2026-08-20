@@ -1020,6 +1020,37 @@ Result:
 
     full test suite passed
 
+Follow-up fix commit:
+
+    f55daeb
+
+Corrected reclaim snapshot validation after physical-object identity
+migration.
+
+Key corrections:
+
+- restore-point lineage validation remains based on `restore_point_id`;
+- physical reclaim object validation remains based on:
+
+      destination_id
+      source_bundle_object_id
+
+- catalog retirement no longer confuses multiple physical locations of one
+  restore point with lineage drift;
+- late replica locations no longer incorrectly invalidate reclaim catalog
+  retirement;
+- regression coverage verifies reclaim validation with multiple physical
+  locations belonging to the same restore point.
+
+Validation completed:
+
+- `python3 -m compileall -q src`
+- `PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q`
+
+Result:
+
+    full test suite passed
+
 
 ## 3E.8b.2d — Reclaim executor orchestration and recovery
 
