@@ -38,12 +38,29 @@
     </section>
 
     <section aria-labelledby="recent-title">
-      <h2 id="recent-title">Recent backup runs</h2>
+      <div class="section-heading recent-runs-heading">
+        <h2 id="recent-title">Recent backup runs</h2>
+        <label class="compact-filter">
+          <span>Status</span>
+          <select id="recent-run-filter">
+            <option value="ALL">All</option>
+            <option value="SUCCESS">Success</option>
+            <option value="FAILED">Failed</option>
+          </select>
+        </label>
+      </div>
+
       <div class="table-scroll">
         <table class="operational-table">
           <thead><tr><th>VM</th><th>Job</th><th>Type</th><th>Created</th><th>Status</th><th>Duration</th><th>Error</th></tr></thead>
           <tbody id="recent-runs"></tbody>
         </table>
+      </div>
+
+      <div class="pagination-controls" aria-label="Backup run history pagination">
+        <button id="recent-run-prev" type="button">Previous</button>
+        <span id="recent-run-page-info">—</span>
+        <button id="recent-run-next" type="button">Next</button>
       </div>
     </section>
 

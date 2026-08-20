@@ -817,3 +817,338 @@ def test_cli_job_replica_options_keep_current_full_only_execution_policy():
     assert method == "job.update"
     assert params["replica_destination_ids"] is None
     assert params["max_incrementals_per_chain"] is None
+
+
+
+def test_run_list_supports_server_side_pagination_and_preserves_legacy_shape():
+    repository = SQLiteRepository()
+    node, destination, _, vm = catalog(repository)
+
+    job = BackupJob(
+        vm.id,
+        "paged-runs",
+        storage_destination_id=destination.id,
+    )
+    repository.add_job(job)
+
+    states = [
+        "SUCCESS",
+        "FAILED",
+        "SUCCESS",
+        "FAILED",
+        "QUEUED",
+    ]
+    run_ids = []
+
+    for index, state in enumerate(states):
+        created = NOW + timedelta(minutes=index)
+        run = repository.create_manual_run(
+            job.id,
+            node.id,
+            created,
+        )
+        run_ids.append(run.id)
+
+        repository.connection.execute(
+            """UPDATE job_runs
+               SET state = ?,
+                   recovery_required = ?,
+                   recovery_reason = ?,
+                   updated_at = ?
+               WHERE id = ?""",
+            (
+                state,
+                1 if index == 4 else 0,
+                "test recovery" if index == 4 else None,
+                created.isoformat(),
+                run.id,
+            ),
+        )
+        repository.connection.commit()
+
+    app = application(
+        repository,
+        node,
+        FakeClock(NOW + timedelta(hours=1)),
+    )
+
+    # Existing consumers keep the original plain-list contract.
+    legacy = app.dispatch("run.list", {})
+    assert isinstance(legacy, list)
+    assert len(legacy) == 5
+
+    first = app.dispatch(
+        "run.list",
+        {
+            "limit": 1,
+            "offset": 0,
+            "result": "SUCCESS",
+            "summary_since": (
+                NOW - timedelta(minutes=1)
+            ).isoformat(),
+        },
+    )
+
+    assert first["limit"] == 1
+    assert first["offset"] == 0
+    assert first["result"] == "SUCCESS"
+    assert first["total"] == 2
+    assert [item["id"] for item in first["items"]] == [
+        run_ids[2]
+    ]
+
+    second = app.dispatch(
+        "run.list",
+        {
+            "limit": 1,
+            "offset": 1,
+            "result": "SUCCESS",
+            "summary_since": (
+                NOW - timedelta(minutes=1)
+            ).isoformat(),
+        },
+    )
+
+    assert second["total"] == 2
+    assert [item["id"] for item in second["items"]] == [
+        run_ids[0]
+    ]
+
+    assert first["summary"] == {
+        "successful_today": 2,
+        "failed_today": 2,
+        "active": 1,
+        "recovery_required": 1,
+    }
+
+    all_page = app.dispatch(
+        "run.list",
+        {
+            "limit": 2,
+            "offset": 0,
+            "result": "ALL",
+            "summary_since": (
+                NOW - timedelta(minutes=1)
+            ).isoformat(),
+        },
+    )
+
+    assert all_page["total"] == 5
+    assert [item["id"] for item in all_page["items"]] == [
+        run_ids[4],
+        run_ids[3],
+    ]
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"limit": 0},
+        {"limit": 101},
+        {"limit": True},
+        {"limit": 5, "offset": -1},
+        {"limit": 5, "offset": True},
+        {"limit": 5, "result": "UNKNOWN"},
+        {"limit": 5, "summary_since": "not-a-time"},
+        {"limit": 5, "summary_since": "2026-08-20T00:00:00"},
+        {"offset": 5},
+    ],
+)
+def test_run_list_pagination_rejects_invalid_params(params):
+    repository = SQLiteRepository()
+    node, _, _, _ = catalog(repository)
+    app = application(
+        repository,
+        node,
+        FakeClock(NOW),
+    )
+
+    with pytest.raises(ApplicationError):
+        app.dispatch("run.list", params)
+
+
+def test_job_list_overview_and_lazy_restore_point_locations():
+    from vmbackupd.engine import MockBackupEngine
+    from vmbackupd.models import (
+        RestorePointLocation,
+        RestorePointLocationRole,
+        RestorePointLocationState,
+        StorageDestination,
+        StorageType,
+    )
+
+    repository = SQLiteRepository()
+    node, primary, _, vm = catalog(repository)
+
+    job = BackupJob(
+        vm.id,
+        "overview-job",
+        storage_destination_id=primary.id,
+    )
+    repository.add_job(job)
+
+    MockBackupEngine(
+        repository
+    ).execute(
+        job.id,
+        backup_object_id="mock://overview",
+    )
+
+    point = repository.list_restore_points(
+        vm.id
+    )[0]
+
+    remote = StorageDestination(
+        name="overview-replica",
+        backup_data_root="/remote/overview",
+        node_id=node.id,
+        storage_type=StorageType.SSH,
+        ssh_host="receiver.example.test",
+        ssh_port=22022,
+        ssh_user="vmbackupd-transfer",
+        remote_storage_id=(
+            "55555555-5555-4555-"
+            "8555-555555555555"
+        ),
+    )
+    repository.add_storage_destination(remote)
+
+    repository.add_restore_point_location(
+        RestorePointLocation(
+            restore_point_id=point.id,
+            destination_id=remote.id,
+            role=RestorePointLocationRole.REPLICA,
+            state=RestorePointLocationState.AVAILABLE,
+            bundle_object_id="vms/test/replica",
+            verified_at=NOW,
+            created_at=NOW,
+        )
+    )
+
+    app = application(
+        repository,
+        node,
+        FakeClock(NOW),
+    )
+
+    # Legacy response stays unchanged.
+    legacy_jobs = app.dispatch(
+        "job.list",
+        {},
+    )
+    assert isinstance(legacy_jobs, list)
+    assert "overview" not in legacy_jobs[0]
+
+    jobs = app.dispatch(
+        "job.list",
+        {"overview": True},
+    )
+
+    assert len(jobs) == 1
+
+    overview = jobs[0]["overview"]
+
+    assert overview["backup_count"] == 1
+    assert overview["active_for_vm"] is False
+    assert overview["recovery_for_vm"] is False
+    assert overview["last_run"]["state"] == "SUCCESS"
+    assert (
+        overview["latest_available_restore_point"]["id"]
+        == point.id
+    )
+
+    # Legacy Restore Point list also stays unchanged.
+    legacy_points = app.dispatch(
+        "restore_point.list",
+        {},
+    )
+    assert isinstance(legacy_points, list)
+    assert "locations" not in legacy_points[0]
+
+    points = app.dispatch(
+        "restore_point.list",
+        {
+            "job_id": job.id,
+            "include_locations": True,
+        },
+    )
+
+    assert len(points) == 1
+    assert points[0]["id"] == point.id
+
+    locations = points[0]["locations"]
+
+    assert len(locations) == 2
+
+    by_role = {
+        item["role"]: item
+        for item in locations
+    }
+
+    assert by_role["PRIMARY"]["state"] == "AVAILABLE"
+    assert by_role["REPLICA"]["state"] == "AVAILABLE"
+    assert (
+        by_role["REPLICA"]["destination_id"]
+        == remote.id
+    )
+    assert (
+        by_role["REPLICA"]["bundle_object_id"]
+        == "vms/test/replica"
+    )
+
+
+def test_job_overview_reports_vm_busy_and_recovery_without_full_run_history():
+    repository = SQLiteRepository()
+    node, primary, _, vm = catalog(repository)
+
+    job = BackupJob(
+        vm.id,
+        "overview-state",
+        storage_destination_id=primary.id,
+    )
+    repository.add_job(job)
+
+    run = repository.create_manual_run(
+        job.id,
+        node.id,
+        NOW,
+    )
+
+    repository.connection.execute(
+        """UPDATE job_runs
+           SET recovery_required = 1,
+               recovery_reason = 'test',
+               updated_at = ?
+           WHERE id = ?""",
+        (
+            NOW.isoformat(),
+            run.id,
+        ),
+    )
+    repository.connection.commit()
+
+    app = application(
+        repository,
+        node,
+        FakeClock(NOW),
+    )
+
+    job_data = app.dispatch(
+        "job.list",
+        {"overview": True},
+    )[0]
+
+    assert (
+        job_data["overview"]["active_for_vm"]
+        is True
+    )
+    assert (
+        job_data["overview"]["recovery_for_vm"]
+        is True
+    )
+    assert job_data["overview"]["backup_count"] == 0
+    assert (
+        job_data["overview"]
+        ["latest_available_restore_point"]
+        is None
+    )

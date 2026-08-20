@@ -158,17 +158,39 @@ def test_cockpit_ui_has_operational_sections_and_no_destructive_controls():
         assert control not in html
 
 
-def test_cockpit_dashboard_derives_operational_run_summaries():
-    html = source("index.html")
-    javascript = source("vmbackupd.js")
-    for label in ("Successful today", "Failed today", "Active", "Recovery required"):
-        assert label in html
-    assert 'run.state === "SUCCESS" && isToday(run.updated_at, now)' in javascript
-    assert 'run.state === "FAILED" && isToday(run.updated_at, now)' in javascript
-    assert '!TERMINAL_STATES.has(run.state)' in javascript
-    assert 'dataset.runs.filter(run => run.recovery_required)' in javascript
-    assert 'const TERMINAL_STATES = new Set(["SUCCESS", "FAILED"]);' in javascript
 
+def test_cockpit_dashboard_derives_operational_run_summaries():
+    javascript = source("vmbackupd.js")
+
+    # Dashboard counters now come from the complete server-side
+    # run summary rather than from the five visible history rows.
+    assert (
+        "const summary = runPage && runPage.summary ? "
+        "runPage.summary : {};"
+        in javascript
+    )
+
+    assert "Number(summary.successful_today || 0)" in javascript
+    assert "Number(summary.failed_today || 0)" in javascript
+    assert "Number(summary.active || 0)" in javascript
+    assert "Number(summary.recovery_required || 0)" in javascript
+
+    assert (
+        'document.getElementById("successful-today")'
+        in javascript
+    )
+    assert (
+        'document.getElementById("failed-today")'
+        in javascript
+    )
+    assert (
+        'document.getElementById("active-runs")'
+        in javascript
+    )
+    assert (
+        'document.getElementById("recovery-required")'
+        in javascript
+    )
 
 def test_cockpit_recent_runs_join_jobs_and_vms_with_explicit_statuses():
     html = source("index.html")
@@ -187,19 +209,31 @@ def test_cockpit_recent_runs_join_jobs_and_vms_with_explicit_statuses():
     assert "run.recovery_reason || run.cleanup_error || run.error" in javascript
 
 
-def test_cockpit_jobs_join_storage_and_use_available_restore_points():
-    html = source("index.html")
-    javascript = source("vmbackupd.js")
-    assert all(column in html for column in (
-        "Destination", "Last run", "Last status", "Last successful backup", "Next run",
-    ))
-    assert "model.storageById.get(job.storage_destination_id)" in javascript
-    assert 'point.status === "AVAILABLE"' in javascript
-    assert "run && run.job_id === jobId" in javascript
-    assert "latestSuccessfulRestorePoint" in javascript
-    assert '"Manual / not scheduled"' in javascript
-    assert '"Never"' in javascript
 
+def test_cockpit_jobs_join_storage_and_use_available_restore_points():
+    javascript = source("vmbackupd.js")
+
+    # Job history facts are supplied by job.list overview=true.
+    assert "const overview = job.overview || {};" in javascript
+    assert "overview.last_run || null" in javascript
+    assert (
+        "overview.latest_available_restore_point || null"
+        in javascript
+    )
+    assert "overview.active_for_vm === true" in javascript
+    assert "overview.recovery_for_vm === true" in javascript
+
+    # Destination lookup remains local UI joining by stable ID.
+    assert "model.storageById.get(" in javascript
+    assert "job.storage_destination_id" in javascript
+
+    # Full restore-point/location history is lazy and only loaded
+    # when the Backups disclosure for a job is opened.
+    assert "jobBackupDetails(job, model)" in javascript
+    assert '"restore_point.list"' in javascript
+    assert "job_id: job.id" in javascript
+    assert "include_locations: true" in javascript
+    assert "Backups (${count})" in javascript
 
 def test_cockpit_has_timestamp_duration_and_atomic_refresh_helpers():
     javascript = source("vmbackupd.js")
@@ -209,9 +243,13 @@ def test_cockpit_has_timestamp_duration_and_atomic_refresh_helpers():
     assert "function runDuration(run, now)" in javascript
     assert "Promise.all([" in javascript
     assert 'api.request("vm.list")' in javascript
-    assert 'api.request("job.list")' in javascript
-    assert 'api.request("run.list")' in javascript
-    assert 'api.request("restore_point.list")' in javascript
+    assert 'api.request(' in javascript
+    assert '"job.list"' in javascript
+    assert "{ overview: true }" in javascript
+    assert '"run.list"' in javascript
+    assert "recentRunParams()" in javascript
+    assert '"restore_point.list"' in javascript
+    assert "include_locations: true" in javascript
     assert 'api.request("recovery.list")' in javascript
     refresh_start = javascript.index(
         "    async function refresh(options) {"
@@ -420,12 +458,22 @@ def test_cockpit_live_refresh_uses_one_shot_polling():
     assert "setInterval" not in javascript
 
 
+
 def test_cockpit_live_refresh_only_exists_while_work_is_active():
     javascript = source("vmbackupd.js")
-    assert "function hasActiveRuns()" in javascript
-    assert "currentModel.runs.some(run => !TERMINAL_STATES.has(run.state))" in javascript
-    assert "if (pageUnloading || !hasActiveRuns())" in javascript
 
+    assert "function hasActiveRuns()" in javascript
+
+    # Active state must represent the complete server-side history,
+    # not merely the current five-row history page.
+    assert "Number(currentModel.active) > 0" in javascript
+
+    assert (
+        "if (pageUnloading || !hasActiveRuns())"
+        in javascript
+    )
+    assert "LIVE_REFRESH_INTERVAL_MS" in javascript
+    assert "scheduleLiveRefresh();" in javascript
 
 def test_cockpit_live_refresh_is_non_overlapping():
     javascript = source("vmbackupd.js")
@@ -442,18 +490,34 @@ def test_cockpit_live_refresh_is_non_overlapping():
     assert "refreshInFlight = operation;" in refresh_body
 
 
+
 def test_cockpit_background_refresh_preserves_rendered_dashboard():
     javascript = source("vmbackupd.js")
 
-    refresh_body = javascript.split("async function refresh(options)", 1)[1].split(
-        'refreshButton.addEventListener("click"', 1
-    )[0]
+    start = javascript.index(
+        "async function refresh(options)"
+    )
+    end = javascript.index(
+        'refreshButton.addEventListener("click", refresh);',
+        start,
+    )
 
-    assert "const background = Boolean(options && options.background);" in refresh_body
-    assert "if (!background) {" in refresh_body
-    assert "clearViews();" in refresh_body
-    assert "void refresh({ background: true });" in javascript
+    refresh_body = javascript[start:end]
 
+    assert (
+        "Boolean(options && options.background)"
+        in refresh_body
+    )
+
+    guard = refresh_body.index("if (!background) {")
+    clear = refresh_body.index("clearViews();")
+
+    # A periodic/background refresh must not clear the currently
+    # rendered dashboard before replacement data arrives.
+    assert guard < clear
+
+    assert "renderModel(model);" in refresh_body
+    assert "scheduleLiveRefresh();" in refresh_body
 
 def test_cockpit_polling_stops_on_failure_terminal_state_and_unload():
     javascript = source("vmbackupd.js")
@@ -575,3 +639,38 @@ def test_cockpit_job_form_configures_primary_replicas_and_incrementals():
     assert "max_incrementals_per_chain" in javascript
     assert "max_incrementals_per_chain: 0" in javascript
     assert "updateJobReplicaOptions" in javascript
+
+
+
+def test_cockpit_history_uses_server_pagination_and_lazy_backup_details():
+    html = source("index.html")
+    javascript = source("vmbackupd.js")
+
+    assert 'id="recent-run-filter"' in html
+    assert 'value="ALL">All</option>' in html
+    assert 'value="SUCCESS">Success</option>' in html
+    assert 'value="FAILED">Failed</option>' in html
+    assert 'id="recent-run-prev"' in html
+    assert 'id="recent-run-next"' in html
+    assert 'id="recent-run-page-info"' in html
+
+    assert "const RECENT_RUN_LIMIT = 5;" in javascript
+    assert ".slice(0, RECENT_RUN_LIMIT)" not in javascript
+
+    assert '"job.list"' in javascript
+    assert "{ overview: true }" in javascript
+
+    assert '"run.list"' in javascript
+    assert "recentRunParams()" in javascript
+    assert "summary_since: localTodayStartIso()" in javascript
+
+    # Restore points are not part of the global dashboard refresh anymore.
+    assert "jobBackupDetails" in javascript
+    assert '"restore_point.list"' in javascript
+    assert "job_id: job.id" in javascript
+    assert "include_locations: true" in javascript
+    assert "Backups (${count})" in javascript
+
+    # Active/live-refresh state is taken from the full server summary,
+    # not from only the five visible history rows.
+    assert "Number(currentModel.active) > 0" in javascript

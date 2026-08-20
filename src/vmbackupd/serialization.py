@@ -57,6 +57,20 @@ def restore_point(value: RestorePoint) -> dict:
             "created_at": value.created_at.isoformat()}
 
 
+def restore_point_location(value) -> dict:
+    return {
+        "restore_point_id": value.restore_point_id,
+        "destination_id": value.destination_id,
+        "role": value.role.value,
+        "state": value.state.value,
+        "bundle_object_id": value.bundle_object_id,
+        "verified_at":
+            value.verified_at.isoformat()
+            if value.verified_at else None,
+        "created_at": value.created_at.isoformat(),
+    }
+
+
 def event(value: Event) -> dict:
     return {"id": value.id, "job_run_id": value.job_run_id,
             "node_id": value.node_id,

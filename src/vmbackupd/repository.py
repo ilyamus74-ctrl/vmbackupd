@@ -3001,6 +3001,169 @@ class SQLiteRepository:
         )
         return [self.get_job(row["id"]) for row in rows]
 
+    def job_overview_for_node(
+        self,
+        node_id: str,
+    ) -> dict[str, dict[str, object]]:
+        """Return compact dashboard history facts without loading all runs."""
+
+        rows = self.connection.execute(
+            """
+            SELECT
+                bj.id AS job_id,
+
+                (
+                    SELECT jr.id
+                    FROM job_runs jr
+                    WHERE jr.job_id = bj.id
+                    ORDER BY jr.created_at DESC, jr.id DESC
+                    LIMIT 1
+                ) AS last_run_id,
+
+                (
+                    SELECT rp.id
+                    FROM restore_points rp
+                    JOIN job_runs rjr
+                      ON rjr.id = rp.job_run_id
+                    WHERE rjr.job_id = bj.id
+                      AND rp.status = 'AVAILABLE'
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM reclaim_bundles rb
+                          JOIN reclaim_operations ro
+                            ON ro.id = rb.operation_id
+                          WHERE rb.restore_point_id = rp.id
+                            AND ro.state IN (
+                                'RETIRING',
+                                'QUARANTINED',
+                                'CATALOG_REMOVED',
+                                'PURGING',
+                                'PURGED',
+                                'RECOVERY_REQUIRED'
+                            )
+                      )
+                    ORDER BY
+                        rp.created_at DESC,
+                        rp.sequence DESC,
+                        rp.id DESC
+                    LIMIT 1
+                ) AS latest_restore_point_id,
+
+                (
+                    SELECT COUNT(*)
+                    FROM restore_points rp
+                    JOIN job_runs rjr
+                      ON rjr.id = rp.job_run_id
+                    WHERE rjr.job_id = bj.id
+                      AND rp.status = 'AVAILABLE'
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM reclaim_bundles rb
+                          JOIN reclaim_operations ro
+                            ON ro.id = rb.operation_id
+                          WHERE rb.restore_point_id = rp.id
+                            AND ro.state IN (
+                                'RETIRING',
+                                'QUARANTINED',
+                                'CATALOG_REMOVED',
+                                'PURGING',
+                                'PURGED',
+                                'RECOVERY_REQUIRED'
+                            )
+                      )
+                ) AS backup_count,
+
+                EXISTS (
+                    SELECT 1
+                    FROM job_runs active_run
+                    JOIN backup_jobs active_job
+                      ON active_job.id = active_run.job_id
+                    WHERE active_job.vm_id = bj.vm_id
+                      AND active_run.state NOT IN ('SUCCESS', 'FAILED')
+                ) AS active_for_vm,
+
+                EXISTS (
+                    SELECT 1
+                    FROM job_runs recovery_run
+                    JOIN backup_jobs recovery_job
+                      ON recovery_job.id = recovery_run.job_id
+                    WHERE recovery_job.vm_id = bj.vm_id
+                      AND recovery_run.recovery_required = 1
+                ) AS recovery_for_vm
+
+            FROM backup_jobs bj
+            JOIN vms vm
+              ON vm.id = bj.vm_id
+            WHERE vm.node_id = ?
+            ORDER BY bj.created_at, bj.id
+            """,
+            (node_id,),
+        )
+
+        result: dict[str, dict[str, object]] = {}
+
+        for row in rows:
+            result[row["job_id"]] = {
+                "last_run_id": row["last_run_id"],
+                "latest_restore_point_id":
+                    row["latest_restore_point_id"],
+                "backup_count": int(row["backup_count"]),
+                "active_for_vm":
+                    bool(row["active_for_vm"]),
+                "recovery_for_vm":
+                    bool(row["recovery_for_vm"]),
+            }
+
+        return result
+
+    def list_restore_points_for_job(
+        self,
+        node_id: str,
+        job_id: str,
+    ) -> list[RestorePoint]:
+        """Return newest-first effective AVAILABLE points for one local job."""
+
+        rows = self.connection.execute(
+            """
+            SELECT rp.*
+            FROM restore_points rp
+            JOIN job_runs jr
+              ON jr.id = rp.job_run_id
+            JOIN backup_jobs bj
+              ON bj.id = jr.job_id
+            JOIN vms vm
+              ON vm.id = bj.vm_id
+            WHERE vm.node_id = ?
+              AND bj.id = ?
+              AND rp.status = 'AVAILABLE'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM reclaim_bundles rb
+                  JOIN reclaim_operations ro
+                    ON ro.id = rb.operation_id
+                  WHERE rb.restore_point_id = rp.id
+                    AND ro.state IN (
+                        'RETIRING',
+                        'QUARANTINED',
+                        'CATALOG_REMOVED',
+                        'PURGING',
+                        'PURGED',
+                        'RECOVERY_REQUIRED'
+                    )
+              )
+            ORDER BY
+                rp.created_at DESC,
+                rp.sequence DESC,
+                rp.id DESC
+            """,
+            (node_id, job_id),
+        )
+
+        return [
+            self._restore_point(row)
+            for row in rows
+        ]
+
     def list_runs(self, *, nonterminal_only: bool = False) -> list[JobRun]:
         sql = "SELECT id FROM job_runs"
         if nonterminal_only:
@@ -3070,6 +3233,122 @@ class SQLiteRepository:
             sql += " AND jr.state NOT IN ('SUCCESS', 'FAILED')"
         sql += " ORDER BY jr.created_at, jr.id"
         return [self.get_run(row["id"]) for row in self.connection.execute(sql, params)]
+
+    def list_runs_page_for_node(
+        self,
+        node_id: str,
+        *,
+        limit: int,
+        offset: int = 0,
+        result_filter: str = "ALL",
+    ) -> tuple[list[JobRun], int]:
+        """Return one newest-first run page and its filtered total."""
+
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise ValueError("run page limit must be an integer")
+        if limit < 1 or limit > 100:
+            raise ValueError("run page limit must be between 1 and 100")
+
+        if isinstance(offset, bool) or not isinstance(offset, int):
+            raise ValueError("run page offset must be an integer")
+        if offset < 0:
+            raise ValueError("run page offset must be non-negative")
+
+        if result_filter not in {"ALL", "SUCCESS", "FAILED"}:
+            raise ValueError("unsupported run result filter")
+
+        from_sql = """FROM job_runs jr
+                      JOIN backup_jobs bj
+                        ON bj.id = jr.job_id
+                      JOIN vms vm
+                        ON vm.id = bj.vm_id
+                      WHERE vm.node_id = ?"""
+
+        params: list[object] = [node_id]
+
+        if result_filter != "ALL":
+            from_sql += " AND jr.state = ?"
+            params.append(result_filter)
+
+        total = int(
+            self.connection.execute(
+                "SELECT COUNT(*) " + from_sql,
+                params,
+            ).fetchone()[0]
+        )
+
+        rows = self.connection.execute(
+            "SELECT jr.id "
+            + from_sql
+            + " ORDER BY jr.created_at DESC, jr.id DESC"
+            + " LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        )
+
+        return (
+            [self.get_run(row["id"]) for row in rows],
+            total,
+        )
+
+    def run_summary_for_node(
+        self,
+        node_id: str,
+        since: datetime,
+    ) -> dict[str, int]:
+        """Return dashboard counters over the complete local run history."""
+
+        if since.tzinfo is None or since.utcoffset() is None:
+            raise ValueError("run summary boundary must be timezone-aware")
+
+        boundary = since.isoformat()
+
+        row = self.connection.execute(
+            """SELECT
+                   COALESCE(SUM(
+                       CASE
+                           WHEN jr.state = 'SUCCESS'
+                            AND jr.updated_at >= ?
+                           THEN 1 ELSE 0
+                       END
+                   ), 0) AS successful_today,
+                   COALESCE(SUM(
+                       CASE
+                           WHEN jr.state = 'FAILED'
+                            AND jr.updated_at >= ?
+                           THEN 1 ELSE 0
+                       END
+                   ), 0) AS failed_today,
+                   COALESCE(SUM(
+                       CASE
+                           WHEN jr.state NOT IN ('SUCCESS', 'FAILED')
+                           THEN 1 ELSE 0
+                       END
+                   ), 0) AS active,
+                   COALESCE(SUM(
+                       CASE
+                           WHEN jr.recovery_required = 1
+                           THEN 1 ELSE 0
+                       END
+                   ), 0) AS recovery_required
+               FROM job_runs jr
+               JOIN backup_jobs bj
+                 ON bj.id = jr.job_id
+               JOIN vms vm
+                 ON vm.id = bj.vm_id
+               WHERE vm.node_id = ?""",
+            (
+                boundary,
+                boundary,
+                node_id,
+            ),
+        ).fetchone()
+
+        return {
+            "successful_today": int(row["successful_today"]),
+            "failed_today": int(row["failed_today"]),
+            "active": int(row["active"]),
+            "recovery_required": int(row["recovery_required"]),
+        }
 
     def mark_recovery_required(self, run_id: str, reason: str, now: datetime) -> JobRun:
         run = self.get_run(run_id)

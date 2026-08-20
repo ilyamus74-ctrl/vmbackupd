@@ -22,8 +22,12 @@
         document.getElementById("client-identity-open");
     const sshDialog = document.getElementById("ssh-dialog");
     const TERMINAL_STATES = new Set(["SUCCESS", "FAILED"]);
-    const RECENT_RUN_LIMIT = 20;
+    const RECENT_RUN_LIMIT = 5;
     const LIVE_REFRESH_INTERVAL_MS = 2000;
+    let recentRunOffset = 0;
+    let recentRunFilter = "ALL";
+    const openBackupJobs = new Set();
+    const backupCache = new Map();
     let currentModel = null;
     let editingJobId = null;
     let editingStorageId = null;
@@ -265,22 +269,21 @@
         const vmById = indexById(dataset.registeredVms);
         const jobById = indexById(dataset.jobs);
         const storageById = indexById(dataset.storage);
-        const runsById = indexById(dataset.runs);
-        const runsByJob = groupRunsByJob(dataset.runs);
+        const runPage = dataset.runPage;
+        const summary = runPage && runPage.summary ? runPage.summary : {};
+
         return {
             ...dataset,
+            runs: Array.isArray(runPage && runPage.items) ?
+                runPage.items : [],
             now: now,
             vmById: vmById,
             jobById: jobById,
             storageById: storageById,
-            runsById: runsById,
-            runsByJob: runsByJob,
-            successfulToday: dataset.runs.filter(run =>
-                run.state === "SUCCESS" && isToday(run.updated_at, now)).length,
-            failedToday: dataset.runs.filter(run =>
-                run.state === "FAILED" && isToday(run.updated_at, now)).length,
-            active: dataset.runs.filter(run => !TERMINAL_STATES.has(run.state)).length,
-            recoveryRequired: dataset.runs.filter(run => run.recovery_required).length,
+            successfulToday: Number(summary.successful_today || 0),
+            failedToday: Number(summary.failed_today || 0),
+            active: Number(summary.active || 0),
+            recoveryRequired: Number(summary.recovery_required || 0),
         };
     }
 
@@ -299,14 +302,16 @@
     }
 
     function renderRecentRuns(model) {
-        const sorted = [...model.runs]
-            .sort((left, right) => new Date(right.created_at) - new Date(left.created_at))
-            .slice(0, RECENT_RUN_LIMIT);
-        const rows = sorted.map(run => {
+        const rows = model.runs.map(run => {
             const job = model.jobById.get(run.job_id);
+
             return tableRow([
-                job ? vmName(model.vmById, job.vm_id) : `Unknown VM (job ${text(run.job_id)})`,
-                job ? job.name : `Unknown job (${text(run.job_id)})`,
+                job ?
+                    vmName(model.vmById, job.vm_id) :
+                    `Unknown VM (job ${text(run.job_id)})`,
+                job ?
+                    job.name :
+                    `Unknown job (${text(run.job_id)})`,
                 [run.planned_kind || "—", "nowrap"],
                 [localTimestamp(run.created_at), "nowrap"],
                 badge(statusLabel(run), statusClass(run)),
@@ -314,59 +319,338 @@
                 [runError(run), "error-cell"],
             ]);
         });
-        replaceRows("recent-runs", rows, 7, "No backup runs yet");
+
+        replaceRows(
+            "recent-runs",
+            rows,
+            7,
+            recentRunFilter === "ALL" ?
+                "No backup runs yet" :
+                `No ${recentRunFilter.toLowerCase()} backup runs`,
+        );
+
+        const page = model.runPage || {};
+        const total = Number(page.total || 0);
+        const offset = Number(page.offset || 0);
+        const limit = Number(page.limit || RECENT_RUN_LIMIT);
+
+        const first = total > 0 ? offset + 1 : 0;
+        const last = Math.min(offset + limit, total);
+
+        document.getElementById(
+            "recent-run-page-info"
+        ).textContent = `${first}–${last} of ${total}`;
+
+        document.getElementById(
+            "recent-run-prev"
+        ).disabled = offset <= 0;
+
+        document.getElementById(
+            "recent-run-next"
+        ).disabled = offset + limit >= total;
+
+        document.getElementById(
+            "recent-run-filter"
+        ).value = recentRunFilter;
+    }
+
+    function backupDestinationText(model, location) {
+        const destination =
+            model.storageById.get(location.destination_id);
+
+        if (!destination)
+            return `Unknown destination (${text(location.destination_id)})`;
+
+        if (storageType(destination) === "SSH") {
+            const remoteStorage = destination.remote_storage_id ?
+                ` / storage ${destination.remote_storage_id}` : "";
+
+            return `${destination.name} — ${sshTarget(destination)}${remoteStorage}`;
+        }
+
+        return `${destination.name} — ${text(destination.backup_data_root)}`;
+    }
+
+    function renderBackupList(model, points, target) {
+        if (!Array.isArray(points) || points.length === 0) {
+            target.replaceChildren(
+                element(
+                    "div",
+                    "No AVAILABLE backups for this job",
+                    "backup-empty",
+                )
+            );
+            return;
+        }
+
+        const items = points.map(point => {
+            const item = document.createElement("div");
+            item.className = "backup-list-item";
+
+            const heading = document.createElement("div");
+            heading.className = "backup-list-heading";
+
+            heading.append(
+                element(
+                    "strong",
+                    `${localTimestamp(point.created_at)} · ${text(point.kind)}`,
+                ),
+                badge(
+                    text(point.status),
+                    point.status === "AVAILABLE" ?
+                        "status-success" :
+                        "status-neutral",
+                ),
+            );
+
+            item.append(heading);
+
+            if (
+                point.kind === "INCREMENTAL" &&
+                Number(point.sequence) > 0
+            ) {
+                item.append(
+                    element(
+                        "div",
+                        `Incremental #${point.sequence}`,
+                        "backup-secondary",
+                    )
+                );
+            }
+
+            const locations = Array.isArray(point.locations) ?
+                point.locations : [];
+
+            if (!locations.length) {
+                item.append(
+                    element(
+                        "div",
+                        "No storage locations recorded",
+                        "backup-secondary",
+                    )
+                );
+            } else {
+                for (const location of locations) {
+                    const role =
+                        location.role === "PRIMARY" ?
+                            "Primary" :
+                            location.role === "REPLICA" ?
+                                "Replica" :
+                                text(location.role);
+
+                    const row = document.createElement("div");
+                    row.className = "backup-location";
+
+                    row.append(
+                        element(
+                            "span",
+                            `${role}: ${backupDestinationText(model, location)}`,
+                        ),
+                        badge(
+                            text(location.state),
+                            location.state === "AVAILABLE" ?
+                                "status-success" :
+                                "status-neutral",
+                        ),
+                    );
+
+                    item.append(row);
+                }
+            }
+
+            return item;
+        });
+
+        target.replaceChildren(...items);
+    }
+
+    function jobBackupDetails(job, model) {
+        const overview = job.overview || {};
+        const count = Number(overview.backup_count || 0);
+
+        const details = document.createElement("details");
+        details.className = "backup-details";
+        details.open = openBackupJobs.has(job.id);
+
+        const summary = document.createElement("summary");
+        summary.textContent = `Backups (${count})`;
+
+        const content = document.createElement("div");
+        content.className = "backup-list";
+        content.textContent = "Open to load backups";
+
+        details.append(summary, content);
+
+        async function load() {
+            const cached = backupCache.get(job.id);
+
+            if (
+                cached &&
+                cached.expectedCount === count
+            ) {
+                renderBackupList(
+                    model,
+                    cached.points,
+                    content,
+                );
+                return;
+            }
+
+            content.textContent = "Loading backups…";
+
+            try {
+                const points = await api.request(
+                    "restore_point.list",
+                    {
+                        job_id: job.id,
+                        include_locations: true,
+                    },
+                );
+
+                backupCache.set(
+                    job.id,
+                    {
+                        expectedCount: count,
+                        points: points,
+                    },
+                );
+
+                renderBackupList(
+                    model,
+                    points,
+                    content,
+                );
+            } catch (error) {
+                content.textContent =
+                    failureMessage(error);
+                content.className =
+                    "backup-list error-cell";
+            }
+        }
+
+        details.addEventListener("toggle", () => {
+            if (details.open) {
+                openBackupJobs.add(job.id);
+                void load();
+            } else {
+                openBackupJobs.delete(job.id);
+            }
+        });
+
+        if (details.open)
+            void load();
+
+        return details;
     }
 
     function renderJobs(model) {
         const jobs = [...model.jobs].sort((left, right) =>
-            vmName(model.vmById, left.vm_id).localeCompare(vmName(model.vmById, right.vm_id)) ||
-            left.name.localeCompare(right.name));
+            vmName(
+                model.vmById,
+                left.vm_id
+            ).localeCompare(
+                vmName(model.vmById, right.vm_id)
+            ) ||
+            left.name.localeCompare(right.name)
+        );
+
         const rows = jobs.map(job => {
-            const lastRun = latestRun(model.runsByJob, job.id);
-            const successfulPoint = latestSuccessfulRestorePoint(
-                job.id, model.restorePoints, model.runsById
-            );
-            const destination = model.storageById.get(job.storage_destination_id);
-            const activeForVm = model.runs.some(run => {
-                const candidate = model.jobById.get(run.job_id);
-                return candidate && candidate.vm_id === job.vm_id &&
-                    !TERMINAL_STATES.has(run.state);
-            });
-            const recoveryForVm = model.runs.some(run => {
-                const candidate = model.jobById.get(run.job_id);
-                return candidate && candidate.vm_id === job.vm_id && run.recovery_required;
-            });
+            const overview = job.overview || {};
+            const lastRun = overview.last_run || null;
+            const successfulPoint =
+                overview.latest_available_restore_point || null;
+
+            const destination =
+                model.storageById.get(
+                    job.storage_destination_id
+                );
+
+            const activeForVm =
+                overview.active_for_vm === true;
+
+            const recoveryForVm =
+                overview.recovery_for_vm === true;
+
             let runDisabledReason = null;
+
             if (!model.status.libvirt_mutation_enabled)
-                runDisabledReason = "Libvirt mutation is disabled";
+                runDisabledReason =
+                    "Libvirt mutation is disabled";
             else if (!job.enabled)
-                runDisabledReason = "The backup job is disabled";
+                runDisabledReason =
+                    "The backup job is disabled";
             else if (recoveryForVm)
-                runDisabledReason = "The VM requires recovery";
+                runDisabledReason =
+                    "The VM requires recovery";
             else if (activeForVm)
-                runDisabledReason = "The VM already has active work";
+                runDisabledReason =
+                    "The VM already has active work";
+
             const actions = document.createElement("div");
             actions.className = "row-actions";
+
             actions.append(
-                actionButton("Edit", () => openJobDialog(job), false),
-                actionButton(job.enabled ? "Disable" : "Enable",
-                    () => updateJob(job.id, { enabled: !job.enabled }), false),
-                actionButton("Run now", () => runNow(job), Boolean(runDisabledReason),
-                    runDisabledReason),
+                actionButton(
+                    "Edit",
+                    () => openJobDialog(job),
+                    false,
+                ),
+                actionButton(
+                    job.enabled ? "Disable" : "Enable",
+                    () => updateJob(
+                        job.id,
+                        { enabled: !job.enabled },
+                    ),
+                    false,
+                ),
+                actionButton(
+                    "Run now",
+                    () => runNow(job),
+                    Boolean(runDisabledReason),
+                    runDisabledReason,
+                ),
+                jobBackupDetails(job, model),
             );
+
             return tableRow([
                 vmName(model.vmById, job.vm_id),
                 job.name,
-                badge(job.enabled ? "Enabled" : "Disabled", job.enabled ? "status-success" : "status-neutral"),
-                destination ? destination.name : `Unknown destination (${text(job.storage_destination_id)})`,
-                lastRun ? localTimestamp(lastRun.created_at) : "Never",
-                lastRun ? badge(statusLabel(lastRun), statusClass(lastRun)) : "—",
-                successfulPoint ? localTimestamp(successfulPoint.created_at) : "Never",
-                job.next_run_at ? localTimestamp(job.next_run_at) : "Manual / not scheduled",
+                badge(
+                    job.enabled ? "Enabled" : "Disabled",
+                    job.enabled ?
+                        "status-success" :
+                        "status-neutral",
+                ),
+                destination ?
+                    destination.name :
+                    `Unknown destination (${text(job.storage_destination_id)})`,
+                lastRun ?
+                    localTimestamp(lastRun.created_at) :
+                    "Never",
+                lastRun ?
+                    badge(
+                        statusLabel(lastRun),
+                        statusClass(lastRun),
+                    ) :
+                    "—",
+                successfulPoint ?
+                    localTimestamp(
+                        successfulPoint.created_at
+                    ) :
+                    "Never",
+                job.next_run_at ?
+                    localTimestamp(job.next_run_at) :
+                    "Manual / not scheduled",
                 actions,
             ]);
         });
-        replaceRows("jobs", rows, 9, "No backup jobs configured");
+
+        replaceRows(
+            "jobs",
+            rows,
+            9,
+            "No backup jobs configured",
+        );
     }
 
     const sshStorageProbeResults = new Map();
@@ -2222,7 +2506,7 @@
     function hasActiveRuns() {
         return Boolean(
             currentModel &&
-            currentModel.runs.some(run => !TERMINAL_STATES.has(run.state))
+            Number(currentModel.active) > 0
         );
     }
 
@@ -2244,12 +2528,103 @@
         }, LIVE_REFRESH_INTERVAL_MS);
     }
 
+    function localTodayStartIso() {
+        const now = new Date();
+
+        return new Date(
+            now.getFullYear(),
+            now.getMonth(),
+            now.getDate(),
+            0,
+            0,
+            0,
+            0,
+        ).toISOString();
+    }
+
+    function recentRunParams() {
+        return {
+            limit: RECENT_RUN_LIMIT,
+            offset: recentRunOffset,
+            result: recentRunFilter,
+            summary_since: localTodayStartIso(),
+        };
+    }
+
+    async function requestRecentRunPage() {
+        let page = await api.request(
+            "run.list",
+            recentRunParams(),
+        );
+
+        const total = Number(page.total || 0);
+
+        if (
+            total > 0 &&
+            recentRunOffset >= total
+        ) {
+            recentRunOffset =
+                Math.floor(
+                    (total - 1) / RECENT_RUN_LIMIT
+                ) * RECENT_RUN_LIMIT;
+
+            page = await api.request(
+                "run.list",
+                recentRunParams(),
+            );
+        }
+
+        return page;
+    }
+
+    async function refreshRecentRunPage() {
+        if (!currentModel)
+            return refresh({ background: true });
+
+        try {
+            const runPage =
+                await requestRecentRunPage();
+
+            currentModel.runPage = runPage;
+            currentModel.runs =
+                Array.isArray(runPage.items) ?
+                    runPage.items : [];
+
+            const summary =
+                runPage.summary || {};
+
+            currentModel.successfulToday =
+                Number(summary.successful_today || 0);
+            currentModel.failedToday =
+                Number(summary.failed_today || 0);
+            currentModel.active =
+                Number(summary.active || 0);
+            currentModel.recoveryRequired =
+                Number(summary.recovery_required || 0);
+            currentModel.now = new Date();
+
+            renderSummary(currentModel);
+            renderRecentRuns(currentModel);
+            scheduleLiveRefresh();
+
+            return true;
+        } catch (error) {
+            setNotice(
+                failureMessage(error),
+                "error",
+            );
+            return false;
+        }
+    }
+
     async function refresh(options) {
-        const background = Boolean(options && options.background);
+        const background =
+            Boolean(options && options.background);
 
         if (refreshInFlight) {
             if (background)
                 return refreshInFlight;
+
             await refreshInFlight;
         }
 
@@ -2258,44 +2633,70 @@
 
         if (!background) {
             clearViews();
-            setNotice("Loading complete backup status…", "loading");
+            setNotice(
+                "Loading complete backup status…",
+                "loading",
+            );
         }
 
         const operation = (async () => {
             try {
-                const [status, discoveredVms, registeredVms, storage, jobs, runs,
-                    restorePoints, recovery] = await Promise.all([
+                const [
+                    status,
+                    discoveredVms,
+                    registeredVms,
+                    storage,
+                    jobs,
+                    runPage,
+                    recovery,
+                ] = await Promise.all([
                     api.request("daemon.status"),
                     api.request("vm.discover"),
                     api.request("vm.list"),
                     api.request("storage.list"),
-                    api.request("job.list"),
-                    api.request("run.list"),
-                    api.request("restore_point.list"),
+                    api.request(
+                        "job.list",
+                        { overview: true },
+                    ),
+                    requestRecentRunPage(),
                     api.request("recovery.list"),
                 ]);
 
-                const model = deriveModel({
-                    status: status,
-                    discoveredVms: discoveredVms,
-                    registeredVms: registeredVms,
-                    storage: storage,
-                    jobs: jobs,
-                    runs: runs,
-                    restorePoints: restorePoints,
-                    recovery: recovery,
-                }, new Date());
+                const model = deriveModel(
+                    {
+                        status: status,
+                        discoveredVms: discoveredVms,
+                        registeredVms: registeredVms,
+                        storage: storage,
+                        jobs: jobs,
+                        runPage: runPage,
+                        recovery: recovery,
+                    },
+                    new Date(),
+                );
 
                 renderModel(model);
 
-                if (status.runtime_state === "RUNNING")
-                    setNotice("Operational data loaded", "success");
-                else
-                    setNotice(`Daemon runtime is ${text(status.runtime_state)}`, "error");
+                if (
+                    status.runtime_state === "RUNNING"
+                ) {
+                    setNotice(
+                        "Operational data loaded",
+                        "success",
+                    );
+                } else {
+                    setNotice(
+                        `Daemon runtime is ${text(status.runtime_state)}`,
+                        "error",
+                    );
+                }
 
                 return true;
             } catch (error) {
-                setNotice(failureMessage(error), "error");
+                setNotice(
+                    failureMessage(error),
+                    "error",
+                );
                 return false;
             } finally {
                 refreshButton.disabled = false;
@@ -2313,6 +2714,42 @@
 
         return succeeded;
     }
+
+    document.getElementById(
+        "recent-run-filter"
+    ).addEventListener("change", event => {
+        recentRunFilter = event.target.value;
+        recentRunOffset = 0;
+        void refreshRecentRunPage();
+    });
+
+    document.getElementById(
+        "recent-run-prev"
+    ).addEventListener("click", () => {
+        recentRunOffset = Math.max(
+            0,
+            recentRunOffset - RECENT_RUN_LIMIT,
+        );
+        void refreshRecentRunPage();
+    });
+
+    document.getElementById(
+        "recent-run-next"
+    ).addEventListener("click", () => {
+        if (!currentModel || !currentModel.runPage)
+            return;
+
+        const total =
+            Number(currentModel.runPage.total || 0);
+
+        if (
+            recentRunOffset + RECENT_RUN_LIMIT <
+            total
+        ) {
+            recentRunOffset += RECENT_RUN_LIMIT;
+            void refreshRecentRunPage();
+        }
+    });
 
     refreshButton.addEventListener("click", refresh);
     addJobButton.addEventListener("click", () => openJobDialog());

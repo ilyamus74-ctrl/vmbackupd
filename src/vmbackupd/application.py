@@ -10,7 +10,7 @@ from .models import new_id
 
 import shutil
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import serialization
@@ -1173,13 +1173,67 @@ class VmbackupApplication:
 
         return result
 
-    def job_list(self):
-        return [
-            self._serialize_job(value)
-            for value in self.repository.list_jobs_for_node(
-                self.node.id
+    def job_list(self, overview=False):
+        if not isinstance(overview, bool):
+            raise ApplicationError(
+                "INVALID_PARAMS",
+                "overview must be boolean",
             )
-        ]
+
+        jobs = self.repository.list_jobs_for_node(
+            self.node.id
+        )
+
+        # Preserve the original API response exactly for existing callers.
+        if not overview:
+            return [
+                self._serialize_job(value)
+                for value in jobs
+            ]
+
+        facts = self.repository.job_overview_for_node(
+            self.node.id
+        )
+
+        result = []
+
+        for value in jobs:
+            item = self._serialize_job(value)
+            fact = facts.get(value.id, {})
+
+            last_run_id = fact.get("last_run_id")
+            latest_point_id = fact.get(
+                "latest_restore_point_id"
+            )
+
+            item["overview"] = {
+                "last_run": (
+                    serialization.run(
+                        self.repository.get_run(
+                            last_run_id
+                        )
+                    )
+                    if last_run_id else None
+                ),
+                "latest_available_restore_point": (
+                    serialization.restore_point(
+                        self.repository.get_restore_point(
+                            latest_point_id
+                        )
+                    )
+                    if latest_point_id else None
+                ),
+                "backup_count":
+                    int(fact.get("backup_count", 0)),
+                "active_for_vm":
+                    bool(fact.get("active_for_vm", False)),
+                "recovery_for_vm":
+                    bool(fact.get("recovery_for_vm", False)),
+            }
+
+            result.append(item)
+
+        return result
 
     def job_show(self, id):
         value = self.repository.get_job(id)
@@ -1380,11 +1434,206 @@ class VmbackupApplication:
         )
         return {"run_id": value.id, "state": value.state.value}
 
-    def run_list(self): return [serialization.run(x) for x in self.repository.list_runs_for_node(self.node.id)]
+    def run_list(
+        self,
+        limit=None,
+        offset=0,
+        result="ALL",
+        summary_since=None,
+    ):
+        # Preserve the original Phase 3C API shape for callers that do not
+        # request pagination.
+        if (
+            limit is None
+            and offset == 0
+            and result == "ALL"
+            and summary_since is None
+        ):
+            return [
+                serialization.run(value)
+                for value in self.repository.list_runs_for_node(
+                    self.node.id
+                )
+            ]
+
+        if limit is None:
+            raise ApplicationError(
+                "INVALID_PARAMS",
+                "limit is required for paginated run.list",
+            )
+
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise ApplicationError(
+                "INVALID_PARAMS",
+                "limit must be an integer",
+            )
+
+        if limit < 1 or limit > 100:
+            raise ApplicationError(
+                "INVALID_PARAMS",
+                "limit must be between 1 and 100",
+            )
+
+        if isinstance(offset, bool) or not isinstance(offset, int):
+            raise ApplicationError(
+                "INVALID_PARAMS",
+                "offset must be an integer",
+            )
+
+        if offset < 0:
+            raise ApplicationError(
+                "INVALID_PARAMS",
+                "offset must be non-negative",
+            )
+
+        if not isinstance(result, str):
+            raise ApplicationError(
+                "INVALID_PARAMS",
+                "result filter must be a string",
+            )
+
+        result_filter = result.upper()
+
+        if result_filter not in {"ALL", "SUCCESS", "FAILED"}:
+            raise ApplicationError(
+                "INVALID_PARAMS",
+                "result filter must be ALL, SUCCESS, or FAILED",
+            )
+
+        if summary_since is None:
+            summary_start = self.clock.now().astimezone(
+                timezone.utc
+            ).replace(
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+        else:
+            if not isinstance(summary_since, str):
+                raise ApplicationError(
+                    "INVALID_PARAMS",
+                    "summary_since must be an ISO timestamp",
+                )
+
+            try:
+                summary_start = datetime.fromisoformat(
+                    summary_since.replace("Z", "+00:00")
+                )
+            except ValueError as exc:
+                raise ApplicationError(
+                    "INVALID_PARAMS",
+                    "summary_since must be an ISO timestamp",
+                ) from exc
+
+            if (
+                summary_start.tzinfo is None
+                or summary_start.utcoffset() is None
+            ):
+                raise ApplicationError(
+                    "INVALID_PARAMS",
+                    "summary_since must include a timezone",
+                )
+
+            summary_start = summary_start.astimezone(
+                timezone.utc
+            )
+
+        try:
+            values, total = self.repository.list_runs_page_for_node(
+                self.node.id,
+                limit=limit,
+                offset=offset,
+                result_filter=result_filter,
+            )
+        except ValueError as exc:
+            raise ApplicationError(
+                "INVALID_PARAMS",
+                str(exc),
+            ) from exc
+
+        return {
+            "items": [
+                serialization.run(value)
+                for value in values
+            ],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "result": result_filter,
+            "summary": self.repository.run_summary_for_node(
+                self.node.id,
+                summary_start,
+            ),
+        }
     def run_show(self, id):
         value = self.repository.get_run(id); self._require_local_run(value)
         return serialization.run(value)
-    def restore_point_list(self): return [serialization.restore_point(x) for x in self.repository.list_restore_points_for_node(self.node.id)]
+    def restore_point_list(
+        self,
+        job_id=None,
+        include_locations=False,
+    ):
+        if not isinstance(include_locations, bool):
+            raise ApplicationError(
+                "INVALID_PARAMS",
+                "include_locations must be boolean",
+            )
+
+        # Preserve the original Phase 3C response for existing callers.
+        if job_id is None:
+            if include_locations:
+                raise ApplicationError(
+                    "INVALID_PARAMS",
+                    "job_id is required when include_locations is true",
+                )
+
+            return [
+                serialization.restore_point(value)
+                for value in
+                self.repository.list_restore_points_for_node(
+                    self.node.id
+                )
+            ]
+
+        if not isinstance(job_id, str) or not job_id.strip():
+            raise ApplicationError(
+                "INVALID_PARAMS",
+                "job_id must be a non-empty string",
+            )
+
+        try:
+            job = self.repository.get_job(job_id)
+        except KeyError as exc:
+            raise ApplicationError(
+                "JOB_NOT_FOUND",
+                "backup job was not found",
+            ) from exc
+
+        self._require_local_job(job)
+
+        points = self.repository.list_restore_points_for_job(
+            self.node.id,
+            job.id,
+        )
+
+        result = []
+
+        for point in points:
+            item = serialization.restore_point(point)
+
+            if include_locations:
+                item["locations"] = [
+                    serialization.restore_point_location(location)
+                    for location in
+                    self.repository.list_restore_point_locations(
+                        point.id
+                    )
+                ]
+
+            result.append(item)
+
+        return result
     def restore_point_show(self, id):
         value = self.repository.get_restore_point(id)
         chain = self.repository.get_chain(value.chain_id)
