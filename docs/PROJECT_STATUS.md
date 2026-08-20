@@ -972,7 +972,56 @@ must be followed separately by the durable reclaim bundle/state transitions.
 
 ---
 
-### 3E.8b.2d — Reclaim executor orchestration and recovery
+#
+## 3E.8b.2e — Reclaim physical object identity migration
+
+Status: CLOSED
+
+Closing commit:
+
+    a5f05c8
+
+Implemented migration of reclaim processing from restore-point identity
+to physical-object identity.
+
+Key properties:
+
+- `reclaim_bundles` now represents an individual physical reclaim target,
+  not an implicit one-to-one mapping with a restore point;
+- a single restore point may now have multiple reclaim rows for different
+  physical destinations;
+- reclaim bundle identity is based on:
+
+      operation_id
+      destination_id
+      source_bundle_object_id
+
+- `restore_point_id` remains a grouping relationship and is no longer used
+  as a physical object identity;
+- quarantine and purge workflows operate on individual physical objects;
+- reclaim recovery/resume paths preserve deterministic object addressing
+  after daemon restart;
+- replica locations no longer collide with primary objects during reclaim;
+- retention planning continues to operate on restore-point lineage while
+  reclaim execution operates on physical objects;
+- schema version migrated from 18 to 20;
+- migration preserves existing reclaim journal data;
+- historical schema migrations were updated with frozen reclaim schema
+  definitions to prevent accidental migration drift;
+- regression coverage was added for multiple physical objects belonging to
+  one restore point.
+
+Validation completed:
+
+- `python3 -m compileall -q src`
+- `PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q`
+
+Result:
+
+    full test suite passed
+
+
+## 3E.8b.2d — Reclaim executor orchestration and recovery
 
 Status: CLOSED
 
