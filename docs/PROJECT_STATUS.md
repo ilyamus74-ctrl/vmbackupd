@@ -2603,15 +2603,194 @@ These belong to R3.3 and later phases.
 
 ---
 
+# SSH sender replica transfer (R3.3)
+
+Status:
+
+    CLOSED
+
+Implementation commits:
+
+    47f7876 — Add SSH replica sender transport
+    a416a12 — Execute SSH replica transfer tasks
+    2d144fd — Tolerate replica claim database contention
+    24f12e6 — Add explicit recovery run resume
+    c29c47e — Add explicit recovery run failure
+    f3694dc — Keep Release 3 backup jobs full-only
+    1194ed8 — Isolate replica worker failures
+
+R3.3 integrates sender-side replica execution with the restricted R3.2
+receiver transport.
+
+The primary backup remains independent of optional replica execution:
+
+    libvirt backup
+        -> verify primary artifacts
+        -> publish PRIMARY Restore Point
+        -> primary run SUCCESS
+        -> create replica task
+        -> SSH transfer from published primary bundle
+        -> receiver STAGING_COMPLETE
+        -> replica task VERIFYING
+
+The replica worker uses a separate SQLite connection from the primary runtime.
+SQLite BUSY/LOCKED contention while attempting to claim replica work is treated
+as transient idle state rather than a fatal runtime error.
+
+Replica worker failures are isolated from the primary controller runtime.
+A replica startup or execution failure must not stop primary backup scheduling,
+heartbeat processing, run advancement, or recovery handling.
+
+Release 3 public backup-job configuration remains FULL-only:
+
+    max_incrementals_per_chain = 0
+
+This prevents the sender path from exposing an incomplete incremental execution
+contract before remote parent verification and publication are implemented.
+
+R3.3 deliberately stops at the remote staging boundary:
+
+    receiver STAGING_COMPLETE
+        -> replica task VERIFYING
+        !=
+    REPLICA AVAILABLE
+
+`VERIFYING` is therefore the expected durable terminal boundary for R3.3
+transport acceptance. Remote semantic verification, publication, creation of
+an AVAILABLE REPLICA location, and replica task SUCCESS belong to R3.4.
+
+Real end-to-end acceptance used:
+
+    source node:
+        maker
+        node_id = 7008fe73-f8b7-4f72-9ab4-6afec6587f57
+
+    source VM:
+        win10
+        vm_id = d9713d09-5b7f-45e6-97ac-c8e5ad771898
+        libvirt UUID = e2258b2e-fcac-4086-9d1e-f8daa8887e04
+
+    job:
+        8818612f-b8d0-4675-ac24-8d3564aa111a
+
+    run:
+        15aa7dc1-66d2-4f2d-9cc7-fee4e5ce2d78
+
+    Restore Point:
+        cd4c302c-e710-4089-8f0b-21a64742991f
+
+    replica task:
+        72cff121-8d9d-48ad-9972-3e50879ffe54
+
+    SSH destination:
+        62.205.155.66:22022
+        remote storage_id = 540459e8-2555-43eb-8527-99853ba96ea7
+
+Acceptance results:
+
+- the real `win10` backup completed as FULL;
+- libvirt reported completed backup execution with `success=1`;
+- the primary run reached `SUCCESS`;
+- `recovery_required` remained false;
+- the primary Restore Point reached `AVAILABLE`;
+- the PRIMARY restore-point location reached `AVAILABLE`;
+- the replica task was created automatically from the successful Restore Point;
+- the replica task was claimed exactly once (`attempts=1`);
+- SSH transfer used the managed vmbackupd client identity and strict host-key
+  verification;
+- the receiver created the task staging tree under its managed remote storage;
+- `domain.xml`, `manifest.json`, `restore-point.json`, and `sda.qcow2` were
+  transferred successfully;
+- the transferred qcow2 logical size was `49904353280` bytes;
+- receiver `transfer.json` reached `STAGING_COMPLETE`;
+- receiver `receipt.json` recorded `STAGING_COMPLETE`;
+- the receipt recorded four completed files and `49904302902` payload bytes;
+- after transfer completion the sender replica task reached `VERIFYING`;
+- `last_error` remained null;
+- the maker daemon remained `RUNNING`;
+- `runtime_last_error` remained null;
+- no primary run was left nonterminal;
+- no backup recovery was required.
+
+The acceptance also exercised package-update persistence on the Fedora 44
+receiver.
+
+Before package replacement:
+
+    vmbackupd = 0.1.0-3.fc44
+    database schema = 12
+
+The current Release 3 SRPM was rebuilt natively on Fedora 44 and the same-NVR
+package was replaced with `rpm --replacepkgs`.
+
+After replacement:
+
+    vmbackupd = 0.1.0-3.fc44
+    database schema = 13
+    PRAGMA integrity_check = ok
+    PRAGMA foreign_key_check = []
+
+The update preserved:
+
+- `/etc/vmbackupd` configuration;
+- receiver authorized source registry;
+- managed outbound SSH identity;
+- receiver SSH host private/public key;
+- receiver SSH host fingerprint
+  `SHA256:3VB7AIOMSA/CKBzYUE+5rtQ/MlYu8o58sA2Zwaoxtro`;
+- the completed R3.3 staging tree;
+- `transfer.json`;
+- `receipt.json`;
+- all staged metadata files;
+- the complete transferred qcow2.
+
+Pre-update and post-update hashes of persistent configuration/key state were
+identical. The staged transfer metadata hashes were also identical across the
+package replacement.
+
+After the update:
+
+- the daemon started successfully with schema version 13;
+- `runtime_state` was `RUNNING`;
+- `runtime_last_error` was null;
+- receiver sshd was active;
+- receiver resolver socket was active;
+- receiver catalog socket was active;
+- receiver SSH continued listening on TCP port 22022.
+
+R3.3 therefore proves the complete sender-to-receiver byte-transfer path while
+preserving the fail-closed publication boundary required for R3.4.
+
+Follow-up Cockpit requirement:
+
+Live replica transfer progress should expose at least:
+
+    bytes transferred / total bytes
+    percentage
+    current throughput
+    ETA
+    transfer state
+
+Per-chunk progress must not be persisted to SQLite. High-frequency progress
+should be maintained outside the durable task-state transaction path so that
+progress reporting cannot reintroduce database contention into primary or
+replica execution.
+
+---
+
 # Current position
 
 Current implementation milestone:
 
-    R3.2 SSH receiver transfer protocol — CLOSED
+    R3.3 SSH sender transfer — CLOSED
+
+Closing implementation head:
+
+    1194ed8 — Isolate replica worker failures
 
 Next implementation milestone:
 
-    R3.3 SSH sender transfer
+    R3.4 remote semantic verification and atomic replica publication
 
 Current safety boundary:
 
@@ -2658,6 +2837,6 @@ Current safety boundary:
     incremental replica dependency YES
     Cockpit replica controls      YES
     CLI replica controls          YES
-    sender SSH transfer           NO
-    replica transfer execution    NO
+    sender SSH transfer           YES
+    replica transfer execution    YES
     remote verification/publish   NO
