@@ -9,7 +9,7 @@ import sqlite3
 from collections.abc import Callable, Mapping
 
 
-CURRENT_SCHEMA_VERSION = 13
+CURRENT_SCHEMA_VERSION = 14
 
 
 class SchemaError(RuntimeError):
@@ -237,6 +237,51 @@ REPLICA_SCHEMA_STATEMENTS = (
 )
 
 
+RESTORE_OPERATION_TABLE_SQL = """CREATE TABLE restore_operations (
+        id TEXT PRIMARY KEY,
+        restore_point_id TEXT NOT NULL
+            REFERENCES restore_points(id),
+        source_destination_id TEXT NOT NULL
+            REFERENCES storage_destinations(id),
+        target_node_id TEXT NOT NULL
+            REFERENCES nodes(id),
+        source_role TEXT NOT NULL
+            CHECK(source_role IN ('PRIMARY', 'REPLICA')),
+        source_bundle_object_id TEXT NOT NULL
+            CHECK(length(trim(source_bundle_object_id)) > 0),
+        target_vm_name TEXT NOT NULL
+            CHECK(length(trim(target_vm_name)) > 0),
+        target_domain_uuid TEXT NOT NULL UNIQUE
+            CHECK(length(trim(target_domain_uuid)) > 0),
+        target_root TEXT NOT NULL
+            CHECK(
+                length(trim(target_root)) > 0
+                AND substr(target_root, 1, 1) = '/'
+            ),
+        network_mode TEXT NOT NULL
+            CHECK(network_mode = 'DISCONNECTED'),
+        start_after_restore INTEGER NOT NULL DEFAULT 0
+            CHECK(start_after_restore IN (0, 1)),
+        state TEXT NOT NULL
+            CHECK(state IN (
+                'PLANNED',
+                'ACQUIRING',
+                'VERIFYING',
+                'MATERIALIZING',
+                'DEFINING',
+                'READY',
+                'STARTING',
+                'SUCCESS',
+                'FAILED',
+                'RECOVERY_REQUIRED'
+            )),
+        error TEXT,
+        recovery_reason TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )"""
+
+
 CURRENT_SCHEMA_STATEMENTS = (
     """CREATE TABLE nodes (
         id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
@@ -331,6 +376,7 @@ CURRENT_SCHEMA_STATEMENTS = (
         UNIQUE(chain_id, sequence)
     )""",
     *REPLICA_SCHEMA_STATEMENTS,
+    RESTORE_OPERATION_TABLE_SQL,
     """CREATE TABLE backup_artifacts (
         id TEXT PRIMARY KEY, job_run_id TEXT NOT NULL REFERENCES job_runs(id),
         restore_point_id TEXT REFERENCES restore_points(id),
@@ -565,6 +611,15 @@ CURRENT_COLUMNS = {
         "attempts", "last_error", "next_retry_at",
         "created_at", "updated_at",
     },
+    "restore_operations": {
+        "id", "restore_point_id", "source_destination_id",
+        "target_node_id", "source_role",
+        "source_bundle_object_id", "target_vm_name",
+        "target_domain_uuid", "target_root",
+        "network_mode", "start_after_restore",
+        "state", "error", "recovery_reason",
+        "created_at", "updated_at",
+    },
     "backup_artifacts": {"id", "job_run_id", "restore_point_id", "kind", "disk_target",
                          "object_id", "published_object_id", "format", "size_bytes",
                          "checksum_algorithm", "checksum",
@@ -601,8 +656,15 @@ CURRENT_COLUMNS = {
     },
 }
 
-VERSION_12_COLUMNS = {
+VERSION_13_COLUMNS = {
     name: set(columns) for name, columns in CURRENT_COLUMNS.items()
+}
+VERSION_13_COLUMNS.pop(
+    "restore_operations"
+)
+
+VERSION_12_COLUMNS = {
+    name: set(columns) for name, columns in VERSION_13_COLUMNS.items()
 }
 VERSION_12_COLUMNS["job_runs"].remove(
     "cleanup_authorized"
@@ -703,6 +765,11 @@ REQUIRED_FOREIGN_KEYS = {
     "replica_tasks": {
         ("restore_point_id", "restore_points", "id"),
         ("destination_id", "storage_destinations", "id"),
+    },
+    "restore_operations": {
+        ("restore_point_id", "restore_points", "id"),
+        ("source_destination_id", "storage_destinations", "id"),
+        ("target_node_id", "nodes", "id"),
     },
     "backup_artifacts": {("job_run_id", "job_runs", "id"),
                          ("restore_point_id", "restore_points", "id")},
@@ -1765,6 +1832,20 @@ def migrate_12_to_13(connection: sqlite3.Connection) -> None:
     )
 
 
+def migrate_13_to_14(
+    connection: sqlite3.Connection,
+) -> None:
+    """Add durable FULL restore operation contract."""
+
+    _validate_fingerprint(
+        connection,
+        VERSION_13_COLUMNS,
+    )
+    connection.execute(
+        RESTORE_OPERATION_TABLE_SQL
+    )
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: migrate_0_to_1,
     1: migrate_1_to_2,
@@ -1779,6 +1860,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     10: migrate_10_to_11,
     11: migrate_11_to_12,
     12: migrate_12_to_13,
+    13: migrate_13_to_14,
 }
 
 

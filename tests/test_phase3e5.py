@@ -22,6 +22,7 @@ NOW = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
 
 
 def drop_v6_reclaim_tables(connection):
+    connection.execute("DROP TABLE IF EXISTS restore_operations")
     connection.execute("DROP TABLE reclaim_bundles")
     connection.execute("DROP TABLE reclaim_chains")
     connection.execute("DROP TABLE reclaim_operations")
@@ -64,6 +65,7 @@ def application(repository, node, clock):
 
 
 def drop_v12_replica_tables(connection):
+    connection.execute("DROP TABLE IF EXISTS restore_operations")
     # These fixtures reconstruct pre-v12 schemas from the current
     # database, so first remove the v13-only run cleanup marker.
     connection.execute(

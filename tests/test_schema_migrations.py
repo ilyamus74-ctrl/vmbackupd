@@ -23,6 +23,7 @@ def drop_v13_cleanup_authorization(connection):
 
 
 def drop_v12_replica_tables(connection):
+    connection.execute("DROP TABLE IF EXISTS restore_operations")
     drop_v13_cleanup_authorization(connection)
     connection.execute("DROP TABLE replica_tasks")
     connection.execute("DROP TABLE restore_point_locations")
@@ -31,6 +32,7 @@ def drop_v12_replica_tables(connection):
 
 
 def drop_v6_reclaim_tables(connection):
+    connection.execute("DROP TABLE IF EXISTS restore_operations")
     connection.execute("DROP TABLE reclaim_bundles")
     connection.execute("DROP TABLE reclaim_chains")
     connection.execute("DROP TABLE reclaim_operations")
@@ -1372,6 +1374,7 @@ def test_v12_to_v13_adds_cleanup_authorization_without_data_loss(
 
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = OFF")
+    connection.execute("DROP TABLE IF EXISTS restore_operations")
 
     # Reconstruct exact v12 shape from the current v13 database.
     drop_v13_cleanup_authorization(connection)
@@ -1422,5 +1425,99 @@ def test_v12_to_v13_adds_cleanup_authorization_without_data_loss(
             "PRAGMA foreign_key_check"
         )
     ) == []
+
+    migrated.close()
+
+
+def test_v13_to_v14_adds_durable_restore_operations_without_data_loss(
+    tmp_path,
+):
+    path = tmp_path / "v13-to-v14.db"
+
+    (
+        node,
+        destination,
+        vm,
+        job,
+        run,
+        point,
+        artifact_ids,
+    ) = populated_database(path)
+
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA foreign_keys = OFF")
+
+    # Reconstruct the exact v13 shape from a fresh v14 database.
+    connection.execute(
+        "DROP TABLE restore_operations"
+    )
+    connection.execute(
+        "UPDATE schema_version SET version = 13 WHERE id = 1"
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = SQLiteRepository(path)
+
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 14
+    assert migrated.get_database_schema_version() == 14
+
+    columns = {
+        row[1]
+        for row in migrated.connection.execute(
+            "PRAGMA table_info(restore_operations)"
+        )
+    }
+
+    assert columns == {
+        "id",
+        "restore_point_id",
+        "source_destination_id",
+        "target_node_id",
+        "source_role",
+        "source_bundle_object_id",
+        "target_vm_name",
+        "target_domain_uuid",
+        "target_root",
+        "network_mode",
+        "start_after_restore",
+        "state",
+        "error",
+        "recovery_reason",
+        "created_at",
+        "updated_at",
+    }
+
+    # Existing backup catalog must survive the migration unchanged.
+    assert migrated.get_node(node.id).id == node.id
+    assert (
+        migrated.get_storage_destination(
+            node.id,
+            destination.id,
+        ).id
+        == destination.id
+    )
+    assert migrated.get_vm(vm.id).id == vm.id
+    assert migrated.get_job(job.id).id == job.id
+    assert migrated.get_run(run.id).id == run.id
+    assert migrated.get_restore_point(point.id).id == point.id
+
+    assert [
+        item.id
+        for item in migrated.list_artifacts_for_run(run.id)
+    ] == artifact_ids
+
+    assert list(
+        migrated.connection.execute(
+            "PRAGMA foreign_key_check"
+        )
+    ) == []
+
+    assert (
+        migrated.connection.execute(
+            "PRAGMA integrity_check"
+        ).fetchone()[0]
+        == "ok"
+    )
 
     migrated.close()

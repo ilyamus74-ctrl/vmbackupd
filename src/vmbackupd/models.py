@@ -69,6 +69,23 @@ class ReplicaTaskState(StrEnum):
     FAILED = "FAILED"
 
 
+class RestoreOperationState(StrEnum):
+    PLANNED = "PLANNED"
+    ACQUIRING = "ACQUIRING"
+    VERIFYING = "VERIFYING"
+    MATERIALIZING = "MATERIALIZING"
+    DEFINING = "DEFINING"
+    READY = "READY"
+    STARTING = "STARTING"
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+    RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
+
+
+class RestoreNetworkMode(StrEnum):
+    DISCONNECTED = "DISCONNECTED"
+
+
 class ArtifactKind(StrEnum):
     DISK = "DISK"
     DOMAIN_XML = "DOMAIN_XML"
@@ -619,6 +636,71 @@ class ReplicaTask:
         )
         if self.attempts < 0:
             raise ValueError("replica attempts must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
+class RestoreOperation:
+    restore_point_id: str
+    source_destination_id: str
+    target_node_id: str
+    source_role: RestorePointLocationRole
+    source_bundle_object_id: str
+    target_vm_name: str
+    target_root: str
+    target_domain_uuid: str = field(default_factory=new_id)
+    network_mode: RestoreNetworkMode = RestoreNetworkMode.DISCONNECTED
+    start_after_restore: bool = False
+    state: RestoreOperationState = RestoreOperationState.PLANNED
+    error: str | None = None
+    recovery_reason: str | None = None
+    id: str = field(default_factory=new_id)
+    created_at: datetime = field(default_factory=utcnow)
+    updated_at: datetime = field(default_factory=utcnow)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "source_role",
+            RestorePointLocationRole(self.source_role),
+        )
+        object.__setattr__(
+            self,
+            "network_mode",
+            RestoreNetworkMode(self.network_mode),
+        )
+        object.__setattr__(
+            self,
+            "state",
+            RestoreOperationState(self.state),
+        )
+
+        if not self.restore_point_id:
+            raise ValueError("restore_point_id must not be empty")
+        if not self.source_destination_id:
+            raise ValueError("source_destination_id must not be empty")
+        if not self.target_node_id:
+            raise ValueError("target_node_id must not be empty")
+        if not self.source_bundle_object_id.strip():
+            raise ValueError(
+                "source_bundle_object_id must not be empty"
+            )
+        if not self.target_vm_name.strip():
+            raise ValueError("target_vm_name must not be empty")
+        if (
+            not self.target_root.startswith("/")
+            or ".." in self.target_root.split("/")
+        ):
+            raise ValueError(
+                "target_root must be absolute and traversal-free"
+            )
+        if not self.target_domain_uuid.strip():
+            raise ValueError(
+                "target_domain_uuid must not be empty"
+            )
+        if not isinstance(self.start_after_restore, bool):
+            raise ValueError(
+                "start_after_restore must be boolean"
+            )
 
 
 @dataclass(frozen=True, slots=True)
