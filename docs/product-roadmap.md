@@ -66,6 +66,19 @@ will consume equivalent API operations rather than invoke the console client.
 - Later: restore execution, retention deletion, deeper verification, and remote
 replication.
 
+
+Release 3 remote replication is implemented through durable staged
+milestones. R3.3 closes sparse SSH transfer at `STAGING_COMPLETE` /
+`VERIFYING`. R3.4 closes remote semantic verification, `qemu-img` validation,
+crash-reconcilable atomic publication, idempotent `PUBLISHED` reconciliation,
+and transactional creation of an `AVAILABLE` REPLICA location with replica
+task `SUCCESS`.
+
+R3.5 is the next milestone and validates restore consumption from an
+`AVAILABLE` remote replica. Release 3 backup-job configuration remains
+FULL-only while incremental execution remains deliberately gated.
+
+
 Phase 3E Cockpit storage screens must expose an explicit destination `Type`
 field from their first version. Initially the only displayed and supported type
 is `Local`. Phase 3F adds `SSH / rsync`. This prevents the UI from being shaped
