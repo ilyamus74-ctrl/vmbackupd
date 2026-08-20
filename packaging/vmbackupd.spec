@@ -2,7 +2,7 @@
 
 Name:           vmbackupd
 Version:        %{upstream_version}
-Release:        4%{?dist}
+Release:        5%{?dist}
 Summary:        Local KVM/libvirt backup management daemon
 License:        LicenseRef-Proprietary
 Source0:        %{name}-%{version}.tar.gz
@@ -168,6 +168,14 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-resolver@.service \
 %{_datadir}/cockpit/vmbackupd/
 
 %changelog
+* Thu Aug 20 2026 vmbackupd packagers <packagers@example.invalid> - 0.1.0-5
+- Add schema version 18 with separate CAPACITY and RETENTION reclaim purposes
+- Add durable post-success retention reclaim through the existing safe reclaim pipeline
+- Fail closed when replica locations or replica tasks depend on reclaim candidates
+- Add restart catch-up for interrupted post-success retention
+- Require explicit recovery for interrupted destructive retention
+- Normalize stale recovery diagnostics on completed v17 reclaim migration
+
 * Thu Aug 20 2026 vmbackupd packagers <packagers@example.invalid> - 0.1.0-4
 - Update runtime and database support through schema version 17
 - Fix reclaim recovery blocked by terminal historical job runs
