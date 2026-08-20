@@ -699,3 +699,63 @@ def test_purged_state_refuses_remaining_physical_object(
         operation.recovery_from_state
         is ReclaimOperationState.PURGED
     )
+
+
+
+def test_pre_destructive_invariant_failure_aborts_planned_reclaim():
+    from types import SimpleNamespace
+
+    from vmbackupd.models import ReclaimOperationState
+    from vmbackupd.repository import DomainInvariantError
+
+    class RefusingRepository:
+        def __init__(self):
+            self.operation = SimpleNamespace(
+                state=ReclaimOperationState.PLANNED,
+                storage_destination_id="storage",
+            )
+            self.aborted = []
+
+        def get_reclaim_operation(self, operation_id):
+            assert operation_id == "operation"
+            return self.operation
+
+        def begin_reclaim_retirement(self, operation_id):
+            assert operation_id == "operation"
+            raise DomainInvariantError(
+                "reclaim is blocked by replica location"
+            )
+
+        def abort_reclaim(self, operation_id):
+            assert operation_id == "operation"
+            assert (
+                self.operation.state
+                is ReclaimOperationState.PLANNED
+            )
+            self.aborted.append(operation_id)
+            self.operation = SimpleNamespace(
+                state=ReclaimOperationState.ABORTED,
+                storage_destination_id="storage",
+            )
+            return self.operation
+
+    repository = RefusingRepository()
+
+    # Constructor dependencies are irrelevant for this state-machine
+    # regression; _drive only needs these two attributes before the
+    # PLANNED retirement guard is exercised.
+    executor = object.__new__(ReclaimExecutor)
+    executor.repository = repository
+    executor.storage_destination_id = "storage"
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="replica location",
+    ):
+        executor.execute("operation")
+
+    assert repository.aborted == ["operation"]
+    assert (
+        repository.operation.state
+        is ReclaimOperationState.ABORTED
+    )

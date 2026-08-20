@@ -48,6 +48,8 @@ class ReclaimInsufficientSpaceError(ReclaimExecutionError):
         )
 
 
+from .repository import DomainInvariantError
+
 class ReclaimExecutor:
     """Drive one durable capacity-reclaim transaction to completion."""
 
@@ -206,9 +208,28 @@ class ReclaimExecutor:
             state = operation.state
 
             if state is ReclaimOperationState.PLANNED:
-                self.repository.begin_reclaim_retirement(
-                    operation_id
-                )
+                try:
+                    self.repository.begin_reclaim_retirement(
+                        operation_id
+                    )
+                except DomainInvariantError:
+                    # Repository safety checks intentionally leave the
+                    # operation PLANNED when retirement is rejected before
+                    # any destructive transition. Persist ABORTED here so a
+                    # deterministic pre-destructive refusal (for example a
+                    # replica dependency or changed policy/snapshot) cannot
+                    # leave a stale operation that blocks future reclaim.
+                    current = self.repository.get_reclaim_operation(
+                        operation_id
+                    )
+                    if (
+                        current.state
+                        is ReclaimOperationState.PLANNED
+                    ):
+                        self.repository.abort_reclaim(
+                            operation_id
+                        )
+                    raise
                 continue
 
             if state is ReclaimOperationState.RETIRING:
