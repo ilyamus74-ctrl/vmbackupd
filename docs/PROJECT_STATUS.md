@@ -3379,6 +3379,79 @@ Planned sequence:
 
 ### A3.5.1 local restore execution foundation
 
+**Status: CLOSED**
+
+Implementation commit:
+
+    16806762af6133ab1846810820e2b93860d25249
+    1680676 feat: add local restore execution state foundation
+
+Delivered foundation:
+
+- schema version 17;
+- ordered v16 -> v17 migration;
+- durable `RestoreOperation.recovery_from_state`;
+- SQLite insert/update recovery-coherence enforcement;
+- LOCAL execution begins with `PLANNED -> VERIFYING`;
+- remote SSH execution remains explicitly deferred with
+  `RESTORE_REMOTE_ACQUISITION_NOT_IMPLEMENTED`;
+- compare-and-set restore state transitions;
+- `VERIFYING` is read-only/retry-safe and may fail terminally;
+- `MATERIALIZING`, `DEFINING`, and `STARTING` are unsafe states and cannot
+  be failed directly;
+- unsafe interruption enters `RECOVERY_REQUIRED` while preserving
+  `recovery_from_state`;
+- `READY -> SUCCESS` is permitted only when start was not requested;
+- `READY -> STARTING -> SUCCESS` is required when start was requested;
+- restore recovery provenance is serialized through the public restore
+  representation.
+
+Accepted state boundary:
+
+    PLANNED
+        -> VERIFYING
+        -> MATERIALIZING
+        -> DEFINING
+        -> READY
+            -> SUCCESS
+
+and, when start-after-restore is requested:
+
+    READY
+        -> STARTING
+        -> SUCCESS
+
+Recovery boundary:
+
+    ACQUIRING
+    MATERIALIZING
+    DEFINING
+    STARTING
+        -> RECOVERY_REQUIRED
+
+`ACQUIRING` remains reserved for the later SSH acquisition implementation.
+
+Acceptance evidence:
+
+- A3.5.1 focused restore/schema suite: 100% passed;
+- full project pytest regression: 100% passed;
+- Python compileall: rc=0;
+- `git diff --check`: clean;
+- schema current version: 17;
+- migration 16 -> 17 registered;
+- no filesystem materialization operations introduced;
+- no qcow2 copy/reflink operations introduced;
+- no qemu-img operations introduced;
+- no libvirt define/start operations introduced;
+- no SSH restore byte acquisition introduced.
+
+A3.5.1 establishes only the durable execution state foundation. It does not
+restore VM data by itself.
+
+The next restore implementation stage is A3.5.2: LOCAL source verification
+and safe independent target materialization.
+
+
 Establish durable RestoreOperation execution semantics:
 
     PLANNED
