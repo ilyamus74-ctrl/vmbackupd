@@ -296,23 +296,14 @@ def helper_main(
     stdin=None,
     stdout=None,
     namespace_probe=receiver_namespace_ready,
+    publisher=None,
 ) -> int:
     import sys
 
-    source = (
-        sys.stdin.buffer
-        if stdin is None
-        else stdin
-    )
-    output = (
-        sys.stdout.buffer
-        if stdout is None
-        else stdout
-    )
+    source = sys.stdin.buffer if stdin is None else stdin
+    output = sys.stdout.buffer if stdout is None else stdout
 
-    line = source.readline(
-        MAX_REQUEST_BYTES + 1
-    )
+    line = source.readline(MAX_REQUEST_BYTES + 1)
 
     if (
         not line
@@ -334,12 +325,35 @@ def helper_main(
     if not isinstance(request, dict):
         return 64
 
+    operation = request.get(
+        "operation"
+    )
+
     if (
         request.get("version")
         != INTERNAL_PROTOCOL_VERSION
-        or request.get("operation")
-        != "resolve"
+        or operation
+        not in {"resolve", "publish"}
     ):
+        return 64
+
+    expected = (
+        {
+            "version",
+            "operation",
+            "storage_id",
+        }
+        if operation == "resolve"
+        else {
+            "version",
+            "operation",
+            "storage_id",
+            "transfer_id",
+            "restore_point_id",
+        }
+    )
+
+    if set(request) != expected:
         return 64
 
     client = (
@@ -351,15 +365,14 @@ def helper_main(
     try:
         storage = resolve_receiver_storage(
             client,
-            request.get("storage_id"),
-            namespace_probe=namespace_probe,
+            request.get(
+                "storage_id"
+            ),
+            namespace_probe=(
+                namespace_probe
+            ),
         )
-        response = {
-            "version":
-                INTERNAL_PROTOCOL_VERSION,
-            "ok": True,
-            "storage": storage,
-        }
+
     except ReceiverResolverError as exc:
         response = {
             "version":
@@ -371,7 +384,57 @@ def helper_main(
             },
         }
 
-    encoded = (
+    else:
+        if operation == "resolve":
+            response = {
+                "version":
+                    INTERNAL_PROTOCOL_VERSION,
+                "ok": True,
+                "storage": storage,
+            }
+
+        else:
+            from .receiver_publish import (
+                ReceiverPublishError,
+                publish_staged_replica,
+            )
+
+            handler = (
+                publish_staged_replica
+                if publisher is None
+                else publisher
+            )
+
+            try:
+                result = handler(
+                    storage,
+                    request.get(
+                        "transfer_id"
+                    ),
+                    request.get(
+                        "restore_point_id"
+                    ),
+                )
+
+                response = {
+                    "version":
+                        INTERNAL_PROTOCOL_VERSION,
+                    "ok": True,
+                    "result": result,
+                }
+
+            except ReceiverPublishError as exc:
+                response = {
+                    "version":
+                        INTERNAL_PROTOCOL_VERSION,
+                    "ok": False,
+                    "error": {
+                        "code": exc.code,
+                        "message": str(exc),
+                    },
+                }
+
+    output.write(
         json.dumps(
             response,
             sort_keys=True,
@@ -379,8 +442,6 @@ def helper_main(
         ).encode("utf-8")
         + b"\n"
     )
-
-    output.write(encoded)
     output.flush()
 
     return 0

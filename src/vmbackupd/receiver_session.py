@@ -21,6 +21,10 @@ from .receiver_catalog import (
     ReceiverCatalogClient,
     ReceiverCatalogError,
 )
+from .receiver_publish import (
+    PUBLISH_COMMAND,
+    run_receiver_publish,
+)
 from .receiver_transfer import (
     TRANSFER_COMMAND,
     run_receiver_transfer,
@@ -130,6 +134,7 @@ def main(
     receiver_root=None,
     catalog_client=None,
     transfer_runner=None,
+    publish_runner=None,
 ) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
 
@@ -164,6 +169,14 @@ def main(
             run_receiver_transfer
             if transfer_runner is None
             else transfer_runner
+        )
+        return runner()
+
+    if original == PUBLISH_COMMAND:
+        runner = (
+            run_receiver_publish
+            if publish_runner is None
+            else publish_runner
         )
         return runner()
 
