@@ -14,7 +14,11 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
-from .bundle import BundlePathPlanner, BundlePublisher
+from .bundle import (
+    BundlePathPlanner,
+    BundlePhysicalInspector,
+    BundlePublisher,
+)
 from .receiver_resolver import INTERNAL_PROTOCOL_VERSION, RESOLVER_SOCKET
 from .receiver_transfer import (
     MAX_CONTROL_LINE,
@@ -623,6 +627,256 @@ def _move(source: Path, final: Path, planner: BundlePathPlanner) -> None:
         if source_fd is not None:
             os.close(source_fd)
         os.close(destination_fd)
+
+
+def inspect_published_replica(
+    storage: dict,
+    restore_point_id: str,
+) -> dict:
+    """Resolve and validate one immutable published replica.
+
+    This is an internal privileged read boundary. Absolute receiver
+    filesystem paths are never returned to the SSH peer.
+    """
+
+    restore_point_id = _uuid(
+        restore_point_id,
+        "Restore Point ID",
+    )
+
+    if not isinstance(storage, dict):
+        raise ReceiverPublishError(
+            "FETCH_STORAGE_INVALID",
+            "receiver storage resolution is invalid",
+        )
+
+    storage_id = _uuid(
+        storage.get("storage_id"),
+        "storage ID",
+    )
+
+    root_value = storage.get(
+        "backup_data_root"
+    )
+
+    if not isinstance(root_value, str):
+        raise ReceiverPublishError(
+            "FETCH_STORAGE_INVALID",
+            "receiver storage root is unavailable",
+        )
+
+    root = Path(root_value)
+
+    if (
+        not root.is_absolute()
+        or ".." in root.parts
+    ):
+        raise ReceiverPublishError(
+            "FETCH_STORAGE_INVALID",
+            "receiver storage root is unsafe",
+        )
+
+    _real_dir(
+        root,
+        "receiver storage root",
+    )
+
+    state = root / _STATE_DIR
+    published = state / _PUBLISHED_DIR
+
+    _real_dir(
+        state,
+        "replica publication state",
+    )
+    _real_dir(
+        published,
+        "published replica state",
+    )
+
+    marker_path = (
+        published
+        / f"{restore_point_id}.json"
+    )
+
+    if (
+        not marker_path.exists()
+        or marker_path.is_symlink()
+    ):
+        raise ReceiverPublishError(
+            "FETCH_REPLICA_NOT_PUBLISHED",
+            "Restore Point is not published on receiver storage",
+        )
+
+    marker = _json(
+        marker_path,
+        "published replica record",
+    )
+
+    if (
+        marker.get("state") != "PUBLISHED"
+        or marker.get("storage_id") != storage_id
+        or marker.get("restore_point_id")
+        != restore_point_id
+    ):
+        raise ReceiverPublishError(
+            "FETCH_PUBLISHED_STATE_INVALID",
+            "published replica record does not match request",
+        )
+
+    object_id = marker.get(
+        "bundle_object_id"
+    )
+
+    bundle = _object_path(
+        root,
+        object_id,
+    )
+
+    _real_dir(
+        bundle,
+        "published replica bundle",
+    )
+
+    try:
+        usage = BundlePhysicalInspector(
+            BundlePathPlanner(root)
+        ).inspect(bundle)
+    except Exception as exc:
+        raise ReceiverPublishError(
+            "FETCH_BUNDLE_INVALID",
+            "published replica bundle failed structural validation",
+        ) from exc
+
+    metadata = bundle / "metadata"
+    disks = bundle / "disks"
+
+    restore_metadata = _json(
+        metadata / "restore-point.json",
+        "restore point metadata",
+    )
+
+    disk_records = restore_metadata.get(
+        "disks"
+    )
+
+    if not isinstance(disk_records, list):
+        raise ReceiverPublishError(
+            "FETCH_METADATA_INVALID",
+            "restore point disk metadata is invalid",
+        )
+
+    expected_disks = set()
+    files = []
+
+    for name in (
+        "domain.xml",
+        "manifest.json",
+        "restore-point.json",
+    ):
+        path = metadata / name
+        size = _regular_size(
+            path,
+            f"metadata/{name}",
+        )
+
+        files.append({
+            "relative_path":
+                f"metadata/{name}",
+            "size_bytes": size,
+        })
+
+    for record in disk_records:
+        if not isinstance(record, dict):
+            raise ReceiverPublishError(
+                "FETCH_METADATA_INVALID",
+                "restore point disk metadata is invalid",
+            )
+
+        target = record.get("target")
+        relative_value = record.get(
+            "relative_path"
+        )
+
+        if not isinstance(target, str):
+            raise ReceiverPublishError(
+                "FETCH_METADATA_INVALID",
+                "restore point disk target is invalid",
+            )
+
+        try:
+            expected_relative = str(
+                BundlePathPlanner.disk_relative(
+                    target
+                )
+            )
+        except ValueError as exc:
+            raise ReceiverPublishError(
+                "FETCH_METADATA_INVALID",
+                "restore point disk target is unsafe",
+            ) from exc
+
+        if relative_value != expected_relative:
+            raise ReceiverPublishError(
+                "FETCH_METADATA_INVALID",
+                "restore point disk path does not match target",
+            )
+
+        if expected_relative in expected_disks:
+            raise ReceiverPublishError(
+                "FETCH_METADATA_INVALID",
+                "restore point contains duplicate disk metadata",
+            )
+
+        expected_disks.add(
+            expected_relative
+        )
+
+        disk_path = (
+            bundle
+            / PurePosixPath(
+                expected_relative
+            )
+        )
+
+        size = _regular_size(
+            disk_path,
+            expected_relative,
+        )
+
+        files.append({
+            "relative_path":
+                expected_relative,
+            "size_bytes": size,
+        })
+
+    try:
+        actual_disks = {
+            f"disks/{name}"
+            for name in os.listdir(disks)
+        }
+    except OSError as exc:
+        raise ReceiverPublishError(
+            "FETCH_BUNDLE_INVALID",
+            "published replica disks cannot be enumerated",
+        ) from exc
+
+    if actual_disks != expected_disks:
+        raise ReceiverPublishError(
+            "FETCH_BUNDLE_INVALID",
+            "published replica disk set does not match metadata",
+        )
+
+    return {
+        "status": "PUBLISHED",
+        "storage_id": storage_id,
+        "restore_point_id":
+            restore_point_id,
+        "bundle_object_id":
+            object_id,
+        "physical_bytes":
+            usage.physical_bytes,
+        "files": files,
+    }
 
 
 def publish_staged_replica(

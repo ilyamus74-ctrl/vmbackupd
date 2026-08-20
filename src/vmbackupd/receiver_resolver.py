@@ -121,6 +121,82 @@ def _real_directory(value: str) -> Path:
     return path
 
 
+def resolve_receiver_storage_readonly(
+    api_client,
+    storage_id: str,
+) -> dict:
+    """Resolve one receiver LOCAL storage for immutable reads.
+
+    Unlike the transfer resolver this deliberately does not require
+    writable capacity or the receiver staging namespace.
+    """
+
+    storage_id = _storage_id(storage_id)
+
+    try:
+        values = api_client.request(
+            "storage.list",
+            {},
+        )
+    except (
+        ApiClientError,
+        ApiUnavailable,
+    ) as exc:
+        raise ReceiverResolverError(
+            "RECEIVER_CATALOG_UNAVAILABLE",
+            "receiver storage catalog is unavailable",
+        ) from exc
+
+    if not isinstance(values, list):
+        raise ReceiverResolverError(
+            "RECEIVER_CATALOG_INVALID",
+            "receiver storage catalog is malformed",
+        )
+
+    matches = [
+        item
+        for item in values
+        if (
+            isinstance(item, dict)
+            and item.get("id") == storage_id
+        )
+    ]
+
+    if len(matches) != 1:
+        raise ReceiverResolverError(
+            "RECEIVER_STORAGE_NOT_FOUND",
+            "receiver storage ID was not found",
+        )
+
+    item = matches[0]
+
+    if item.get("storage_type") != "LOCAL":
+        raise ReceiverResolverError(
+            "RECEIVER_STORAGE_NOT_LOCAL",
+            "receiver storage must be LOCAL",
+        )
+
+    root_value = item.get(
+        "backup_data_root"
+    )
+
+    if not isinstance(root_value, str):
+        raise ReceiverResolverError(
+            "RECEIVER_CATALOG_INVALID",
+            "receiver storage has no local root",
+        )
+
+    root = _real_directory(
+        root_value
+    )
+
+    return {
+        # INTERNAL ONLY.
+        "storage_id": storage_id,
+        "backup_data_root": str(root),
+    }
+
+
 def resolve_receiver_storage(
     api_client,
     storage_id: str,
@@ -297,6 +373,7 @@ def helper_main(
     stdout=None,
     namespace_probe=receiver_namespace_ready,
     publisher=None,
+    fetcher=None,
 ) -> int:
     import sys
 
@@ -333,25 +410,31 @@ def helper_main(
         request.get("version")
         != INTERNAL_PROTOCOL_VERSION
         or operation
-        not in {"resolve", "publish"}
+        not in {"resolve", "publish", "fetch_manifest"}
     ):
         return 64
 
-    expected = (
-        {
+    if operation == "resolve":
+        expected = {
             "version",
             "operation",
             "storage_id",
         }
-        if operation == "resolve"
-        else {
+    elif operation == "publish":
+        expected = {
             "version",
             "operation",
             "storage_id",
             "transfer_id",
             "restore_point_id",
         }
-    )
+    else:
+        expected = {
+            "version",
+            "operation",
+            "storage_id",
+            "restore_point_id",
+        }
 
     if set(request) != expected:
         return 64
@@ -363,15 +446,23 @@ def helper_main(
     )
 
     try:
-        storage = resolve_receiver_storage(
-            client,
-            request.get(
-                "storage_id"
-            ),
-            namespace_probe=(
-                namespace_probe
-            ),
-        )
+        if operation == "fetch_manifest":
+            storage = resolve_receiver_storage_readonly(
+                client,
+                request.get(
+                    "storage_id"
+                ),
+            )
+        else:
+            storage = resolve_receiver_storage(
+                client,
+                request.get(
+                    "storage_id"
+                ),
+                namespace_probe=(
+                    namespace_probe
+                ),
+            )
 
     except ReceiverResolverError as exc:
         response = {
@@ -393,7 +484,7 @@ def helper_main(
                 "storage": storage,
             }
 
-        else:
+        elif operation == "publish":
             from .receiver_publish import (
                 ReceiverPublishError,
                 publish_staged_replica,
@@ -411,6 +502,44 @@ def helper_main(
                     request.get(
                         "transfer_id"
                     ),
+                    request.get(
+                        "restore_point_id"
+                    ),
+                )
+
+                response = {
+                    "version":
+                        INTERNAL_PROTOCOL_VERSION,
+                    "ok": True,
+                    "result": result,
+                }
+
+            except ReceiverPublishError as exc:
+                response = {
+                    "version":
+                        INTERNAL_PROTOCOL_VERSION,
+                    "ok": False,
+                    "error": {
+                        "code": exc.code,
+                        "message": str(exc),
+                    },
+                }
+
+        else:
+            from .receiver_publish import (
+                ReceiverPublishError,
+                inspect_published_replica,
+            )
+
+            handler = (
+                inspect_published_replica
+                if fetcher is None
+                else fetcher
+            )
+
+            try:
+                result = handler(
+                    storage,
                     request.get(
                         "restore_point_id"
                     ),
