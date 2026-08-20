@@ -5949,17 +5949,15 @@ class SQLiteRepository:
             for row in all_chains
         }
 
-        snapshot_by_chain = {}
+        snapshot_restore_points_by_chain: dict[str, set[str]] = {}
 
         for bundle in reclaim_bundles:
-            snapshot_by_chain.setdefault(
+            snapshot_restore_points_by_chain.setdefault(
                 bundle["chain_id"],
-                {},
-            )[
-                bundle["restore_point_id"]
-            ] = bundle["source_bundle_object_id"]
+                set(),
+            ).add(bundle["restore_point_id"])
 
-        if set(snapshot_by_chain) != selected_set:
+        if set(snapshot_restore_points_by_chain) != selected_set:
             raise DomainInvariantError(
                 "retention reclaim chain membership changed"
             )
@@ -5991,19 +5989,12 @@ class SQLiteRepository:
                     "is no longer valid"
                 )
 
-            current_snapshot = {
-                point["id"]:
-                    point["bundle_object_id"]
-                for point in current_members
+            current_restore_point_ids = {
+                point["id"] for point in current_members
             }
-
-            if (
-                current_snapshot
-                != snapshot_by_chain[chain_id]
-            ):
+            if current_restore_point_ids != snapshot_restore_points_by_chain[chain_id]:
                 raise DomainInvariantError(
-                    "selected retention reclaim catalog "
-                    "snapshot changed"
+                    "selected retention reclaim restore-point snapshot changed"
                 )
 
         if (
@@ -6243,7 +6234,7 @@ class SQLiteRepository:
                 "reclaim retirement snapshot has no bundles"
             )
 
-        snapshot_by_chain: dict[str, dict[str, str]] = {}
+        lineage_by_chain: dict[str, set[str]] = {}
         for bundle in snapshots:
             if (
                 ReclaimBundleState(bundle["state"])
@@ -6258,14 +6249,12 @@ class SQLiteRepository:
                     "destructive bundle evidence"
                 )
 
-            snapshot_by_chain.setdefault(
+            lineage_by_chain.setdefault(
                 bundle["chain_id"],
-                {},
-            )[bundle["restore_point_id"]] = (
-                bundle["source_bundle_object_id"]
-            )
+                set(),
+            ).add(bundle["restore_point_id"])
 
-        if set(snapshot_by_chain) != selected_set:
+        if set(lineage_by_chain) != selected_set:
             raise DomainInvariantError(
                 "reclaim retirement bundle membership changed"
             )
@@ -6292,12 +6281,10 @@ class SQLiteRepository:
                     "a valid populated FULL chain"
                 )
 
-            current_snapshot = {
-                point["id"]: point["bundle_object_id"]
-                for point in current_members
+            current_restore_point_ids = {
+                point["id"] for point in current_members
             }
-
-            if current_snapshot != snapshot_by_chain[chain_id]:
+            if current_restore_point_ids != lineage_by_chain[chain_id]:
                 raise DomainInvariantError(
                     "selected reclaim restore-point snapshot changed"
                 )
@@ -6839,21 +6826,14 @@ class SQLiteRepository:
                         chain["id"]
                     ] = chain_members
 
-            snapshot_by_chain: dict[str, dict[str, str]] = {}
+            snapshot_restore_points_by_chain: dict[str, set[str]] = {}
             for bundle in reclaim_bundles:
-                if (
-                    bundle["destination_id"]
-                    != operation["storage_destination_id"]
-                ):
-                    continue
-                snapshot_by_chain.setdefault(
+                snapshot_restore_points_by_chain.setdefault(
                     bundle["chain_id"],
-                    {},
-                )[bundle["restore_point_id"]] = (
-                    bundle["source_bundle_object_id"]
-                )
+                    set(),
+                ).add(bundle["restore_point_id"])
 
-            if set(snapshot_by_chain) != selected_chain_set:
+            if set(snapshot_restore_points_by_chain) != selected_chain_set:
                 raise DomainInvariantError(
                     "reclaim catalog chain membership changed"
                 )
@@ -6884,14 +6864,15 @@ class SQLiteRepository:
                         "a valid populated FULL chain"
                     )
 
-                current_snapshot = {
-                    point["id"]: point["bundle_object_id"]
-                    for point in current_members
+                current_restore_point_ids = {
+                    point["id"] for point in current_members
                 }
-
-                if current_snapshot != snapshot_by_chain[chain_id]:
+                if (
+                    current_restore_point_ids
+                    != snapshot_restore_points_by_chain[chain_id]
+                ):
                     raise DomainInvariantError(
-                        "selected reclaim catalog snapshot changed"
+                        "selected reclaim catalog restore-point snapshot changed"
                     )
 
                 selected_catalog_points.extend(current_members)

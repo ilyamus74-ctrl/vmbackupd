@@ -1178,16 +1178,68 @@ def test_retirement_revalidates_restore_point_snapshot(tmp_path):
     )
     repository.connection.commit()
 
-    with pytest.raises(
-        DomainInvariantError,
-        match="snapshot changed",
-    ):
-        repository.begin_reclaim_retirement(operation.id)
+    operation = repository.begin_reclaim_retirement(operation.id)
+
+    assert operation.state is ReclaimOperationState.RETIRING
 
     assert (
         repository.get_reclaim_operation(operation.id).state
-        is ReclaimOperationState.PLANNED
+        is ReclaimOperationState.RETIRING
     )
+
+
+def test_retirement_and_catalog_validation_accepts_multiple_destinations_per_restore_point(
+    tmp_path,
+):
+    repository, node, _, vm, job, target_run = catalog(
+        tmp_path / "multi-destination.db"
+    )
+
+    operation, chain, points = make_quarantined_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+    )
+
+    replica = StorageDestination(
+        node_id=node.id,
+        name="replica",
+        backup_data_root="/replica",
+    )
+    repository.add_storage_destination(replica)
+
+    repository.connection.execute(
+        """INSERT INTO restore_point_locations (
+               restore_point_id,
+               destination_id,
+               role,
+               state,
+               bundle_object_id,
+               verified_at,
+               created_at
+           ) VALUES (?, ?, 'REPLICA', 'AVAILABLE', ?, ?, ?)""",
+        (
+            points[0].id,
+            replica.id,
+            "/replica/selected/0",
+            NOW.isoformat(),
+            NOW.isoformat(),
+        ),
+    )
+    repository.connection.commit()
+
+    operation = repository.retire_reclaim_catalog(operation.id)
+
+    assert operation.state is ReclaimOperationState.CATALOG_REMOVED
+    assert repository.connection.execute(
+        "SELECT COUNT(*) FROM restore_points WHERE id = ?",
+        (points[0].id,),
+    ).fetchone()[0] == 0
+    assert repository.connection.execute(
+        "SELECT COUNT(*) FROM backup_chains WHERE id = ?",
+        (chain.id,),
+    ).fetchone()[0] == 0
 
 
 def test_retirement_revalidates_minimum_full_chain_floor(tmp_path):
@@ -1704,26 +1756,21 @@ def test_catalog_retirement_refuses_snapshot_drift_atomically(
     )
 
     repository.connection.execute(
-        """UPDATE restore_points
-           SET bundle_object_id = ?
-           WHERE id = ?""",
-        (
-            "/changed/after/quarantine",
-            points[0].id,
-        ),
+        "DELETE FROM restore_points WHERE id = ?",
+        (points[0].id,),
     )
     repository.connection.commit()
 
     with pytest.raises(
         DomainInvariantError,
-        match="snapshot changed",
+        match="valid populated FULL chain",
     ):
         repository.retire_reclaim_catalog(operation.id)
 
     assert repository.connection.execute(
         "SELECT COUNT(*) FROM restore_points WHERE id = ?",
         (points[0].id,),
-    ).fetchone()[0] == 1
+    ).fetchone()[0] == 0
 
     assert repository.connection.execute(
         "SELECT COUNT(*) FROM backup_chains WHERE id = ?",
@@ -2551,4 +2598,3 @@ def test_catalog_retirement_allows_late_replica_location(
         ).fetchone()[0]
         == 0
     )
-
