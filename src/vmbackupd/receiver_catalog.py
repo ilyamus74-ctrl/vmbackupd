@@ -92,6 +92,87 @@ def _validate_catalog_item(item: dict) -> None:
         )
 
 
+def build_receiver_node_capability(
+    api_client,
+) -> dict:
+    """Return path-free restore capability for this receiver node."""
+
+    value = api_client.request(
+        "node.capability",
+        {},
+    )
+
+    if not isinstance(value, dict):
+        raise ReceiverCatalogError(
+            "daemon returned malformed node capability"
+        )
+
+    required_strings = (
+        "node_id",
+        "node_name",
+        "version",
+        "runtime_state",
+        "libvirt_uri",
+    )
+
+    for name in required_strings:
+        field = value.get(name)
+
+        if (
+            not isinstance(field, str)
+            or not field.strip()
+        ):
+            raise ReceiverCatalogError(
+                f"daemon returned invalid node capability field {name}"
+            )
+
+    for name in (
+        "controller_owned",
+        "libvirt_available",
+        "libvirt_mutation_enabled",
+        "restore_capable",
+    ):
+        if not isinstance(
+            value.get(name),
+            bool,
+        ):
+            raise ReceiverCatalogError(
+                f"daemon returned invalid node capability field {name}"
+            )
+
+    libvirt_error = value.get(
+        "libvirt_error"
+    )
+
+    if (
+        libvirt_error is not None
+        and not isinstance(libvirt_error, str)
+    ):
+        raise ReceiverCatalogError(
+            "daemon returned invalid libvirt error"
+        )
+
+    return {
+        "node_id": value["node_id"].strip(),
+        "node_name": value["node_name"].strip(),
+        "version": value["version"].strip(),
+        "runtime_state":
+            value["runtime_state"].strip(),
+        "controller_owned":
+            value["controller_owned"],
+        "libvirt_uri":
+            value["libvirt_uri"].strip(),
+        "libvirt_available":
+            value["libvirt_available"],
+        "libvirt_mutation_enabled":
+            value["libvirt_mutation_enabled"],
+        "restore_capable":
+            value["restore_capable"],
+        "libvirt_error":
+            libvirt_error,
+    }
+
+
 def build_receiver_storage_catalog(
     api_client,
     *,
@@ -182,6 +263,7 @@ def helper_main(
     )
 
     try:
+        node = build_receiver_node_capability(client)
         storages = build_receiver_storage_catalog(client)
     except (
         ApiClientError,
@@ -198,6 +280,7 @@ def helper_main(
         json.dumps(
             {
                 "version": INTERNAL_PROTOCOL_VERSION,
+                "node": node,
                 "storages": storages,
             },
             sort_keys=True,
@@ -218,6 +301,7 @@ class ReceiverCatalogClient:
     ) -> None:
         self.socket_path = Path(socket_path)
         self.timeout = timeout
+        self.last_node = None
 
     def list(self) -> list[dict]:
         connection = socket.socket(
@@ -267,6 +351,18 @@ class ReceiverCatalogClient:
             raise ReceiverCatalogError(
                 "receiver catalog protocol version mismatch"
             )
+
+        node = payload.get("node")
+
+        if (
+            node is not None
+            and not isinstance(node, dict)
+        ):
+            raise ReceiverCatalogError(
+                "receiver catalog node capability is malformed"
+            )
+
+        self.last_node = node
 
         storages = payload.get("storages")
 

@@ -73,6 +73,11 @@ def _storage_list(catalog_client) -> int:
         "protocol_version": STORAGE_LIST_PROTOCOL_VERSION,
         "operation": "storage.list",
         "transport_ready": False,
+        "node": getattr(
+            catalog_client,
+            "last_node",
+            None,
+        ),
         "storages": storages,
     })
 

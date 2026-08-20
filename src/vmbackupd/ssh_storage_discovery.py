@@ -67,6 +67,67 @@ def _percent(value, name: str) -> float:
     return result
 
 
+def _sanitize_node(value: object) -> dict:
+    if not isinstance(value, dict):
+        raise SSHStorageDiscoveryError(
+            "SSH_STORAGE_DISCOVERY_PROTOCOL_INVALID",
+            "receiver node capability is invalid",
+        )
+
+    result = {}
+
+    for name in (
+        "node_id",
+        "node_name",
+        "version",
+        "runtime_state",
+        "libvirt_uri",
+    ):
+        field = value.get(name)
+
+        if (
+            not isinstance(field, str)
+            or not field.strip()
+        ):
+            raise SSHStorageDiscoveryError(
+                "SSH_STORAGE_DISCOVERY_PROTOCOL_INVALID",
+                f"receiver node field {name} is invalid",
+            )
+
+        result[name] = field.strip()
+
+    for name in (
+        "controller_owned",
+        "libvirt_available",
+        "libvirt_mutation_enabled",
+        "restore_capable",
+    ):
+        field = value.get(name)
+
+        if not isinstance(field, bool):
+            raise SSHStorageDiscoveryError(
+                "SSH_STORAGE_DISCOVERY_PROTOCOL_INVALID",
+                f"receiver node field {name} is invalid",
+            )
+
+        result[name] = field
+
+    error = value.get("libvirt_error")
+
+    if (
+        error is not None
+        and not isinstance(error, str)
+    ):
+        raise SSHStorageDiscoveryError(
+            "SSH_STORAGE_DISCOVERY_PROTOCOL_INVALID",
+            "receiver libvirt error is invalid",
+        )
+
+    result["libvirt_error"] = error
+
+    return result
+
+
 def _sanitize_storage(value: object) -> dict:
     if not isinstance(value, dict):
         raise SSHStorageDiscoveryError(
@@ -379,6 +440,14 @@ class SSHStorageDiscoveryClient:
                 "SSH receiver transport readiness is invalid",
             )
 
+        raw_node = payload.get("node")
+
+        node = (
+            None
+            if raw_node is None
+            else _sanitize_node(raw_node)
+        )
+
         raw_storages = payload.get("storages")
 
         if not isinstance(raw_storages, list):
@@ -402,7 +471,7 @@ class SSHStorageDiscoveryClient:
             ids.add(storage["id"])
             storages.append(storage)
 
-        return {
+        result = {
             "host": trusted["host"],
             "port": trusted["port"],
             "user": user,
@@ -412,3 +481,10 @@ class SSHStorageDiscoveryClient:
             "transport_ready": transport_ready,
             "storages": storages,
         }
+
+        # Backward compatible with receivers predating R3.5:
+        # absence of node capability does not break storage discovery.
+        if node is not None:
+            result["node"] = node
+
+        return result

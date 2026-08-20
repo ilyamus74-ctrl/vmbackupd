@@ -58,7 +58,9 @@ class VmbackupApplication:
 
     def dispatch(self, method: str, params: dict) -> object:
         handlers = {
-            "daemon.status": self.daemon_status, "node.list": self.node_list,
+            "daemon.status": self.daemon_status,
+            "node.list": self.node_list,
+            "node.capability": self.node_capability,
             "storage.list": self.storage_list, "storage.show": self.storage_show,
             "storage.create": self.storage_create, "storage.update": self.storage_update,
             "storage.delete": self.storage_delete,
@@ -149,6 +151,66 @@ class VmbackupApplication:
                 "free_backup_data_bytes": self._free(default),
                 "nonterminal_run_count": len(runs),
                 "recovery_required_count": sum(r.recovery_required for r in runs)}
+
+    def node_capability(self):
+        """Read-only capability advertisement for a managed node."""
+
+        runtime_state = getattr(
+            self.runtime,
+            "runtime_state",
+            "RUNNING",
+        )
+        runtime_state = getattr(
+            runtime_state,
+            "value",
+            runtime_state,
+        )
+
+        controller = self.repository.get_controller(
+            self.node.id
+        )
+        controller_owned = bool(
+            controller
+            and controller.daemon_instance_id
+            == self.runtime.instance_id
+        )
+
+        libvirt_available = False
+        libvirt_error = None
+
+        try:
+            self.driver.version_info()
+            libvirt_available = True
+        except Exception as exc:
+            libvirt_error = str(exc).strip()
+
+            if len(libvirt_error) > 500:
+                libvirt_error = libvirt_error[-500:]
+
+        mutation_enabled = bool(
+            self.config.libvirt.allow_mutation
+        )
+
+        restore_capable = bool(
+            runtime_state == "RUNNING"
+            and controller_owned
+            and libvirt_available
+            and mutation_enabled
+        )
+
+        return {
+            "node_id": self.node.id,
+            "node_name": self.node.name,
+            "version": self.version,
+            "runtime_state": runtime_state,
+            "controller_owned": controller_owned,
+            "libvirt_uri": self.config.libvirt.uri,
+            "libvirt_available": libvirt_available,
+            "libvirt_mutation_enabled":
+                mutation_enabled,
+            "restore_capable": restore_capable,
+            "libvirt_error": libvirt_error,
+        }
 
     def node_list(self): return [serialization.node(x) for x in self.repository.list_nodes()]
     def _serialize_storage(self, value):

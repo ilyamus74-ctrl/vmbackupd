@@ -20,6 +20,22 @@ class Api:
         params = params or {}
         self.calls.append((method, params))
 
+        if method == "node.capability":
+            assert params == {}
+
+            return {
+                "node_id": "node-kiev",
+                "node_name": "kiev",
+                "version": "0.1.0",
+                "runtime_state": "RUNNING",
+                "controller_owned": True,
+                "libvirt_uri": "qemu:///system",
+                "libvirt_available": True,
+                "libvirt_mutation_enabled": True,
+                "restore_capable": True,
+                "libvirt_error": None,
+            }
+
         if method == "storage.list":
             return [
                 {
@@ -134,8 +150,10 @@ def test_receiver_catalog_helper_emits_path_free_contract():
     output = io.StringIO()
     errors = io.StringIO()
 
+    api = Api()
+
     result = helper_main(
-        api_client=Api(),
+        api_client=api,
         stdout=output,
         stderr=errors,
     )
@@ -146,8 +164,28 @@ def test_receiver_catalog_helper_emits_path_free_contract():
     payload = json.loads(output.getvalue())
 
     assert payload["version"] == 1
+
+    assert payload["node"] == {
+        "node_id": "node-kiev",
+        "node_name": "kiev",
+        "version": "0.1.0",
+        "runtime_state": "RUNNING",
+        "controller_owned": True,
+        "libvirt_uri": "qemu:///system",
+        "libvirt_available": True,
+        "libvirt_mutation_enabled": True,
+        "restore_capable": True,
+        "libvirt_error": None,
+    }
+
     assert isinstance(payload["storages"], list)
     assert len(payload["storages"]) == 1
+
+    assert api.calls == [
+        ("node.capability", {}),
+        ("storage.list", {}),
+        ("storage.test", {"id": "local-1"}),
+    ]
 
     encoded = output.getvalue()
 
