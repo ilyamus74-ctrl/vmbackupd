@@ -2778,19 +2778,259 @@ replica execution.
 
 ---
 
+# Remote semantic verification and atomic replica publication (R3.4)
+
+Status:
+
+    CLOSED
+
+Implementation commits:
+
+    7e7613e — Add remote replica verification and publication
+    c2727c7 — Finalize remote replica publication
+
+R3.4 closes the fail-closed publication boundary left by R3.3.
+
+The completed replica path is now:
+
+    PRIMARY Restore Point AVAILABLE
+        -> replica task TRANSFERRING
+        -> receiver STAGING_COMPLETE
+        -> replica task VERIFYING
+        -> remote semantic verification
+        -> qemu-img structural verification
+        -> atomic receiver publication
+        -> receiver PUBLISHED
+        -> REPLICA location AVAILABLE
+        -> replica task SUCCESS
+
+Receiver publication uses the existing restricted SSH receiver and the
+existing privileged receiver-resolver socket boundary. No additional daemon,
+socket, service account, or externally supplied filesystem path was
+introduced.
+
+The public restricted command is:
+
+    vmbackupd-publish-v1
+
+The public publish request carries only stable identities:
+
+    storage_id
+    transfer_id
+    restore_point_id
+
+Filesystem paths remain receiver-local implementation details.
+
+Remote semantic verification requires:
+
+- the transfer record to be `STAGING_COMPLETE`;
+- the staging receipt to be `STAGING_COMPLETE`;
+- transfer, receipt, storage, Restore Point, VM, chain, run, sequence, kind,
+  and parent identities to agree;
+- the staged bundle to contain exactly the canonical metadata set and the
+  declared qcow2 disk set;
+- `restore-point.json`, `manifest.json`, and `domain.xml` identities to agree;
+- every staged disk to match its declared file size and planned virtual
+  capacity;
+- `qemu-img info` to identify the image as qcow2 and report the expected
+  virtual capacity;
+- `qemu-img check` to complete without structural errors.
+
+FULL publication requires sequence zero and no parent.
+
+INCREMENTAL publication requires the direct parent Restore Point to have
+already been published on the same receiver storage with matching chain
+identity and immediately preceding sequence. Release 3 public backup jobs
+remain FULL-only until the incremental execution contract is enabled by a
+later milestone.
+
+The canonical remote bundle path is derived by the receiver with the existing
+`BundlePathPlanner` contract:
+
+    vms/<vm-id>/<year>/<month>/<UTC-created-at>_<run-id>
+
+The sender never supplies the final remote filesystem path.
+
+Publication is crash-reconcilable:
+
+    verify staging
+        -> durable publish intent
+        -> atomic rename of bundle
+        -> fsync final hierarchy
+        -> durable PUBLISHED marker
+
+If execution stops after the atomic rename but before the PUBLISHED marker is
+written, a repeated publish request validates the already moved canonical
+bundle and completes the marker. A completed publish request is idempotent
+and returns the same logical `bundle_object_id`.
+
+The sender-side replica worker treats `VERIFYING` as durable work. It does not
+re-enter the byte-transfer path. A restarted worker may issue the idempotent
+publish request again and reconcile the result without transferring the
+backup bundle again.
+
+A successful publish is finalized locally in one SQLite transaction:
+
+    insert REPLICA / AVAILABLE location
+    update replica task VERIFYING -> SUCCESS
+    unblock dependent child replica tasks
+
+This avoids a crash window in which a successful remote publication could be
+recorded only partially in the local catalog.
+
+Definitive receiver semantic rejection fails the replica task. An ambiguous
+SSH or process outcome after publication was requested leaves the task in
+`VERIFYING`, because the receiver may already have committed `PUBLISHED`.
+The next worker iteration reconciles the result by repeating the idempotent
+publish request rather than retransmitting backup bytes.
+
+Real end-to-end acceptance reused the R3.3 production transfer:
+
+    source node:
+        maker
+
+    source VM:
+        win10
+        vm_id = d9713d09-5b7f-45e6-97ac-c8e5ad771898
+
+    run:
+        15aa7dc1-66d2-4f2d-9cc7-fee4e5ce2d78
+
+    Restore Point:
+        cd4c302c-e710-4089-8f0b-21a64742991f
+
+    replica task:
+        72cff121-8d9d-48ad-9972-3e50879ffe54
+
+    receiver:
+        62.205.155.66:22022
+
+    receiver storage_id:
+        540459e8-2555-43eb-8527-99853ba96ea7
+
+    SSH destination:
+        a2ef055f-397d-45e3-b493-3336112353f1
+
+The existing real receiver staging tree contained:
+
+    domain.xml
+    manifest.json
+    restore-point.json
+    disks/sda.qcow2
+
+The staged qcow2 file size was:
+
+    49904353280 bytes
+
+Its virtual capacity reported by `qemu-img info` was:
+
+    107374182400 bytes
+
+Before publication, read-only `qemu-img check` returned:
+
+    check-errors = 0
+
+The Fedora 44 receiver was upgraded with the R3.4 package before publication.
+The same-NVR package replacement preserved the complete R3.3 staging tree,
+transfer record, receipt, metadata hashes, qcow2 size, configuration, receiver
+services, and persistent SSH state.
+
+The real publish operation returned:
+
+    status = PUBLISHED
+
+with logical object identity:
+
+    vms/d9713d09-5b7f-45e6-97ac-c8e5ad771898/2026/08/20260819T200153Z_15aa7dc1-66d2-4f2d-9cc7-fee4e5ce2d78
+
+After publication:
+
+- the bundle existed only at its canonical final location;
+- `transfer.json` and `receipt.json` remained in receiver staging;
+- durable `publish-intent.json` existed;
+- the receiver PUBLISHED marker existed;
+- the marker recorded FULL, sequence zero, no parent, and the expected VM,
+  run, chain, Restore Point, transfer, and storage identities;
+- the final qcow2 passed `qemu-img check` with `check-errors = 0`;
+- a second identical publish request returned `PUBLISHED` with the identical
+  `bundle_object_id`, proving idempotent publication.
+
+Receiver filesystem access was also validated after publication:
+
+- the `vmbackupd` service account could read the published qcow2;
+- the restricted `vmbackupd-transfer` account could no longer traverse the
+  canonical `vms/...` hierarchy;
+- the restricted transfer account therefore could neither read nor modify the
+  published qcow2 through its canonical path.
+
+The Fedora 41 maker was then upgraded with the R3.4 package.
+
+Before restart:
+
+    replica task state = VERIFYING
+    attempts = 1
+    REPLICA location = absent
+
+After the upgraded replica worker reconciled the already published receiver
+object:
+
+    replica task state = SUCCESS
+    attempts = 1
+    last_error = null
+
+and:
+
+    location role = REPLICA
+    location state = AVAILABLE
+    verified_at = 2026-08-20T07:39:09.854276+00:00
+
+The persisted remote `bundle_object_id` matched the receiver publication
+result exactly.
+
+`attempts` remained `1`. Therefore the original approximately 49.9 GB qcow2
+was not retransmitted during recovery from the durable R3.3 `VERIFYING`
+boundary.
+
+Acceptance also passed:
+
+- focused R3.4 pytest regression;
+- full project pytest regression;
+- Python syntax compilation;
+- Fedora 41 unified Release 3 RPM build;
+- native Fedora 44 SRPM rebuild;
+- receiver package replacement;
+- maker package replacement;
+- receiver service restart;
+- maker daemon restart;
+- remote semantic verification;
+- atomic receiver publication;
+- publication idempotency;
+- local transactional REPLICA finalization.
+
+R3.4 therefore completes remote replica verification and publication.
+
+Restore execution and restore acceptance from the remote REPLICA remain
+outside R3.4 and are the next milestone.
+
+---
+
 # Current position
 
 Current implementation milestone:
 
-    R3.3 SSH sender transfer — CLOSED
+    R3.4 remote semantic verification and atomic replica publication — CLOSED
 
 Closing implementation head:
 
-    1194ed8 — Isolate replica worker failures
+    c2727c7 — Finalize remote replica publication
+
+Supporting receiver publication commit:
+
+    7e7613e — Add remote replica verification and publication
 
 Next implementation milestone:
 
-    R3.4 remote semantic verification and atomic replica publication
+    R3.5 remote replica restore acceptance
 
 Current safety boundary:
 
