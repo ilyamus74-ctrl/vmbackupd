@@ -516,6 +516,7 @@ class VmbackupApplication:
                     remote_storage_id
                 )
             )
+            remote_node_id = None
 
             if discover:
                 discovery = self.ssh_storage_discover(
@@ -529,7 +530,33 @@ class VmbackupApplication:
                     remote_storage_id,
                 )
 
-            return remote_storage_id, None
+                node = discovery.get("node")
+                if not isinstance(node, dict):
+                    raise ApplicationError(
+                        "SSH_STORAGE_DISCOVERY_PROTOCOL_INVALID",
+                        "receiver node identity is missing",
+                    )
+
+                node_id = node.get("node_id")
+                node_name = node.get("node_name")
+                if (
+                    not isinstance(node_id, str)
+                    or not node_id.strip()
+                    or not isinstance(node_name, str)
+                    or not node_name.strip()
+                ):
+                    raise ApplicationError(
+                        "SSH_STORAGE_DISCOVERY_PROTOCOL_INVALID",
+                        "receiver node identity is invalid",
+                    )
+
+                registered = self.repository.register_discovered_node(
+                    node_id,
+                    node_name,
+                )
+                remote_node_id = registered.id
+
+            return remote_storage_id, None, remote_node_id
 
         if ssh_remote_root is not None:
             try:
@@ -542,7 +569,7 @@ class VmbackupApplication:
                     "ssh_remote_root must be absolute and traversal-free",
                 ) from None
 
-            return None, str(remote_root)
+            return None, str(remote_root), None
 
         raise ApplicationError(
             "SSH_REMOTE_STORAGE_REQUIRED",
@@ -577,9 +604,10 @@ class VmbackupApplication:
         profile = self._seed_access_profile()
         destination_id = new_id()
         managed_staging = False
+        remote_node_id = None
 
         if transport is StorageType.SSH:
-            remote_storage_id, ssh_remote_root = (
+            remote_storage_id, ssh_remote_root, remote_node_id = (
                 self._validate_ssh_remote_identity(
                     ssh_host,
                     ssh_port,
@@ -633,6 +661,7 @@ class VmbackupApplication:
                 ssh_user=ssh_user,
                 ssh_remote_root=ssh_remote_root,
                 remote_storage_id=remote_storage_id,
+                remote_node_id=remote_node_id,
             )
 
             created = self.repository.create_storage_destination(
@@ -707,6 +736,8 @@ class VmbackupApplication:
         ):
             self._prepare_local_storage(backup_data_root)
 
+        discovered_remote_node_id = None
+
         if current.storage_type is StorageType.SSH:
             candidate_host = (
                 current.ssh_host
@@ -748,6 +779,7 @@ class VmbackupApplication:
             (
                 candidate_remote_storage_id,
                 candidate_root,
+                discovered_remote_node_id,
             ) = self._validate_ssh_remote_identity(
                 candidate_host,
                 candidate_port,
@@ -762,9 +794,7 @@ class VmbackupApplication:
             )
 
             if remote_storage_id is not _UNSET:
-                remote_storage_id = (
-                    candidate_remote_storage_id
-                )
+                remote_storage_id = candidate_remote_storage_id
 
             if ssh_remote_root is not _UNSET:
                 ssh_remote_root = candidate_root
@@ -779,6 +809,9 @@ class VmbackupApplication:
         ):
             if candidate is not _UNSET:
                 transport_patch[key] = candidate
+
+        if discovered_remote_node_id is not None:
+            transport_patch["remote_node_id"] = discovered_remote_node_id
 
         value = self.repository.update_storage_destination(
             self.node.id,

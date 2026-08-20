@@ -77,6 +77,29 @@ def drop_v12_replica_tables(connection):
     connection.execute("DROP TABLE backup_job_replicas")
 
 
+def drop_v15_remote_node_binding(
+    connection,
+):
+    """Remove CURRENT-v15 remote-node placement before historical downgrade."""
+
+    connection.execute(
+        "DROP TRIGGER IF EXISTS "
+        "storage_destination_remote_node_immutable_after_run"
+    )
+
+    columns = {
+        row[1]
+        for row in connection.execute(
+            "PRAGMA table_info(storage_destinations)"
+        )
+    }
+
+    if "remote_node_id" in columns:
+        connection.execute(
+            "ALTER TABLE storage_destinations "
+            "DROP COLUMN remote_node_id"
+        )
+
 def version_one_database(path):
     repository = SQLiteRepository(path)
     node, first, _, vm = catalog(repository)
@@ -85,6 +108,7 @@ def version_one_database(path):
     run = repository.create_manual_run(job.id, node.id, NOW)
     repository.close()
     connection = sqlite3.connect(path)
+    drop_v15_remote_node_binding(connection)
     connection.execute("PRAGMA foreign_keys = OFF")
     drop_v12_replica_tables(connection)
     drop_v9_schedule_columns(connection)

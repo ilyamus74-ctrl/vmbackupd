@@ -120,4 +120,5 @@ def storage(value: StorageDestination, *, free_bytes: int | None,
             "ssh_user": value.ssh_user,
             "ssh_remote_root": value.ssh_remote_root,
             "remote_storage_id": value.remote_storage_id,
+            "remote_node_id": value.remote_node_id,
             "type": "Local" if value.storage_type.value == "LOCAL" else "SSH"}

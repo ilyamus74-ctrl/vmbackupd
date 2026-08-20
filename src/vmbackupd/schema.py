@@ -9,7 +9,7 @@ import sqlite3
 from collections.abc import Callable, Mapping
 
 
-CURRENT_SCHEMA_VERSION = 14
+CURRENT_SCHEMA_VERSION = 15
 
 
 class SchemaError(RuntimeError):
@@ -318,6 +318,16 @@ CURRENT_SCHEMA_STATEMENTS = (
                 remote_storage_id IS NULL
                 OR length(trim(remote_storage_id)) > 0
             ),
+        remote_node_id TEXT
+            REFERENCES nodes(id)
+            CHECK(
+                remote_node_id IS NULL
+                OR (
+                    length(trim(remote_node_id)) > 0
+                    AND storage_type = 'SSH'
+                    AND remote_storage_id IS NOT NULL
+                )
+            ),
         UNIQUE(node_id, name)
     )""",
     """CREATE TABLE backup_jobs (
@@ -566,6 +576,26 @@ CURRENT_SCHEMA_STATEMENTS = (
         BEGIN
             SELECT RAISE(ABORT, 'storage destination physical identity is immutable');
         END""",
+    """CREATE TRIGGER storage_destination_remote_node_immutable_after_run
+        BEFORE UPDATE OF remote_node_id
+        ON storage_destinations
+        WHEN EXISTS (
+            SELECT 1
+            FROM job_runs
+            WHERE storage_destination_id = OLD.id
+        )
+        AND NEW.remote_node_id IS NOT OLD.remote_node_id
+        AND NOT (
+            OLD.remote_node_id IS NULL
+            AND NEW.remote_node_id IS NOT NULL
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'storage destination physical identity is immutable'
+            );
+        END""",
+
 )
 
 
@@ -574,7 +604,7 @@ CURRENT_COLUMNS = {
     "vms": {"id", "node_id", "name", "external_id", "libvirt_domain_uuid", "created_at"},
     "storage_destinations": {"id", "node_id", "name", "backup_data_root",
                              "storage_type", "ssh_host", "ssh_port", "ssh_user",
-                             "ssh_remote_root", "remote_storage_id",
+                             "ssh_remote_root", "remote_storage_id", "remote_node_id",
                              "backup_data_mode", "backup_data_uid", "backup_data_gid",
                              "minimum_free_bytes", "minimum_free_percent", "is_default",
                              "created_at"},
@@ -656,8 +686,17 @@ CURRENT_COLUMNS = {
     },
 }
 
+VERSION_14_COLUMNS = {
+    name: set(columns)
+    for name, columns in CURRENT_COLUMNS.items()
+}
+VERSION_14_COLUMNS["storage_destinations"].remove(
+    "remote_node_id"
+)
+
 VERSION_13_COLUMNS = {
-    name: set(columns) for name, columns in CURRENT_COLUMNS.items()
+    name: set(columns)
+    for name, columns in VERSION_14_COLUMNS.items()
 }
 VERSION_13_COLUMNS.pop(
     "restore_operations"
@@ -742,7 +781,10 @@ LEGACY_COLUMNS["backup_artifacts"] -= {
 
 REQUIRED_FOREIGN_KEYS = {
     "vms": {("node_id", "nodes", "id")},
-    "storage_destinations": {("node_id", "nodes", "id")},
+    "storage_destinations": {
+        ("node_id", "nodes", "id"),
+        ("remote_node_id", "nodes", "id"),
+    },
     "backup_jobs": {("vm_id", "vms", "id"),
                     ("storage_destination_id", "storage_destinations", "id")},
     "job_runs": {("job_id", "backup_jobs", "id"),
@@ -817,6 +859,7 @@ REQUIRED_TRIGGERS = {
     "storage_destination_transport_contract_insert",
     "storage_destination_transport_contract_update",
     "storage_destination_identity_immutable_after_run",
+    "storage_destination_remote_node_immutable_after_run",
 }
 
 VERSION_2_TRIGGERS = {
@@ -829,9 +872,10 @@ VERSION_4_TO_9_REQUIRED_TRIGGERS = VERSION_2_TRIGGERS | {
     "storage_destination_identity_immutable_after_run",
 }
 
-DESTINATION_TRIGGER_STATEMENTS = CURRENT_SCHEMA_STATEMENTS[-6:-3]
-STORAGE_TRANSPORT_TRIGGER_STATEMENTS = CURRENT_SCHEMA_STATEMENTS[-3:-1]
-STORAGE_IDENTITY_TRIGGER_SQL = CURRENT_SCHEMA_STATEMENTS[-1]
+DESTINATION_TRIGGER_STATEMENTS = CURRENT_SCHEMA_STATEMENTS[-7:-4]
+STORAGE_TRANSPORT_TRIGGER_STATEMENTS = CURRENT_SCHEMA_STATEMENTS[-4:-2]
+STORAGE_IDENTITY_TRIGGER_SQL = CURRENT_SCHEMA_STATEMENTS[-2]
+STORAGE_REMOTE_NODE_TRIGGER_SQL = CURRENT_SCHEMA_STATEMENTS[-1]
 
 VERSION_10_STORAGE_TRANSPORT_TRIGGER_STATEMENTS = (
     """CREATE TRIGGER storage_destination_transport_contract_insert
@@ -1261,6 +1305,7 @@ def validate_current_schema(connection: sqlite3.Connection) -> None:
                    OR ssh_user IS NOT NULL
                    OR ssh_remote_root IS NOT NULL
                    OR remote_storage_id IS NOT NULL
+                   OR remote_node_id IS NOT NULL
                )
            )
            OR (
@@ -1273,6 +1318,10 @@ def validate_current_schema(connection: sqlite3.Connection) -> None:
                    OR ssh_port > 65535
                    OR ssh_user IS NULL
                    OR length(trim(ssh_user)) = 0
+                   OR (
+                       remote_node_id IS NOT NULL
+                       AND remote_storage_id IS NULL
+                   )
                    OR NOT (
                        (
                            remote_storage_id IS NOT NULL
@@ -1846,6 +1895,34 @@ def migrate_13_to_14(
     )
 
 
+def migrate_14_to_15(
+    connection: sqlite3.Connection,
+) -> None:
+    """Bind stable remote storage identity to a discovered node."""
+
+    _validate_fingerprint(
+        connection,
+        VERSION_14_COLUMNS,
+    )
+
+    connection.execute(
+        """ALTER TABLE storage_destinations
+           ADD COLUMN remote_node_id TEXT
+           REFERENCES nodes(id)
+           CHECK(
+               remote_node_id IS NULL
+               OR (
+                   length(trim(remote_node_id)) > 0
+                   AND storage_type = 'SSH'
+                   AND remote_storage_id IS NOT NULL
+               )
+           )"""
+    )
+
+    connection.execute(
+        STORAGE_REMOTE_NODE_TRIGGER_SQL
+    )
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: migrate_0_to_1,
     1: migrate_1_to_2,
@@ -1861,6 +1938,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     11: migrate_11_to_12,
     12: migrate_12_to_13,
     13: migrate_13_to_14,
+    14: migrate_14_to_15,
 }
 
 

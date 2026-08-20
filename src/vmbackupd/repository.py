@@ -119,11 +119,48 @@ class SQLiteRepository:
         self.add_vm(vm)
         return vm
 
+    def register_discovered_node(self, node_id: str, name: str) -> Node:
+        """Register discovered receiver identity fail-closed."""
+        if (
+            not isinstance(node_id, str)
+            or not node_id.strip()
+            or not isinstance(name, str)
+            or not name.strip()
+        ):
+            raise DomainInvariantError("REMOTE_NODE_IDENTITY_CONFLICT")
+
+        node_id = node_id.strip()
+        name = name.strip()
+
+        existing_by_id = self.connection.execute(
+            "SELECT id, name FROM nodes WHERE id = ?", (node_id,)
+        ).fetchone()
+        if existing_by_id is not None:
+            if existing_by_id["name"] != name:
+                raise DomainInvariantError("REMOTE_NODE_IDENTITY_CONFLICT")
+            return self.get_node(node_id)
+
+        existing_by_name = self.connection.execute(
+            "SELECT id FROM nodes WHERE name = ? LIMIT 1", (name,)
+        ).fetchone()
+        if existing_by_name is not None:
+            raise DomainInvariantError("REMOTE_NODE_IDENTITY_CONFLICT")
+
+        value = Node(id=node_id, name=name)
+        try:
+            self.add_node(value)
+        except sqlite3.IntegrityError as exc:
+            raise DomainInvariantError(
+                "REMOTE_NODE_IDENTITY_CONFLICT"
+            ) from exc
+
+        return self.get_node(node_id)
+
     def add_storage_destination(self, value: StorageDestination) -> None:
         self._insert("storage_destinations", value, (
             "id", "node_id", "name", "backup_data_root",
             "storage_type", "ssh_host", "ssh_port", "ssh_user", "ssh_remote_root",
-            "remote_storage_id",
+            "remote_storage_id", "remote_node_id",
             "backup_data_mode", "backup_data_uid", "backup_data_gid",
             "minimum_free_bytes", "minimum_free_percent", "is_default", "created_at",
         ))
@@ -151,6 +188,7 @@ class SQLiteRepository:
             ssh_user=row["ssh_user"],
             ssh_remote_root=row["ssh_remote_root"],
             remote_storage_id=row["remote_storage_id"],
+            remote_node_id=row["remote_node_id"],
             backup_data_mode=row["backup_data_mode"], backup_data_uid=row["backup_data_uid"],
             backup_data_gid=row["backup_data_gid"], minimum_free_bytes=row["minimum_free_bytes"],
             minimum_free_percent=row["minimum_free_percent"], is_default=bool(row["is_default"]),
@@ -295,6 +333,7 @@ class SQLiteRepository:
                 value.ssh_user,
                 value.ssh_remote_root,
                 value.remote_storage_id,
+                value.remote_node_id,
             )):
                 raise DomainInvariantError(
                     "STORAGE_TRANSPORT_INVALID"
@@ -316,9 +355,8 @@ class SQLiteRepository:
 
             remote_root = value.ssh_remote_root
             remote_storage_id = value.remote_storage_id
+            remote_node_id = value.remote_node_id
 
-            # One and only one remote identity contract:
-            # legacy path OR stable receiver storage ID.
             if (
                 (remote_root is None)
                 == (remote_storage_id is None)
@@ -331,6 +369,16 @@ class SQLiteRepository:
                 if (
                     not isinstance(remote_storage_id, str)
                     or not remote_storage_id.strip()
+                ):
+                    raise DomainInvariantError(
+                        "STORAGE_REMOTE_IDENTITY_INVALID"
+                    )
+
+            if remote_node_id is not None:
+                if (
+                    remote_storage_id is None
+                    or not isinstance(remote_node_id, str)
+                    or not remote_node_id.strip()
                 ):
                     raise DomainInvariantError(
                         "STORAGE_REMOTE_IDENTITY_INVALID"
@@ -368,6 +416,15 @@ class SQLiteRepository:
             self.connection.execute("BEGIN IMMEDIATE")
             self.get_node(value.node_id)
             self._validate_storage_fields(value)
+
+            if value.remote_node_id is not None:
+                try:
+                    self.get_node(value.remote_node_id)
+                except KeyError as exc:
+                    raise DomainInvariantError(
+                        "REMOTE_NODE_NOT_REGISTERED"
+                    ) from exc
+
             self._validate_storage_uniqueness(
                 value.node_id, value.name, value.backup_data_root,
             )
@@ -383,12 +440,12 @@ class SQLiteRepository:
                 """INSERT INTO storage_destinations (
                        id, node_id, name, backup_data_root,
                        storage_type, ssh_host, ssh_port, ssh_user, ssh_remote_root,
-                       remote_storage_id,
+                       remote_storage_id, remote_node_id,
                        backup_data_mode, backup_data_uid, backup_data_gid,
                        minimum_free_bytes, minimum_free_percent,
                        is_default, created_at
                    )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     value.id,
                     value.node_id,
@@ -400,6 +457,7 @@ class SQLiteRepository:
                     value.ssh_user,
                     value.ssh_remote_root,
                     value.remote_storage_id,
+                    value.remote_node_id,
                     value.backup_data_mode,
                     value.backup_data_uid,
                     value.backup_data_gid,
@@ -426,7 +484,7 @@ class SQLiteRepository:
         storage_type=_STORAGE_UNSET,
         ssh_host=_STORAGE_UNSET, ssh_port=_STORAGE_UNSET,
         ssh_user=_STORAGE_UNSET, ssh_remote_root=_STORAGE_UNSET,
-        remote_storage_id=_STORAGE_UNSET,
+        remote_storage_id=_STORAGE_UNSET, remote_node_id=_STORAGE_UNSET,
     ) -> StorageDestination:
         try:
             self.connection.execute("BEGIN IMMEDIATE")
@@ -473,6 +531,11 @@ class SQLiteRepository:
                     if remote_storage_id is _STORAGE_UNSET
                     else remote_storage_id
                 ),
+                remote_node_id=(
+                    current.remote_node_id
+                    if remote_node_id is _STORAGE_UNSET
+                    else remote_node_id
+                ),
                 backup_data_mode=current.backup_data_mode,
                 backup_data_uid=current.backup_data_uid,
                 backup_data_gid=current.backup_data_gid,
@@ -484,6 +547,15 @@ class SQLiteRepository:
                 is_default=current.is_default or make_default,
             )
             self._validate_storage_fields(updated)
+
+            if updated.remote_node_id is not None:
+                try:
+                    self.get_node(updated.remote_node_id)
+                except KeyError as exc:
+                    raise DomainInvariantError(
+                        "REMOTE_NODE_NOT_REGISTERED"
+                    ) from exc
+
             if self.storage_destination_identity_locked(node_id, destination_id) and (
                 updated.backup_data_root != current.backup_data_root
                 or updated.storage_type != current.storage_type
@@ -492,6 +564,13 @@ class SQLiteRepository:
                 or updated.ssh_user != current.ssh_user
                 or updated.ssh_remote_root != current.ssh_remote_root
                 or updated.remote_storage_id != current.remote_storage_id
+                or (
+                    updated.remote_node_id != current.remote_node_id
+                    and not (
+                        current.remote_node_id is None
+                        and updated.remote_node_id is not None
+                    )
+                )
             ):
                 raise DomainInvariantError(
                     "STORAGE_DESTINATION_IDENTITY_LOCKED"
@@ -509,7 +588,7 @@ class SQLiteRepository:
                    backup_data_root = ?,
                    storage_type = ?, ssh_host = ?, ssh_port = ?,
                    ssh_user = ?, ssh_remote_root = ?,
-                   remote_storage_id = ?,
+                   remote_storage_id = ?, remote_node_id = ?,
                    minimum_free_bytes = ?, minimum_free_percent = ?,
                    is_default = ? WHERE id = ? AND node_id = ?""",
                 (
@@ -521,6 +600,7 @@ class SQLiteRepository:
                     updated.ssh_user,
                     updated.ssh_remote_root,
                     updated.remote_storage_id,
+                    updated.remote_node_id,
                     updated.minimum_free_bytes,
                     updated.minimum_free_percent,
                     int(updated.is_default),

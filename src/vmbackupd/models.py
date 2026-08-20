@@ -533,6 +533,7 @@ class StorageDestination:
     remote_storage_id: str | None = None
     id: str = field(default_factory=new_id)
     created_at: datetime = field(default_factory=utcnow)
+    remote_node_id: str | None = None
 
 
 @dataclass(slots=True)

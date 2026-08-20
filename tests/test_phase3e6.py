@@ -58,7 +58,31 @@ def catalog(repository, tmp_path):
     return node, first, vm
 
 
+def drop_v15_remote_node_binding(
+    connection,
+):
+    """Remove CURRENT-v15 remote-node placement before historical downgrade."""
+
+    connection.execute(
+        "DROP TRIGGER IF EXISTS "
+        "storage_destination_remote_node_immutable_after_run"
+    )
+
+    columns = {
+        row[1]
+        for row in connection.execute(
+            "PRAGMA table_info(storage_destinations)"
+        )
+    }
+
+    if "remote_node_id" in columns:
+        connection.execute(
+            "ALTER TABLE storage_destinations "
+            "DROP COLUMN remote_node_id"
+        )
+
 def drop_v10_storage_transport(connection):
+    drop_v15_remote_node_binding(connection)
     for trigger in (
         "storage_destination_transport_contract_insert",
         "storage_destination_transport_contract_update",
