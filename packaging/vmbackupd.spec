@@ -2,7 +2,7 @@
 
 Name:           vmbackupd
 Version:        %{upstream_version}
-Release:        3%{?dist}
+Release:        4%{?dist}
 Summary:        Local KVM/libvirt backup management daemon
 License:        LicenseRef-Proprietary
 Source0:        %{name}-%{version}.tar.gz
@@ -168,6 +168,13 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-resolver@.service \
 %{_datadir}/cockpit/vmbackupd/
 
 %changelog
+* Thu Aug 20 2026 vmbackupd packagers <packagers@example.invalid> - 0.1.0-4
+- Update runtime and database support through schema version 17
+- Fix reclaim recovery blocked by terminal historical job runs
+- Preserve destructive reclaim recovery after later policy changes
+- Clear stale reclaim errors after successful completion
+- Improve capacity inspection diagnostics
+
 * Tue Aug 18 2026 vmbackupd packagers <packagers@example.invalid> - 0.1.0-3
 - Add Cockpit SSH receiver authorization controls
 - Manage SSH staging paths automatically
