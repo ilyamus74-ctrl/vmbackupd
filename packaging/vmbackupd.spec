@@ -2,7 +2,7 @@
 
 Name:           vmbackupd
 Version:        %{upstream_version}
-Release:        6%{?dist}
+Release:        7%{?dist}
 Summary:        Local KVM/libvirt backup management daemon
 License:        LicenseRef-Proprietary
 Source0:        %{name}-%{version}.tar.gz
@@ -168,6 +168,11 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-resolver@.service \
 %{_datadir}/cockpit/vmbackupd/
 
 %changelog
+* Thu Aug 20 2026 vmbackupd packagers <packagers@example.invalid> - 0.1.0-7
+- Abort rejected PLANNED reclaim operations before destructive work begins
+- Prevent replica, policy, or snapshot safety refusals from leaving stale reclaim operations
+- Preserve RECOVERY_REQUIRED handling for failures after destructive reclaim starts
+
 * Thu Aug 20 2026 vmbackupd packagers <packagers@example.invalid> - 0.1.0-6
 - Make Full backups to retain authoritative for FULL-only jobs
 - Keep restore-point retention semantics for incremental chains
