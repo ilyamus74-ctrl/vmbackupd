@@ -3482,23 +3482,123 @@ exists on the controller node.
 
 ### A3.5.2 local source verification and materialization
 
-Validate the exact frozen local source bundle before restoring:
+**Status: CLOSED**
 
-    source_bundle_object_id
-        -> immutable published source
-        -> structural and semantic verification
+Implementation commit:
 
-The source bundle remains read-only.
+    fd73b6125baf33d6d3a9125b4886c5d85f702c1c
+    fd73b61 feat: add local restore source materialization
 
-Materialization creates a separate operation-owned target workspace under the
-planned target_root.
+Delivered LOCAL restore execution boundary:
 
-Restore execution must never modify, rename, delete, rebase, or otherwise
-mutate the successful backup bundle being used as the source.
+    PLANNED
+        -> VERIFYING
+        -> MATERIALIZING
+        -> DEFINING
 
-Materialization must preserve sparse disk behavior where applicable and use
-safe filesystem operations that reject symlinks, unsafe traversal, and
-unexpected existing objects.
+Verification failure boundary:
+
+    VERIFYING
+        -> FAILED
+
+Unsafe materialization failure boundary:
+
+    MATERIALIZING
+        -> RECOVERY_REQUIRED
+
+with durable:
+
+    recovery_from_state = MATERIALIZING
+
+Source verification guarantees:
+
+- restore execution is limited to a frozen LOCAL PRIMARY source;
+- `source_bundle_object_id` remains the immutable source identity;
+- the bundle must resolve inside the configured LOCAL
+  `backup_data_root`;
+- canonical bundle layout is required:
+  `metadata/` plus `disks/`;
+- canonical metadata files are required:
+  `domain.xml`, `manifest.json`, and `restore-point.json`;
+- restore metadata is matched against the selected catalog
+  `RestorePoint`;
+- job run, chain, backup kind, sequence, parent point, VM identity,
+  domain UUID, disk set, disk paths, sizes, and capacities are
+  cross-validated;
+- domain XML, manifest, and restore-point metadata must agree;
+- source bundle symlinks are rejected;
+- source files with multiple hard links are rejected;
+- path escape and unexpected bundle entries are rejected;
+- source files are opened read-only with no-follow semantics;
+- source device, inode, size, link count, and modification identity
+  are captured and rechecked;
+- a source changed after VERIFYING is refused before successful
+  materialization;
+- each restore disk must be qcow2;
+- `qemu-img info --force-share` validates image format, virtual
+  capacity, dirty/corrupt metadata, and expected image properties;
+- `qemu-img check` must report no structural errors.
+
+Materialization guarantees:
+
+- backup source files are never modified;
+- target disks are independent filesystem objects and are never
+  hard links to the source;
+- sparse qcow2 allocation is preserved using
+  `SEEK_DATA` / `SEEK_HOLE`;
+- restore staging is deterministic and operation-owned;
+- partial materialization remains private staging evidence and is
+  never exposed as a completed `target_root`;
+- target hierarchy traversal is descriptor-relative from `/` with
+  directory and no-follow semantics;
+- target files are created exclusively with no-follow semantics;
+- files and relevant directories are fsynced before publication;
+- a `.vmbackupd-restore.json` marker binds the materialized target
+  to the restore operation, restore point, source bundle, target VM,
+  and target domain UUID;
+- publication uses Linux
+  `renameat2(..., RENAME_NOREPLACE)`;
+- an existing or concurrently appearing `target_root` is never
+  replaced;
+- unsupported atomic no-replace publication fails closed.
+
+Execution orchestration guarantees:
+
+- `VERIFYING` remains read-only and retry-safe;
+- filesystem mutation starts only after the durable transition to
+  `MATERIALIZING`;
+- verification errors become terminal `FAILED`;
+- materialization errors become `RECOVERY_REQUIRED`;
+- successful durable target publication is followed by
+  `MATERIALIZING -> DEFINING`;
+- an already unsafe `MATERIALIZING` operation is never
+  automatically resumed or guessed after restart.
+
+Acceptance evidence:
+
+- dedicated LOCAL restore materialization/safety suite:
+  17 tests passed;
+- existing restore/bundle/receiver boundary suite passed;
+- full project pytest regression: 100% passed;
+- Python compileall: rc=0;
+- `git diff --check`: clean;
+- source symlink rejection covered by regression test;
+- source hard-link rejection covered by regression test;
+- post-verification source mutation detection covered by regression
+  test;
+- atomic destination no-replace behavior covered by regression test;
+- no ordinary `os.rename()` publication remains;
+- no reflink, hardlink, or generic copy shortcut is used;
+- no libvirt define/start operation introduced;
+- no SSH restore acquisition introduced.
+
+A3.5.2 deliberately stops at `DEFINING`.
+
+It does not define or start a libvirt domain. Those operations belong
+to A3.5.3.
+
+The next restore implementation stage is A3.5.3: libvirt definition
+and disconnected restore.
 
 ### A3.5.3 libvirt definition and disconnected restore
 
