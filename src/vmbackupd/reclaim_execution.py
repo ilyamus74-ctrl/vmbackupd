@@ -367,6 +367,10 @@ class ReclaimExecutor:
                     restore_point_id=(
                         bundle.restore_point_id
                     ),
+                    destination_id=bundle.destination_id,
+                    source_bundle_object_id=(
+                        bundle.source_bundle_object_id
+                    ),
                 )
             )
 
@@ -400,6 +404,7 @@ class ReclaimExecutor:
                     restore_point_id=(
                         bundle.restore_point_id
                     ),
+                    destination_id=bundle.destination_id,
                 )
             else:
                 if not presence.quarantine_exists:
@@ -417,6 +422,7 @@ class ReclaimExecutor:
                         restore_point_id=(
                             bundle.restore_point_id
                         ),
+                        destination_id=bundle.destination_id,
                     )
                 )
 
@@ -432,7 +438,8 @@ class ReclaimExecutor:
 
             self.repository.mark_reclaim_bundle_quarantined(
                 bundle.operation_id,
-                bundle.restore_point_id,
+                bundle.destination_id,
+                bundle.source_bundle_object_id,
                 quarantine_object_id=(
                     result.quarantine_object_id
                 ),
@@ -486,6 +493,10 @@ class ReclaimExecutor:
         presence = self.purger.inspect_reclaim_presence(
             operation_id=bundle.operation_id,
             restore_point_id=bundle.restore_point_id,
+            destination_id=bundle.destination_id,
+            source_bundle_object_id=(
+                bundle.source_bundle_object_id
+            ),
         )
 
         if (
@@ -503,6 +514,7 @@ class ReclaimExecutor:
             ),
             operation_id=bundle.operation_id,
             restore_point_id=bundle.restore_point_id,
+            destination_id=bundle.destination_id,
         )
 
         expected = (
@@ -547,7 +559,8 @@ class ReclaimExecutor:
                 bundle = (
                     self.repository.begin_reclaim_bundle_purge(
                         operation_id,
-                        bundle.restore_point_id,
+                        bundle.destination_id,
+                        bundle.source_bundle_object_id,
                     )
                 )
 
@@ -565,6 +578,10 @@ class ReclaimExecutor:
                         restore_point_id=(
                             bundle.restore_point_id
                         ),
+                        destination_id=bundle.destination_id,
+                        source_bundle_object_id=(
+                            bundle.source_bundle_object_id
+                        ),
                     )
                 )
 
@@ -578,7 +595,8 @@ class ReclaimExecutor:
                     # destructive step reached filesystem completion.
                     self.repository.mark_reclaim_bundle_purged(
                         operation_id,
-                        bundle.restore_point_id,
+                        bundle.destination_id,
+                        bundle.source_bundle_object_id,
                     )
                     continue
 
@@ -595,11 +613,19 @@ class ReclaimExecutor:
                     ),
                     source_device=bundle.source_device,
                     source_inode=bundle.source_inode,
+                    destination_id=bundle.destination_id,
+                    source_bundle_object_id=(
+                        bundle.source_bundle_object_id
+                    ),
                 )
 
                 after = self.purger.inspect_reclaim_presence(
                     operation_id=bundle.operation_id,
                     restore_point_id=bundle.restore_point_id,
+                    destination_id=bundle.destination_id,
+                    source_bundle_object_id=(
+                        bundle.source_bundle_object_id
+                    ),
                 )
 
                 if (
@@ -612,7 +638,8 @@ class ReclaimExecutor:
 
                 self.repository.mark_reclaim_bundle_purged(
                     operation_id,
-                    bundle.restore_point_id,
+                    bundle.destination_id,
+                    bundle.source_bundle_object_id,
                 )
                 continue
 
@@ -664,6 +691,10 @@ class ReclaimExecutor:
         presence = self.purger.inspect_reclaim_presence(
             operation_id=bundle.operation_id,
             restore_point_id=bundle.restore_point_id,
+            destination_id=bundle.destination_id,
+            source_bundle_object_id=(
+                bundle.source_bundle_object_id
+            ),
         )
 
         if (

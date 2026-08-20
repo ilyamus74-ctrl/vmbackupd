@@ -9,7 +9,7 @@ import sqlite3
 from collections.abc import Callable, Mapping
 
 
-CURRENT_SCHEMA_VERSION = 18
+CURRENT_SCHEMA_VERSION = 20
 
 
 class SchemaError(RuntimeError):
@@ -54,6 +54,75 @@ JOB_RUNS_TABLE_SQL = """CREATE TABLE job_runs (
 
 
 RECLAIM_SCHEMA_STATEMENTS = (
+    """CREATE TABLE reclaim_operations (
+        id TEXT PRIMARY KEY,
+        job_run_id TEXT NOT NULL REFERENCES job_runs(id),
+        job_id TEXT NOT NULL REFERENCES backup_jobs(id),
+        vm_id TEXT NOT NULL REFERENCES vms(id),
+        storage_destination_id TEXT NOT NULL REFERENCES storage_destinations(id),
+        purpose TEXT NOT NULL CHECK(purpose IN (
+            'CAPACITY', 'RETENTION'
+        )),
+        state TEXT NOT NULL CHECK(state IN (
+            'PLANNED', 'RETIRING', 'QUARANTINED', 'CATALOG_REMOVED',
+            'PURGING', 'PURGED', 'COMPLETED', 'RECOVERY_REQUIRED', 'ABORTED'
+        )),
+        required_backup_bytes INTEGER NOT NULL CHECK(required_backup_bytes >= 0),
+        free_bytes_before INTEGER NOT NULL CHECK(free_bytes_before >= 0),
+        reserve_bytes INTEGER NOT NULL CHECK(reserve_bytes >= 0),
+        expected_reclaim_bytes INTEGER NOT NULL CHECK(expected_reclaim_bytes >= 0),
+        free_bytes_after INTEGER CHECK(
+            free_bytes_after IS NULL OR free_bytes_after >= 0
+        ),
+        error TEXT,
+        recovery_from_state TEXT CHECK(
+            recovery_from_state IS NULL OR recovery_from_state IN (
+                'RETIRING', 'QUARANTINED', 'CATALOG_REMOVED',
+                'PURGING', 'PURGED'
+            )
+        ),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(job_run_id, purpose)
+    )""",
+    """CREATE TABLE reclaim_chains (
+        operation_id TEXT NOT NULL REFERENCES reclaim_operations(id),
+        chain_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+        expected_physical_bytes INTEGER NOT NULL
+            CHECK(expected_physical_bytes >= 0),
+        PRIMARY KEY(operation_id, chain_id),
+        UNIQUE(operation_id, ordinal)
+    )""",
+    """CREATE TABLE reclaim_bundles (
+        operation_id TEXT NOT NULL REFERENCES reclaim_operations(id),
+        chain_id TEXT NOT NULL,
+        restore_point_id TEXT NOT NULL,
+        destination_id TEXT NOT NULL REFERENCES storage_destinations(id),
+        source_bundle_object_id TEXT NOT NULL,
+        quarantine_object_id TEXT,
+        expected_physical_bytes INTEGER CHECK(
+            expected_physical_bytes IS NULL OR expected_physical_bytes >= 0
+        ),
+        source_device INTEGER,
+        source_inode INTEGER,
+        state TEXT NOT NULL CHECK(state IN (
+            'PLANNED', 'QUARANTINED', 'PURGING', 'PURGED'
+        )),
+        PRIMARY KEY(
+            operation_id,
+            destination_id,
+            source_bundle_object_id
+        ),
+        FOREIGN KEY(operation_id, chain_id)
+            REFERENCES reclaim_chains(operation_id, chain_id)
+    )""",
+    """CREATE INDEX reclaim_bundles_operation_restore_point_idx
+       ON reclaim_bundles(operation_id, restore_point_id)""",
+)
+
+
+VERSION_18_RECLAIM_SCHEMA_STATEMENTS = (
     """CREATE TABLE reclaim_operations (
         id TEXT PRIMARY KEY,
         job_run_id TEXT NOT NULL REFERENCES job_runs(id),
@@ -879,14 +948,28 @@ CURRENT_COLUMNS = {
     },
     "reclaim_bundles": {
         "operation_id", "chain_id", "restore_point_id",
+        "destination_id",
         "source_bundle_object_id", "quarantine_object_id",
         "expected_physical_bytes", "source_device", "source_inode", "state",
     },
 }
 
-VERSION_17_COLUMNS = {
+VERSION_19_COLUMNS = {
     name: set(columns)
     for name, columns in CURRENT_COLUMNS.items()
+}
+VERSION_19_COLUMNS["reclaim_bundles"].remove(
+    "destination_id"
+)
+
+VERSION_18_COLUMNS = {
+    name: set(columns)
+    for name, columns in VERSION_19_COLUMNS.items()
+}
+
+VERSION_17_COLUMNS = {
+    name: set(columns)
+    for name, columns in VERSION_18_COLUMNS.items()
 }
 VERSION_17_COLUMNS["reclaim_operations"].remove(
     "purpose"
@@ -2274,7 +2357,7 @@ def migrate_17_to_18(
         "RENAME TO reclaim_operations_v17"
     )
 
-    for statement in RECLAIM_SCHEMA_STATEMENTS:
+    for statement in VERSION_18_RECLAIM_SCHEMA_STATEMENTS:
         connection.execute(statement)
 
     connection.execute(
@@ -2373,6 +2456,189 @@ def migrate_17_to_18(
     )
 
 
+
+def migrate_18_to_19(
+    connection: sqlite3.Connection,
+) -> None:
+    """
+    Allow reclaim journal to track multiple physical locations
+    of the same restore point.
+
+    A restore point may have PRIMARY and REPLICA locations.
+    Reclaim must journal every removable physical object.
+    """
+    connection.execute(
+        "ALTER TABLE reclaim_bundles "
+        "RENAME TO reclaim_bundles_v18"
+    )
+
+    connection.execute(
+        """
+        CREATE TABLE reclaim_bundles (
+            operation_id TEXT NOT NULL
+                REFERENCES reclaim_operations(id),
+            chain_id TEXT NOT NULL,
+            restore_point_id TEXT NOT NULL,
+            source_bundle_object_id TEXT NOT NULL,
+            quarantine_object_id TEXT,
+            expected_physical_bytes INTEGER CHECK(
+                expected_physical_bytes IS NULL
+                OR expected_physical_bytes >= 0
+            ),
+            source_device INTEGER,
+            source_inode INTEGER,
+            state TEXT NOT NULL CHECK(state IN (
+                'PLANNED',
+                'QUARANTINED',
+                'PURGING',
+                'PURGED'
+            )),
+            PRIMARY KEY(
+                operation_id,
+                restore_point_id,
+                source_bundle_object_id
+            ),
+
+            UNIQUE(
+                operation_id,
+                source_bundle_object_id
+            ),
+
+            FOREIGN KEY(operation_id, chain_id)
+                REFERENCES reclaim_chains(operation_id, chain_id)
+        )
+        """
+    )
+
+    connection.execute(
+        """
+        INSERT INTO reclaim_bundles (
+            operation_id,
+            chain_id,
+            restore_point_id,
+            source_bundle_object_id,
+            quarantine_object_id,
+            expected_physical_bytes,
+            source_device,
+            source_inode,
+            state
+        )
+        SELECT
+            operation_id,
+            chain_id,
+            restore_point_id,
+            source_bundle_object_id,
+            quarantine_object_id,
+            expected_physical_bytes,
+            source_device,
+            source_inode,
+            state
+        FROM reclaim_bundles_v18
+        """
+    )
+
+    connection.execute(
+        "DROP TABLE reclaim_bundles_v18"
+    )
+
+
+
+
+
+def migrate_19_to_20(
+    connection: sqlite3.Connection,
+) -> None:
+    """Add destination identity to physical reclaim objects."""
+
+    _validate_fingerprint(
+        connection,
+        VERSION_19_COLUMNS,
+    )
+
+    connection.execute(
+        """
+        CREATE TABLE reclaim_bundles_v20 (
+            operation_id TEXT NOT NULL
+                REFERENCES reclaim_operations(id),
+            chain_id TEXT NOT NULL,
+            restore_point_id TEXT NOT NULL,
+            destination_id TEXT NOT NULL
+                REFERENCES storage_destinations(id),
+            source_bundle_object_id TEXT NOT NULL,
+            quarantine_object_id TEXT,
+            expected_physical_bytes INTEGER CHECK(
+                expected_physical_bytes IS NULL
+                OR expected_physical_bytes >= 0
+            ),
+            source_device INTEGER,
+            source_inode INTEGER,
+            state TEXT NOT NULL CHECK(state IN (
+                'PLANNED',
+                'QUARANTINED',
+                'PURGING',
+                'PURGED'
+            )),
+            PRIMARY KEY(
+                operation_id,
+                destination_id,
+                source_bundle_object_id
+            ),
+            FOREIGN KEY(operation_id, chain_id)
+                REFERENCES reclaim_chains(operation_id, chain_id)
+        )
+        """
+    )
+
+    connection.execute(
+        """
+        INSERT INTO reclaim_bundles_v20 (
+            operation_id,
+            chain_id,
+            restore_point_id,
+            destination_id,
+            source_bundle_object_id,
+            quarantine_object_id,
+            expected_physical_bytes,
+            source_device,
+            source_inode,
+            state
+        )
+        SELECT
+            rb.operation_id,
+            rb.chain_id,
+            rb.restore_point_id,
+            ro.storage_destination_id,
+            rb.source_bundle_object_id,
+            rb.quarantine_object_id,
+            rb.expected_physical_bytes,
+            rb.source_device,
+            rb.source_inode,
+            rb.state
+        FROM reclaim_bundles rb
+        JOIN reclaim_operations ro
+          ON ro.id = rb.operation_id
+        """
+    )
+
+    connection.execute(
+        "DROP TABLE reclaim_bundles"
+    )
+
+    connection.execute(
+        """
+        ALTER TABLE reclaim_bundles_v20
+        RENAME TO reclaim_bundles
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE INDEX reclaim_bundles_operation_restore_point_idx
+        ON reclaim_bundles(operation_id, restore_point_id)
+        """
+    )
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: migrate_0_to_1,
     1: migrate_1_to_2,
@@ -2392,6 +2658,8 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     15: migrate_15_to_16,
     16: migrate_16_to_17,
     17: migrate_17_to_18,
+    18: migrate_18_to_19,
+    19: migrate_19_to_20,
 }
 
 

@@ -50,7 +50,8 @@ class FakeRepository:
     def mark_reclaim_bundle_quarantined(
         self,
         operation_id,
-        restore_point_id,
+        destination_id,
+        source_bundle_object_id=None,
         *,
         quarantine_object_id,
         expected_physical_bytes,
@@ -58,7 +59,10 @@ class FakeRepository:
         source_inode,
     ):
         self.calls.append("bundle-quarantined")
-        bundle = self._bundle(restore_point_id)
+        bundle = self._bundle(
+            destination_id,
+            source_bundle_object_id,
+        )
         bundle.state = ReclaimBundleState.QUARANTINED
         bundle.quarantine_object_id = quarantine_object_id
         bundle.expected_physical_bytes = expected_physical_bytes
@@ -86,10 +90,14 @@ class FakeRepository:
     def begin_reclaim_bundle_purge(
         self,
         operation_id,
-        restore_point_id,
+        destination_id,
+        source_bundle_object_id=None,
     ):
         self.calls.append("bundle-purge-intent")
-        bundle = self._bundle(restore_point_id)
+        bundle = self._bundle(
+            destination_id,
+            source_bundle_object_id,
+        )
         assert bundle.state is ReclaimBundleState.QUARANTINED
         bundle.state = ReclaimBundleState.PURGING
         return bundle
@@ -97,10 +105,14 @@ class FakeRepository:
     def mark_reclaim_bundle_purged(
         self,
         operation_id,
-        restore_point_id,
+        destination_id,
+        source_bundle_object_id=None,
     ):
         self.calls.append("bundle-purged")
-        bundle = self._bundle(restore_point_id)
+        bundle = self._bundle(
+            destination_id,
+            source_bundle_object_id,
+        )
         assert bundle.state is ReclaimBundleState.PURGING
         bundle.state = ReclaimBundleState.PURGED
         return bundle
@@ -151,12 +163,23 @@ class FakeRepository:
         self.operation.recovery_from_state = None
         return self.operation
 
-    def _bundle(self, restore_point_id):
-        matches = [
-            bundle
-            for bundle in self.bundles
-            if bundle.restore_point_id == restore_point_id
-        ]
+    def _bundle(self, destination_id, source_bundle_object_id=None):
+        if source_bundle_object_id is None:
+            matches = [
+                bundle
+                for bundle in self.bundles
+                if bundle.restore_point_id == destination_id
+            ]
+        else:
+            matches = [
+                bundle
+                for bundle in self.bundles
+                if (
+                    bundle.destination_id == destination_id
+                    and bundle.source_bundle_object_id
+                        == source_bundle_object_id
+                )
+            ]
         assert len(matches) == 1
         return matches[0]
 
@@ -175,6 +198,7 @@ class FakeQuarantiner:
         source_bundle_object_id,
         operation_id,
         restore_point_id,
+        destination_id=None,
     ):
         self.calls.append("quarantine")
 
@@ -182,6 +206,12 @@ class FakeQuarantiner:
         destination = self.planner.reclaim(
             operation_id,
             restore_point_id,
+            destination_id=destination_id,
+            source_bundle_object_id=(
+                source_bundle_object_id
+                if destination_id is not None
+                else None
+            ),
         )
         destination.parent.mkdir(
             parents=True,
@@ -205,12 +235,19 @@ class FakeQuarantiner:
         source_bundle_object_id,
         operation_id,
         restore_point_id,
+        destination_id=None,
     ):
         self.calls.append("inspect-quarantine")
 
         destination = self.planner.reclaim(
             operation_id,
             restore_point_id,
+            destination_id=destination_id,
+            source_bundle_object_id=(
+                source_bundle_object_id
+                if destination_id is not None
+                else None
+            ),
         )
         info = destination.stat()
 
@@ -235,14 +272,20 @@ class FakePurger:
         *,
         operation_id,
         restore_point_id,
+        destination_id=None,
+        source_bundle_object_id=None,
     ):
         quarantine = self.planner.reclaim(
             operation_id,
             restore_point_id,
+            destination_id=destination_id,
+            source_bundle_object_id=source_bundle_object_id,
         )
         purging = self.planner.reclaim_purging(
             operation_id,
             restore_point_id,
+            destination_id=destination_id,
+            source_bundle_object_id=source_bundle_object_id,
         )
 
         return SimpleNamespace(
@@ -259,6 +302,8 @@ class FakePurger:
         expected_physical_bytes,
         source_device,
         source_inode,
+        destination_id=None,
+        source_bundle_object_id=None,
     ):
         self.calls.append("purge")
 
@@ -266,6 +311,8 @@ class FakePurger:
         purging = self.planner.reclaim_purging(
             operation_id,
             restore_point_id,
+            destination_id=destination_id,
+            source_bundle_object_id=source_bundle_object_id,
         )
 
         if quarantine.exists() and purging.exists():
@@ -318,6 +365,7 @@ def fixture(
         operation_id=OPERATION_ID,
         chain_id="chain",
         restore_point_id=RESTORE_POINT_ID,
+        destination_id=STORAGE_ID,
         source_bundle_object_id=str(source),
         state=bundle_state,
         quarantine_object_id=None,
@@ -362,6 +410,8 @@ def seed_quarantine(
     path = planner.reclaim(
         OPERATION_ID,
         RESTORE_POINT_ID,
+        destination_id=bundle.destination_id,
+        source_bundle_object_id=bundle.source_bundle_object_id,
     )
     path.parent.mkdir(
         parents=True,
@@ -405,6 +455,8 @@ def test_executor_drives_fresh_reclaim_to_completion(
     assert not planner.reclaim(
         OPERATION_ID,
         RESTORE_POINT_ID,
+        destination_id=bundle.destination_id,
+        source_bundle_object_id=bundle.source_bundle_object_id,
     ).exists()
 
     assert repository.calls == [
@@ -448,6 +500,8 @@ def test_retiring_reconciles_completed_quarantine_rename(
     quarantine = planner.reclaim(
         OPERATION_ID,
         RESTORE_POINT_ID,
+        destination_id=bundle.destination_id,
+        source_bundle_object_id=bundle.source_bundle_object_id,
     )
     quarantine.parent.mkdir(
         parents=True,
@@ -518,6 +572,8 @@ def test_purging_resumes_existing_purge_staging(
     staging = planner.reclaim_purging(
         OPERATION_ID,
         RESTORE_POINT_ID,
+        destination_id=bundle.destination_id,
+        source_bundle_object_id=bundle.source_bundle_object_id,
     )
     staging.parent.mkdir(
         parents=True,
@@ -531,6 +587,8 @@ def test_purging_resumes_existing_purge_staging(
         planner.reclaim(
             OPERATION_ID,
             RESTORE_POINT_ID,
+            destination_id=bundle.destination_id,
+            source_bundle_object_id=bundle.source_bundle_object_id,
         )
     )
     bundle.expected_physical_bytes = 4096
@@ -553,7 +611,7 @@ def test_retiring_ambiguity_moves_operation_to_recovery_required(
         _,
         _,
         operation,
-        _,
+        bundle,
         source,
         planner,
     ) = fixture(
@@ -566,6 +624,8 @@ def test_retiring_ambiguity_moves_operation_to_recovery_required(
     quarantine = planner.reclaim(
         OPERATION_ID,
         RESTORE_POINT_ID,
+        destination_id=bundle.destination_id,
+        source_bundle_object_id=bundle.source_bundle_object_id,
     )
     quarantine.parent.mkdir(
         parents=True,
@@ -700,6 +760,86 @@ def test_purged_state_refuses_remaining_physical_object(
         is ReclaimOperationState.PURGED
     )
 
+
+
+def test_same_restore_point_keeps_physical_bundle_identities_separate(
+    tmp_path,
+):
+    planner = BundlePathPlanner(tmp_path)
+    quarantiner = FakeQuarantiner(planner)
+    purger = FakePurger(planner)
+
+    source_a = tmp_path / "source-a"
+    source_b = tmp_path / "source-b"
+    source_a.mkdir()
+    source_b.mkdir()
+
+    quarantine_a = planner.reclaim(
+        OPERATION_ID,
+        RESTORE_POINT_ID,
+        destination_id="primary",
+        source_bundle_object_id=str(source_a),
+    )
+    quarantine_b = planner.reclaim(
+        OPERATION_ID,
+        RESTORE_POINT_ID,
+        destination_id="replica",
+        source_bundle_object_id=str(source_b),
+    )
+
+    result_a = quarantiner.quarantine(
+        source_bundle_object_id=str(source_a),
+        operation_id=OPERATION_ID,
+        restore_point_id=RESTORE_POINT_ID,
+        destination_id="primary",
+    )
+
+    assert result_a.quarantine_object_id == str(quarantine_a)
+    assert source_b.exists()
+    assert not quarantine_b.exists()
+
+    quarantine_b.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    quarantine_b.mkdir(mode=0o700)
+
+    inspected_b = quarantiner.inspect_quarantine(
+        source_bundle_object_id=str(source_b),
+        operation_id=OPERATION_ID,
+        restore_point_id=RESTORE_POINT_ID,
+        destination_id="replica",
+    )
+    assert inspected_b.quarantine_object_id == str(quarantine_b)
+
+    presence_b = purger.inspect_reclaim_presence(
+        operation_id=OPERATION_ID,
+        restore_point_id=RESTORE_POINT_ID,
+        destination_id="replica",
+        source_bundle_object_id=str(source_b),
+    )
+    assert presence_b.quarantine_exists
+    assert not presence_b.purging_exists
+
+    purger.purge(
+        quarantine_object_id=str(quarantine_a),
+        operation_id=OPERATION_ID,
+        restore_point_id=RESTORE_POINT_ID,
+        expected_physical_bytes=result_a.expected_physical_bytes,
+        source_device=result_a.source_device,
+        source_inode=result_a.source_inode,
+        destination_id="primary",
+        source_bundle_object_id=str(source_a),
+    )
+
+    assert not quarantine_a.exists()
+    assert quarantine_b.exists()
+
+    after_b = purger.inspect_reclaim_presence(
+        operation_id=OPERATION_ID,
+        restore_point_id=RESTORE_POINT_ID,
+        destination_id="replica",
+        source_bundle_object_id=str(source_b),
+    )
+    assert after_b.quarantine_exists
+    assert not after_b.purging_exists
 
 
 def test_pre_destructive_invariant_failure_aborts_planned_reclaim():

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import os
 import re
 import stat
@@ -42,6 +43,12 @@ class BundlePathPlanner:
             raise ValueError(f"unsafe {label}")
         return str(parsed)
 
+    @staticmethod
+    def _identity_component(value: str, label: str) -> str:
+        if not value:
+            raise ValueError(f"unsafe {label}")
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+
     def incoming(self, run_id: str) -> Path:
         return self.root / ".incoming" / self._uuid_component(run_id, "run ID")
 
@@ -54,32 +61,57 @@ class BundlePathPlanner:
         self,
         operation_id: str,
         restore_point_id: str,
+        *,
+        destination_id: str | None = None,
+        source_bundle_object_id: str | None = None,
     ) -> Path:
         """Deterministic controlled quarantine identity."""
         operation = self._uuid_component(
             operation_id,
             "reclaim operation ID",
         )
-        restore_point = self._uuid_component(
-            restore_point_id,
-            "restore point ID",
+        if destination_id is None and source_bundle_object_id is None:
+            restore_point = self._uuid_component(
+                restore_point_id,
+                "restore point ID",
+            )
+            return self.root / ".reclaim" / operation / restore_point
+        if destination_id is None or source_bundle_object_id is None:
+            raise ValueError(
+                "destination_id and source_bundle_object_id must be provided together"
+            )
+        return self.root / ".reclaim" / operation / (
+            f"{self._identity_component(destination_id, 'destination ID')}-"
+            f"{self._identity_component(source_bundle_object_id, 'source bundle object ID')}"
         )
-        return self.root / ".reclaim" / operation / restore_point
 
     def reclaim_purging(
         self,
         operation_id: str,
         restore_point_id: str,
+        *,
+        destination_id: str | None = None,
+        source_bundle_object_id: str | None = None,
     ) -> Path:
         """Deterministic in-progress physical purge identity."""
         operation = self._uuid_component(
             operation_id,
             "reclaim operation ID",
         )
-        restore_point = self._uuid_component(
-            restore_point_id,
-            "restore point ID",
-        )
+        if destination_id is None and source_bundle_object_id is None:
+            restore_point = self._uuid_component(
+                restore_point_id,
+                "restore point ID",
+            )
+        else:
+            if destination_id is None or source_bundle_object_id is None:
+                raise ValueError(
+                    "destination_id and source_bundle_object_id must be provided together"
+                )
+            restore_point = (
+                f"{self._identity_component(destination_id, 'destination ID')}-"
+                f"{self._identity_component(source_bundle_object_id, 'source bundle object ID')}"
+            )
         return (
             self.root
             / ".reclaim"
@@ -710,11 +742,18 @@ class BundleQuarantiner:
         source_bundle_object_id: str | Path,
         operation_id: str,
         restore_point_id: str,
+        destination_id: str | None = None,
     ) -> BundleQuarantineResult:
         source = Path(source_bundle_object_id)
         quarantine = self.planner.reclaim(
             operation_id,
             restore_point_id,
+            destination_id=destination_id,
+            source_bundle_object_id=(
+                str(source_bundle_object_id)
+                if destination_id is not None
+                else None
+            ),
         )
 
         try:
@@ -1014,12 +1053,19 @@ class BundleQuarantiner:
         source_bundle_object_id: str | Path,
         operation_id: str,
         restore_point_id: str,
+        destination_id: str | None = None,
     ) -> BundleQuarantineResult:
         """Reconstruct durable evidence after rename completed before DB update."""
 
         quarantine = self.planner.reclaim(
             operation_id,
             restore_point_id,
+            destination_id=destination_id,
+            source_bundle_object_id=(
+                str(source_bundle_object_id)
+                if destination_id is not None
+                else None
+            ),
         )
 
         purger = BundlePurger(self.planner)
@@ -1030,12 +1076,7 @@ class BundleQuarantiner:
         bundle_fd = None
 
         try:
-            restore_point_name = (
-                BundlePathPlanner._uuid_component(
-                    restore_point_id,
-                    "restore point ID",
-                )
-            )
+            restore_point_name = quarantine.name
 
             info = purger._entry_info(
                 operation_fd,
@@ -1717,6 +1758,8 @@ class BundlePurger:
         *,
         operation_id: str,
         restore_point_id: str,
+        destination_id: str | None = None,
+        source_bundle_object_id: str | None = None,
     ) -> BundleReclaimPresence:
         """Inspect deterministic quarantine/purge names without following links."""
 
@@ -1733,12 +1776,13 @@ class BundlePurger:
         purging_fd = None
 
         try:
-            restore_point_name = (
-                BundlePathPlanner._uuid_component(
-                    restore_point_id,
-                    "restore point ID",
-                )
+            expected_quarantine = self.planner.reclaim(
+                operation_id,
+                restore_point_id,
+                destination_id=destination_id,
+                source_bundle_object_id=source_bundle_object_id,
             )
+            restore_point_name = expected_quarantine.name
 
             quarantine = self._entry_info(
                 operation_fd,
@@ -1776,6 +1820,8 @@ class BundlePurger:
         expected_physical_bytes: int,
         source_device: int,
         source_inode: int,
+        destination_id: str | None = None,
+        source_bundle_object_id: str | None = None,
     ) -> BundlePurgeResult:
         if expected_physical_bytes < 0:
             raise ValueError(
@@ -1794,10 +1840,14 @@ class BundlePurger:
         expected_quarantine = self.planner.reclaim(
             operation_id,
             restore_point_id,
+            destination_id=destination_id,
+            source_bundle_object_id=source_bundle_object_id,
         )
         purge_object = self.planner.reclaim_purging(
             operation_id,
             restore_point_id,
+            destination_id=destination_id,
+            source_bundle_object_id=source_bundle_object_id,
         )
 
         if quarantine != expected_quarantine:
@@ -1813,10 +1863,7 @@ class BundlePurger:
         bundle_fd = None
 
         try:
-            restore_point_name = BundlePathPlanner._uuid_component(
-                restore_point_id,
-                "restore point ID",
-            )
+            restore_point_name = expected_quarantine.name
 
             quarantine_info = self._entry_info(
                 operation_fd,

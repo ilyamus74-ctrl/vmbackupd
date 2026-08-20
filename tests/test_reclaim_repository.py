@@ -2393,6 +2393,91 @@ def test_retention_reclaim_allows_replica_location_before_destructive_stage(
     assert result.state is ReclaimOperationState.RETIRING
 
 
+
+def test_retention_reclaim_journals_primary_and_replica_locations(
+    tmp_path,
+):
+    (
+        repository,
+        node,
+        _,
+        _,
+        _,
+        target_run,
+        old_chain,
+        old_points,
+        _,
+        _,
+    ) = retention_catalog(
+        tmp_path / "retention-primary-replica-journal.db"
+    )
+
+    replica = StorageDestination(
+        node_id=node.id,
+        name="replica",
+        backup_data_root="/replica",
+    )
+
+    repository.add_storage_destination(
+        replica
+    )
+
+    repository.connection.execute(
+        """
+        INSERT INTO restore_point_locations (
+            restore_point_id,
+            destination_id,
+            role,
+            state,
+            bundle_object_id,
+            verified_at,
+            created_at
+        )
+        VALUES (
+            ?, ?,
+            'REPLICA',
+            'AVAILABLE',
+            ?,
+            ?,
+            ?
+        )
+        """,
+        (
+            old_points[0].id,
+            replica.id,
+            "/replica/retention-old",
+            NOW.isoformat(),
+            NOW.isoformat(),
+        ),
+    )
+
+    repository.connection.commit()
+
+    operation = repository.create_retention_reclaim_operation(
+        target_run.id,
+        [(old_chain.id, 100)],
+        free_bytes_before=1000,
+    )
+
+    bundles = repository.list_reclaim_bundles(
+        operation.id
+    )
+
+    objects = sorted(
+        bundle.source_bundle_object_id
+        for bundle in bundles
+    )
+
+    assert objects == sorted(
+        [
+            old_points[0].bundle_object_id,
+            "/replica/retention-old",
+        ]
+    )
+
+    assert len(bundles) == 2
+
+
 def test_catalog_retirement_allows_late_replica_location(
     tmp_path,
 ):

@@ -873,6 +873,7 @@ class ReclaimBundle:
     operation_id: str
     chain_id: str
     restore_point_id: str
+    destination_id: str
     source_bundle_object_id: str
     state: ReclaimBundleState = ReclaimBundleState.PLANNED
     quarantine_object_id: str | None = None
@@ -881,6 +882,9 @@ class ReclaimBundle:
     source_inode: int | None = None
 
     def __post_init__(self) -> None:
+        if not self.destination_id:
+            raise ValueError("destination_id must not be empty")
+
         if not self.source_bundle_object_id:
             raise ValueError("source_bundle_object_id must not be empty")
         if (

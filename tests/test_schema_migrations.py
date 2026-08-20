@@ -1765,8 +1765,8 @@ def test_v13_to_v14_adds_durable_restore_operations_without_data_loss(
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 18
-    assert migrated.get_database_schema_version() == 18
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 20
+    assert migrated.get_database_schema_version() == 20
 
     columns = {
         row[1]
@@ -1883,10 +1883,10 @@ def test_v14_to_v15_adds_remote_node_binding_without_data_loss(
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == 18
+    assert migrated.schema_version == 20
     assert (
         migrated.get_database_schema_version()
-        == 18
+        == 20
     )
 
     columns = {
@@ -1996,7 +1996,7 @@ def test_v15_to_v16_adds_durable_remote_restore_source_snapshot(
     assert (
         migrated.schema_version
         == CURRENT_SCHEMA_VERSION
-        == 18
+        == 20
     )
 
     columns = {
@@ -2135,9 +2135,9 @@ def test_v16_to_v17_adds_restore_recovery_provenance_without_data_loss(
     assert (
         migrated.schema_version
         == CURRENT_SCHEMA_VERSION
-        == 18
+        == 20
     )
-    assert migrated.get_database_schema_version() == 18
+    assert migrated.get_database_schema_version() == 20
 
     columns = {
         row[1]
@@ -2191,7 +2191,7 @@ def test_v16_to_v17_adds_restore_recovery_provenance_without_data_loss(
 
 
 
-def test_current_schema_v18_has_reclaim_purpose_contract(
+def test_current_schema_v20_has_reclaim_purpose_contract(
     tmp_path,
 ):
     from vmbackupd.schema import CURRENT_SCHEMA_VERSION
@@ -2199,8 +2199,8 @@ def test_current_schema_v18_has_reclaim_purpose_contract(
     path = tmp_path / "schema-v18-reclaim-purpose.db"
     repository = SQLiteRepository(path)
 
-    assert CURRENT_SCHEMA_VERSION == 18
-    assert repository.schema_version == 18
+    assert CURRENT_SCHEMA_VERSION == 20
+    assert repository.schema_version == 20
 
     columns = {
         row[1]
@@ -2231,7 +2231,7 @@ def test_v17_to_v18_adds_reclaim_purpose_without_journal_loss(
     tmp_path,
 ):
     from vmbackupd.models import ReclaimPurpose
-    from vmbackupd.schema import RECLAIM_SCHEMA_STATEMENTS
+    from vmbackupd.schema import VERSION_18_RECLAIM_SCHEMA_STATEMENTS
 
     path = tmp_path / "v17-to-v18.db"
 
@@ -2292,8 +2292,8 @@ def test_v17_to_v18_adds_reclaim_purpose_without_journal_loss(
     )
 
     # Child table shapes did not change in v18.
-    connection.execute(RECLAIM_SCHEMA_STATEMENTS[1])
-    connection.execute(RECLAIM_SCHEMA_STATEMENTS[2])
+    connection.execute(VERSION_18_RECLAIM_SCHEMA_STATEMENTS[1])
+    connection.execute(VERSION_18_RECLAIM_SCHEMA_STATEMENTS[2])
 
     operation_id = "11111111-1111-4111-8111-111111111111"
 
@@ -2348,8 +2348,8 @@ def test_v17_to_v18_adds_reclaim_purpose_without_journal_loss(
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == 18
-    assert migrated.get_database_schema_version() == 18
+    assert migrated.schema_version == 20
+    assert migrated.get_database_schema_version() == 20
 
     operation = migrated.get_reclaim_operation(
         operation_id

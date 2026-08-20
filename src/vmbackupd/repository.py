@@ -3328,7 +3328,7 @@ class SQLiteRepository:
         ).fetchone()
 
         if context is None:
-            raise KeyError(restore_point_id)
+            raise KeyError(source_bundle_object_id)
 
         destination = self.connection.execute(
             """SELECT node_id
@@ -5185,16 +5185,26 @@ class SQLiteRepository:
                 for point in valid_full_chain_members[chain_id]:
                     self.connection.execute(
                         """INSERT INTO reclaim_bundles (
-                               operation_id, chain_id, restore_point_id,
+                               operation_id,
+                               chain_id,
+                               restore_point_id,
+                               destination_id,
                                source_bundle_object_id,
                                quarantine_object_id,
                                expected_physical_bytes,
-                               source_device, source_inode, state
-                           ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?)""",
+                               source_device,
+                               source_inode,
+                               state
+                           ) VALUES (
+                               ?, ?, ?, ?, ?,
+                               NULL, NULL,
+                               NULL, NULL, ?
+                           )""",
                         (
                             operation.id,
                             chain_id,
                             point["id"],
+                            operation.storage_destination_id,
                             point["bundle_object_id"],
                             ReclaimBundleState.PLANNED,
                         ),
@@ -5213,6 +5223,73 @@ class SQLiteRepository:
         return self.get_reclaim_operation(operation.id)
 
 
+
+    def _list_reclaim_locations_for_restore_point(
+        self,
+        restore_point_id: str,
+        fallback_object_id: str,
+        fallback_destination_id: str,
+    ) -> list[tuple[str, str]]:
+        """
+        Return every physical location which belongs to a restore point.
+
+        New catalog model:
+          restore_point_locations contains PRIMARY and REPLICA objects.
+
+        Legacy compatibility:
+          restore_points.bundle_object_id remains the PRIMARY object
+          when no PRIMARY location row exists.
+        """
+
+        locations: list[tuple[str, str]] = []
+
+        rows = self.connection.execute(
+            """
+            SELECT
+                destination_id,
+                bundle_object_id
+            FROM restore_point_locations
+            WHERE restore_point_id = ?
+              AND bundle_object_id IS NOT NULL
+            ORDER BY
+                role,
+                destination_id
+            """,
+            (restore_point_id,),
+        ).fetchall()
+
+        for row in rows:
+            locations.append(
+                (
+                    row["destination_id"],
+                    row["bundle_object_id"],
+                )
+            )
+
+        has_primary = bool(
+            self.connection.execute(
+                '''
+                SELECT 1
+                FROM restore_point_locations
+                WHERE restore_point_id = ?
+                  AND role = 'PRIMARY'
+                LIMIT 1
+                ''',
+                (restore_point_id,),
+            ).fetchone()
+        )
+
+        if not has_primary and fallback_object_id:
+            locations.insert(
+                0,
+                (
+                    fallback_destination_id,
+                    fallback_object_id,
+                ),
+            )
+
+        return locations
+
     def _validate_reclaim_replica_dependencies(
         self,
         operation_id: str,
@@ -5225,7 +5302,7 @@ class SQLiteRepository:
         """
         return self.connection.execute(
             """
-            SELECT
+            SELECT DISTINCT
                 rpl.*
             FROM reclaim_bundles rb
             JOIN restore_point_locations rpl
@@ -5604,30 +5681,41 @@ class SQLiteRepository:
                 for point in valid_members[
                     chain_id
                 ]:
-                    self.connection.execute(
-                        """INSERT INTO reclaim_bundles (
-                               operation_id,
-                               chain_id,
-                               restore_point_id,
-                               source_bundle_object_id,
-                               quarantine_object_id,
-                               expected_physical_bytes,
-                               source_device,
-                               source_inode,
-                               state
-                           ) VALUES (
-                               ?, ?, ?, ?,
-                               NULL, NULL,
-                               NULL, NULL, ?
-                           )""",
-                        (
-                            operation.id,
-                            chain_id,
+                    locations = (
+                        self._list_reclaim_locations_for_restore_point(
                             point["id"],
                             point["bundle_object_id"],
-                            ReclaimBundleState.PLANNED,
-                        ),
+                            operation.storage_destination_id,
+                        )
                     )
+
+                    for destination_id, object_id in locations:
+                        self.connection.execute(
+                            """INSERT INTO reclaim_bundles (
+                                   operation_id,
+                                   chain_id,
+                                   restore_point_id,
+                                   destination_id,
+                                   source_bundle_object_id,
+                                   quarantine_object_id,
+                                   expected_physical_bytes,
+                                   source_device,
+                                   source_inode,
+                                   state
+                               ) VALUES (
+                                   ?, ?, ?, ?, ?,
+                                   NULL, NULL,
+                                   NULL, NULL, ?
+                               )""",
+                            (
+                                operation.id,
+                                chain_id,
+                                point["id"],
+                                destination_id,
+                                object_id,
+                                ReclaimBundleState.PLANNED,
+                            ),
+                        )
 
             replica_dependencies = self._validate_reclaim_replica_dependencies(
                 operation.id
@@ -6270,7 +6358,8 @@ class SQLiteRepository:
     def mark_reclaim_bundle_quarantined(
         self,
         operation_id: str,
-        restore_point_id: str,
+        destination_id: str,
+        source_bundle_object_id: str | None = None,
         *,
         quarantine_object_id: str,
         expected_physical_bytes: int,
@@ -6299,15 +6388,42 @@ class SQLiteRepository:
                 ReclaimOperationState.RETIRING,
             )
 
+            if source_bundle_object_id is None:
+                legacy_restore_point_id = destination_id
+                rows = self.connection.execute(
+                    """SELECT *
+                       FROM reclaim_bundles
+                       WHERE operation_id = ?
+                         AND restore_point_id = ?""",
+                    (
+                        operation_id,
+                        legacy_restore_point_id,
+                    ),
+                ).fetchall()
+                if not rows:
+                    raise KeyError(legacy_restore_point_id)
+                if len(rows) != 1:
+                    raise DomainInvariantError(
+                        "legacy reclaim bundle identity is ambiguous"
+                    )
+                row = rows[0]
+                destination_id = row["destination_id"]
+                source_bundle_object_id = row["source_bundle_object_id"]
+
             row = self.connection.execute(
                 """SELECT *
                    FROM reclaim_bundles
                    WHERE operation_id = ?
-                     AND restore_point_id = ?""",
-                (operation_id, restore_point_id),
+                     AND destination_id = ?
+                     AND source_bundle_object_id = ?""",
+                (
+                    operation_id,
+                    destination_id,
+                    source_bundle_object_id,
+                ),
             ).fetchone()
             if row is None:
-                raise KeyError(restore_point_id)
+                raise KeyError(source_bundle_object_id)
 
             if (
                 ReclaimBundleState(row["state"])
@@ -6328,13 +6444,15 @@ class SQLiteRepository:
                    WHERE quarantine_object_id = ?
                      AND NOT (
                          operation_id = ?
-                         AND restore_point_id = ?
+                         AND destination_id = ?
+                         AND source_bundle_object_id = ?
                      )
                    LIMIT 1""",
                 (
                     quarantine_object_id,
                     operation_id,
-                    restore_point_id,
+                    destination_id,
+                    source_bundle_object_id,
                 ),
             ).fetchone()
             if duplicate is not None:
@@ -6350,7 +6468,8 @@ class SQLiteRepository:
                        source_device = ?,
                        source_inode = ?
                    WHERE operation_id = ?
-                     AND restore_point_id = ?
+                     AND destination_id = ?
+                     AND source_bundle_object_id = ?
                      AND state = 'PLANNED'""",
                 (
                     quarantine_object_id,
@@ -6358,7 +6477,8 @@ class SQLiteRepository:
                     source_device,
                     source_inode,
                     operation_id,
-                    restore_point_id,
+                    destination_id,
+                    source_bundle_object_id,
                 ),
             )
             if cursor.rowcount != 1:
@@ -6374,7 +6494,11 @@ class SQLiteRepository:
         bundles = [
             item
             for item in self.list_reclaim_bundles(operation_id)
-            if item.restore_point_id == restore_point_id
+            if (
+                item.destination_id == destination_id
+                and item.source_bundle_object_id
+                    == source_bundle_object_id
+            )
         ]
         if len(bundles) != 1:
             raise DomainInvariantError(
@@ -6553,7 +6677,9 @@ class SQLiteRepository:
                 )
 
             selected_point_ids = tuple(
-                row["restore_point_id"] for row in reclaim_bundles
+                dict.fromkeys(
+                    row["restore_point_id"] for row in reclaim_bundles
+                )
             )
             selected_point_set = set(selected_point_ids)
 
@@ -6715,6 +6841,11 @@ class SQLiteRepository:
 
             snapshot_by_chain: dict[str, dict[str, str]] = {}
             for bundle in reclaim_bundles:
+                if (
+                    bundle["destination_id"]
+                    != operation["storage_destination_id"]
+                ):
+                    continue
                 snapshot_by_chain.setdefault(
                     bundle["chain_id"],
                     {},
@@ -7099,7 +7230,8 @@ class SQLiteRepository:
     def begin_reclaim_bundle_purge(
         self,
         operation_id: str,
-        restore_point_id: str,
+        destination_id: str,
+        source_bundle_object_id: str | None = None,
     ) -> ReclaimBundle:
         """Persist destructive per-bundle purge intent before filesystem removal."""
 
@@ -7110,16 +7242,43 @@ class SQLiteRepository:
                 ReclaimOperationState.PURGING,
             )
 
+            if source_bundle_object_id is None:
+                legacy_restore_point_id = destination_id
+                rows = self.connection.execute(
+                    """SELECT *
+                       FROM reclaim_bundles
+                       WHERE operation_id = ?
+                         AND restore_point_id = ?""",
+                    (
+                        operation_id,
+                        legacy_restore_point_id,
+                    ),
+                ).fetchall()
+                if not rows:
+                    raise KeyError(legacy_restore_point_id)
+                if len(rows) != 1:
+                    raise DomainInvariantError(
+                        "legacy reclaim bundle identity is ambiguous"
+                    )
+                row = rows[0]
+                destination_id = row["destination_id"]
+                source_bundle_object_id = row["source_bundle_object_id"]
+
             row = self.connection.execute(
                 """SELECT *
                    FROM reclaim_bundles
                    WHERE operation_id = ?
-                     AND restore_point_id = ?""",
-                (operation_id, restore_point_id),
+                     AND destination_id = ?
+                     AND source_bundle_object_id = ?""",
+                (
+                    operation_id,
+                    destination_id,
+                    source_bundle_object_id,
+                ),
             ).fetchone()
 
             if row is None:
-                raise KeyError(restore_point_id)
+                raise KeyError(source_bundle_object_id)
 
             if (
                 ReclaimBundleState(row["state"])
@@ -7144,11 +7303,13 @@ class SQLiteRepository:
                 """UPDATE reclaim_bundles
                    SET state = 'PURGING'
                    WHERE operation_id = ?
-                     AND restore_point_id = ?
+                     AND destination_id = ?
+                     AND source_bundle_object_id = ?
                      AND state = 'QUARANTINED'""",
                 (
                     operation_id,
-                    restore_point_id,
+                    destination_id,
+                    source_bundle_object_id,
                 ),
             )
 
@@ -7165,7 +7326,10 @@ class SQLiteRepository:
         bundles = [
             item
             for item in self.list_reclaim_bundles(operation_id)
-            if item.restore_point_id == restore_point_id
+            if (
+                item.destination_id == destination_id
+                and item.source_bundle_object_id == source_bundle_object_id
+            )
         ]
 
         if len(bundles) != 1:
@@ -7178,7 +7342,8 @@ class SQLiteRepository:
     def mark_reclaim_bundle_purged(
         self,
         operation_id: str,
-        restore_point_id: str,
+        destination_id: str,
+        source_bundle_object_id: str | None = None,
     ) -> ReclaimBundle:
         """Persist executor evidence that one quarantined bundle was purged."""
 
@@ -7189,15 +7354,42 @@ class SQLiteRepository:
                 ReclaimOperationState.PURGING,
             )
 
+            if source_bundle_object_id is None:
+                legacy_restore_point_id = destination_id
+                rows = self.connection.execute(
+                    """SELECT *
+                       FROM reclaim_bundles
+                       WHERE operation_id = ?
+                         AND restore_point_id = ?""",
+                    (
+                        operation_id,
+                        legacy_restore_point_id,
+                    ),
+                ).fetchall()
+                if not rows:
+                    raise KeyError(legacy_restore_point_id)
+                if len(rows) != 1:
+                    raise DomainInvariantError(
+                        "legacy reclaim bundle identity is ambiguous"
+                    )
+                row = rows[0]
+                destination_id = row["destination_id"]
+                source_bundle_object_id = row["source_bundle_object_id"]
+
             row = self.connection.execute(
                 """SELECT *
                    FROM reclaim_bundles
                    WHERE operation_id = ?
-                     AND restore_point_id = ?""",
-                (operation_id, restore_point_id),
+                     AND destination_id = ?
+                     AND source_bundle_object_id = ?""",
+                (
+                    operation_id,
+                    destination_id,
+                    source_bundle_object_id,
+                ),
             ).fetchone()
             if row is None:
-                raise KeyError(restore_point_id)
+                raise KeyError(source_bundle_object_id)
 
             if (
                 ReclaimBundleState(row["state"])
@@ -7220,9 +7412,14 @@ class SQLiteRepository:
                 """UPDATE reclaim_bundles
                    SET state = 'PURGED'
                    WHERE operation_id = ?
-                     AND restore_point_id = ?
+                     AND destination_id = ?
+                     AND source_bundle_object_id = ?
                      AND state = 'PURGING'""",
-                (operation_id, restore_point_id),
+                (
+                    operation_id,
+                    destination_id,
+                    source_bundle_object_id,
+                ),
             )
             if cursor.rowcount != 1:
                 raise DomainInvariantError(
@@ -7237,7 +7434,10 @@ class SQLiteRepository:
         bundles = [
             item
             for item in self.list_reclaim_bundles(operation_id)
-            if item.restore_point_id == restore_point_id
+            if (
+                item.destination_id == destination_id
+                and item.source_bundle_object_id == source_bundle_object_id
+            )
         ]
         if len(bundles) != 1:
             raise DomainInvariantError(
@@ -7811,8 +8011,10 @@ class SQLiteRepository:
                  ON rc.operation_id = rb.operation_id
                 AND rc.chain_id = rb.chain_id
                WHERE rb.operation_id = ?
-               ORDER BY rc.ordinal, rb.source_bundle_object_id,
-                        rb.restore_point_id""",
+               ORDER BY rc.ordinal,
+                        rb.restore_point_id,
+                        rb.destination_id,
+                        rb.source_bundle_object_id""",
             (operation_id,),
         )
         return [self._reclaim_bundle(row) for row in rows]
@@ -8106,6 +8308,7 @@ class SQLiteRepository:
             operation_id=row["operation_id"],
             chain_id=row["chain_id"],
             restore_point_id=row["restore_point_id"],
+            destination_id=row["destination_id"],
             source_bundle_object_id=row["source_bundle_object_id"],
             quarantine_object_id=row["quarantine_object_id"],
             expected_physical_bytes=row["expected_physical_bytes"],
