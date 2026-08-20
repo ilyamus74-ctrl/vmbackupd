@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .bundle import BundlePathPlanner
 from .models import (
@@ -2095,6 +2095,50 @@ class SQLiteRepository:
             task_id
         )
 
+
+    def next_ssh_replica_task_verifying(
+        self,
+        node_id: str,
+        now: datetime,
+    ) -> ReplicaTask | None:
+        """Return one durable VERIFYING SSH task for idempotent publication."""
+
+        row = self.connection.execute(
+            """SELECT rt.*
+               FROM replica_tasks rt
+               JOIN restore_points rp
+                 ON rp.id = rt.restore_point_id
+               JOIN job_runs jr
+                 ON jr.id = rp.job_run_id
+               JOIN backup_jobs bj
+                 ON bj.id = jr.job_id
+               JOIN vms vm
+                 ON vm.id = bj.vm_id
+               JOIN storage_destinations sd
+                 ON sd.id = rt.destination_id
+               WHERE rt.state = 'VERIFYING'
+                 AND vm.node_id = ?
+                 AND sd.node_id = ?
+                 AND sd.storage_type = 'SSH'
+                 AND (
+                     rt.next_retry_at IS NULL
+                     OR rt.next_retry_at <= ?
+                 )
+               ORDER BY rt.updated_at, rt.id
+               LIMIT 1""",
+            (
+                node_id,
+                node_id,
+                now.isoformat(),
+            ),
+        ).fetchone()
+
+        return (
+            self._replica_task(row)
+            if row is not None
+            else None
+        )
+
     def mark_replica_task_verifying(
         self,
         task_id: str,
@@ -2118,6 +2162,323 @@ class SQLiteRepository:
             if cursor.rowcount != 1:
                 raise DomainInvariantError(
                     "REPLICA_TASK_NOT_TRANSFERRING"
+                )
+
+        return self.get_replica_task(
+            task_id
+        )
+
+
+    def finalize_replica_success(
+        self,
+        task_id: str,
+        bundle_object_id: str,
+        now: datetime,
+    ) -> ReplicaTask:
+        """Atomically publish an AVAILABLE REPLICA location and task SUCCESS."""
+
+        if (
+            not isinstance(bundle_object_id, str)
+            or not bundle_object_id
+        ):
+            raise DomainInvariantError(
+                "REPLICA_REMOTE_BUNDLE_INVALID"
+            )
+
+        object_path = PurePosixPath(
+            bundle_object_id
+        )
+
+        if (
+            object_path.is_absolute()
+            or ".." in object_path.parts
+            or not object_path.parts
+            or object_path.parts[0] != "vms"
+            or object_path.as_posix()
+            != bundle_object_id
+        ):
+            raise DomainInvariantError(
+                "REPLICA_REMOTE_BUNDLE_INVALID"
+            )
+
+        try:
+            with self.connection:
+                context = self.connection.execute(
+                    """SELECT
+                           rt.restore_point_id,
+                           rt.destination_id,
+                           rt.state AS task_state,
+                           rp.parent_restore_point_id,
+                           rp.status AS restore_point_status,
+                           jr.storage_destination_id
+                               AS primary_destination_id,
+                           vm.node_id AS vm_node_id,
+                           sd.node_id AS destination_node_id,
+                           sd.storage_type
+                               AS destination_type
+                       FROM replica_tasks rt
+                       JOIN restore_points rp
+                         ON rp.id = rt.restore_point_id
+                       JOIN job_runs jr
+                         ON jr.id = rp.job_run_id
+                       JOIN backup_jobs bj
+                         ON bj.id = jr.job_id
+                       JOIN vms vm
+                         ON vm.id = bj.vm_id
+                       JOIN storage_destinations sd
+                         ON sd.id = rt.destination_id
+                       WHERE rt.id = ?""",
+                    (task_id,),
+                ).fetchone()
+
+                if context is None:
+                    raise KeyError(
+                        task_id
+                    )
+
+                if context[
+                    "task_state"
+                ] not in {
+                    "VERIFYING",
+                    "SUCCESS",
+                }:
+                    raise DomainInvariantError(
+                        "REPLICA_TASK_NOT_VERIFYING"
+                    )
+
+                if (
+                    context[
+                        "restore_point_status"
+                    ]
+                    != "AVAILABLE"
+                ):
+                    raise DomainInvariantError(
+                        "REPLICA_RESTORE_POINT_NOT_AVAILABLE"
+                    )
+
+                if (
+                    context[
+                        "destination_type"
+                    ]
+                    != "SSH"
+                    or context[
+                        "destination_node_id"
+                    ]
+                    != context["vm_node_id"]
+                ):
+                    raise DomainInvariantError(
+                        "REPLICA_DESTINATION_INVALID"
+                    )
+
+                if (
+                    context[
+                        "destination_id"
+                    ]
+                    == context[
+                        "primary_destination_id"
+                    ]
+                ):
+                    raise DomainInvariantError(
+                        "REPLICA_MATCHES_PRIMARY"
+                    )
+
+                parent_id = context[
+                    "parent_restore_point_id"
+                ]
+
+                if parent_id is not None:
+                    parent = self.connection.execute(
+                        """SELECT role,
+                                  state,
+                                  bundle_object_id
+                           FROM restore_point_locations
+                           WHERE restore_point_id = ?
+                             AND destination_id = ?""",
+                        (
+                            parent_id,
+                            context[
+                                "destination_id"
+                            ],
+                        ),
+                    ).fetchone()
+
+                    if (
+                        parent is None
+                        or parent["role"]
+                        != "REPLICA"
+                        or parent["state"]
+                        != "AVAILABLE"
+                        or not parent[
+                            "bundle_object_id"
+                        ]
+                    ):
+                        raise DomainInvariantError(
+                            "REPLICA_PARENT_NOT_AVAILABLE"
+                        )
+
+                existing = (
+                    self.connection.execute(
+                        """SELECT *
+                           FROM restore_point_locations
+                           WHERE restore_point_id = ?
+                             AND destination_id = ?""",
+                        (
+                            context[
+                                "restore_point_id"
+                            ],
+                            context[
+                                "destination_id"
+                            ],
+                        ),
+                    ).fetchone()
+                )
+
+                if existing is None:
+                    self.connection.execute(
+                        """INSERT INTO restore_point_locations (
+                               restore_point_id,
+                               destination_id,
+                               role,
+                               state,
+                               bundle_object_id,
+                               verified_at,
+                               created_at
+                           )
+                           VALUES (
+                               ?, ?,
+                               'REPLICA',
+                               'AVAILABLE',
+                               ?, ?, ?
+                           )""",
+                        (
+                            context[
+                                "restore_point_id"
+                            ],
+                            context[
+                                "destination_id"
+                            ],
+                            bundle_object_id,
+                            now.isoformat(),
+                            now.isoformat(),
+                        ),
+                    )
+
+                elif (
+                    existing["role"]
+                    != "REPLICA"
+                    or existing["state"]
+                    != "AVAILABLE"
+                    or existing[
+                        "bundle_object_id"
+                    ]
+                    != bundle_object_id
+                    or existing[
+                        "verified_at"
+                    ]
+                    is None
+                ):
+                    raise DomainInvariantError(
+                        "REPLICA_LOCATION_CONFLICT"
+                    )
+
+                if (
+                    context[
+                        "task_state"
+                    ]
+                    == "VERIFYING"
+                ):
+                    cursor = (
+                        self.connection.execute(
+                            """UPDATE replica_tasks
+                               SET state = 'SUCCESS',
+                                   last_error = NULL,
+                                   next_retry_at = NULL,
+                                   updated_at = ?
+                               WHERE id = ?
+                                 AND state = 'VERIFYING'""",
+                            (
+                                now.isoformat(),
+                                task_id,
+                            ),
+                        )
+                    )
+
+                    if cursor.rowcount != 1:
+                        raise DomainInvariantError(
+                            "REPLICA_TASK_NOT_VERIFYING"
+                        )
+
+                self.connection.execute(
+                    """UPDATE replica_tasks
+                       SET state = 'PENDING',
+                           last_error = NULL,
+                           next_retry_at = NULL,
+                           updated_at = ?
+                       WHERE destination_id = ?
+                         AND state = 'BLOCKED'
+                         AND restore_point_id IN (
+                             SELECT id
+                             FROM restore_points
+                             WHERE parent_restore_point_id = ?
+                         )""",
+                    (
+                        now.isoformat(),
+                        context[
+                            "destination_id"
+                        ],
+                        context[
+                            "restore_point_id"
+                        ],
+                    ),
+                )
+
+        except sqlite3.IntegrityError as exc:
+            raise DomainInvariantError(
+                "replica publication rejected: "
+                f"{exc}"
+            ) from exc
+
+        return self.get_replica_task(
+            task_id
+        )
+
+    def fail_replica_task_verification(
+        self,
+        task_id: str,
+        error: str,
+        now: datetime,
+    ) -> ReplicaTask:
+        message = str(
+            error
+        ).strip()
+
+        if not message:
+            message = (
+                "replica verification failed"
+            )
+
+        if len(message) > 2000:
+            message = message[-2000:]
+
+        with self.connection:
+            cursor = self.connection.execute(
+                """UPDATE replica_tasks
+                   SET state = 'FAILED',
+                       last_error = ?,
+                       next_retry_at = NULL,
+                       updated_at = ?
+                   WHERE id = ?
+                     AND state = 'VERIFYING'""",
+                (
+                    message,
+                    now.isoformat(),
+                    task_id,
+                ),
+            )
+
+            if cursor.rowcount != 1:
+                raise DomainInvariantError(
+                    "REPLICA_TASK_NOT_VERIFYING"
                 )
 
         return self.get_replica_task(

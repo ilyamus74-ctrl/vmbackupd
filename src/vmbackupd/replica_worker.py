@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import sqlite3
 import threading
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .command import SubprocessCommandRunner
 from .models import (
@@ -15,6 +16,7 @@ from .models import (
     utcnow,
 )
 from .replica_sender import (
+    ReplicaPublishRejectedError,
     ReplicaSenderError,
     ReplicaTransferCancelledError,
     SSHReplicaTransferClient,
@@ -213,9 +215,206 @@ class ReplicaTaskExecutor:
                     "receiver staging receipt identity mismatch"
                 )
 
+
+    @staticmethod
+    def _validate_publish_receipt(
+        task: ReplicaTask,
+        point,
+        destination,
+        receipt: dict,
+    ) -> str:
+        expected = {
+            "transfer_id":
+                task.id,
+            "storage_id":
+                destination.remote_storage_id,
+            "restore_point_id":
+                point.id,
+        }
+
+        if (
+            not isinstance(
+                receipt,
+                dict,
+            )
+            or receipt.get(
+                "status"
+            )
+            != "PUBLISHED"
+        ):
+            raise ReplicaSenderError(
+                "receiver publication receipt is invalid"
+            )
+
+        for key, value in (
+            expected.items()
+        ):
+            if receipt.get(
+                key
+            ) != value:
+                raise ReplicaSenderError(
+                    "receiver publication receipt identity mismatch"
+                )
+
+        object_id = receipt.get(
+            "bundle_object_id"
+        )
+
+        if (
+            not isinstance(
+                object_id,
+                str,
+            )
+            or not object_id
+        ):
+            raise ReplicaSenderError(
+                "receiver publication object ID is invalid"
+            )
+
+        path = PurePosixPath(
+            object_id
+        )
+
+        if (
+            path.is_absolute()
+            or ".." in path.parts
+            or not path.parts
+            or path.parts[0]
+            != "vms"
+            or path.as_posix()
+            != object_id
+        ):
+            raise ReplicaSenderError(
+                "receiver publication object ID is unsafe"
+            )
+
+        return object_id
+
+    @staticmethod
+    def _sqlite_busy(
+        exc: sqlite3.OperationalError,
+    ) -> bool:
+        code = getattr(
+            exc,
+            "sqlite_errorcode",
+            None,
+        )
+        message = str(
+            exc
+        ).lower()
+
+        return (
+            code in {
+                sqlite3.SQLITE_BUSY,
+                sqlite3.SQLITE_LOCKED,
+            }
+            or "database is locked"
+            in message
+            or "database table is locked"
+            in message
+        )
+
+    def _verify_once(
+        self,
+        task: ReplicaTask,
+    ) -> ReplicaTask | None:
+        try:
+            (
+                point,
+                _,
+                destination,
+            ) = self._context(
+                task
+            )
+
+        except DomainInvariantError as exc:
+            return (
+                self.repository
+                .fail_replica_task_verification(
+                    task.id,
+                    (
+                        f"{type(exc).__name__}: "
+                        f"{exc}"
+                    ),
+                    utcnow(),
+                )
+            )
+
+        try:
+            receipt = self.client.publish(
+                task.id,
+                point.id,
+                destination,
+            )
+
+        except ReplicaPublishRejectedError as exc:
+            return (
+                self.repository
+                .fail_replica_task_verification(
+                    task.id,
+                    (
+                        f"{exc.code}: "
+                        f"{exc}"
+                    ),
+                    utcnow(),
+                )
+            )
+
+        except Exception:
+            # Publication is idempotent.  A transport failure may happen
+            # after the receiver has already committed PUBLISHED, so never
+            # downgrade VERIFYING or retransmit bytes blindly.
+            return None
+
+        try:
+            object_id = (
+                self._validate_publish_receipt(
+                    task,
+                    point,
+                    destination,
+                    receipt,
+                )
+            )
+
+        except ReplicaSenderError:
+            # The receiver may already have published the object.  Keep
+            # VERIFYING so the next idempotent publish can reconcile it.
+            return None
+
+        try:
+            return (
+                self.repository
+                .finalize_replica_success(
+                    task.id,
+                    object_id,
+                    utcnow(),
+                )
+            )
+
+        except sqlite3.OperationalError as exc:
+            if self._sqlite_busy(
+                exc
+            ):
+                return None
+
+            raise
+
     def run_once(
         self,
     ) -> ReplicaTask | None:
+        verifying = (
+            self.repository
+            .next_ssh_replica_task_verifying(
+                self.node_id,
+                utcnow(),
+            )
+        )
+
+        if verifying is not None:
+            return self._verify_once(
+                verifying
+            )
+
         task = (
             self.repository
             .claim_next_ssh_replica_task(

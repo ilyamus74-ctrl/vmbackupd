@@ -572,3 +572,127 @@ def test_sender_shutdown_before_start_does_not_launch_ssh(
         )
 
     assert factory.process is None
+
+def test_sender_publish_uses_exact_restricted_command():
+    source = Path(
+        "/tmp/unused"
+    )
+    restore_point = point(
+        source
+    )
+    task = ReplicaTask(
+        restore_point_id=restore_point.id,
+        destination_id=destination().id,
+    )
+
+    response = {
+        "service":
+            "vmbackupd-receiver",
+        "protocol_version": 1,
+        "status": "PUBLISHED",
+        "transfer_id":
+            task.id,
+        "storage_id":
+            STORAGE_ID,
+        "restore_point_id":
+            restore_point.id,
+        "bundle_object_id":
+            (
+                "vms/"
+                f"{VM_ID}/"
+                "2026/08/object"
+            ),
+    }
+
+    factory = ProcessFactory(
+        [response]
+    )
+
+    client = SSHReplicaTransferClient(
+        Identity(),
+        KnownHosts(),
+        process_factory=factory,
+    )
+
+    result = client.publish(
+        task.id,
+        restore_point.id,
+        destination(),
+    )
+
+    assert (
+        result["status"]
+        == "PUBLISHED"
+    )
+
+    assert (
+        factory.argv[-1]
+        == "vmbackupd-publish-v1"
+    )
+
+    request = json.loads(
+        factory.process.stdin
+        .getvalue()
+        .splitlines()[0]
+    )
+
+    assert request == {
+        "protocol_version": 1,
+        "operation": "PUBLISH",
+        "storage_id": STORAGE_ID,
+        "transfer_id": task.id,
+        "restore_point_id":
+            restore_point.id,
+    }
+
+
+def test_sender_publish_preserves_definitive_receiver_rejection():
+    from vmbackupd.replica_sender import (
+        ReplicaPublishRejectedError,
+    )
+
+    source = Path(
+        "/tmp/unused"
+    )
+    restore_point = point(
+        source
+    )
+    task = ReplicaTask(
+        restore_point_id=restore_point.id,
+        destination_id=destination().id,
+    )
+
+    factory = ProcessFactory([
+        {
+            "service":
+                "vmbackupd-receiver",
+            "protocol_version": 1,
+            "status": "ERROR",
+            "error": {
+                "code":
+                    "PUBLISH_METADATA_MISMATCH",
+                "message":
+                    "metadata mismatch",
+            },
+        }
+    ])
+
+    client = SSHReplicaTransferClient(
+        Identity(),
+        KnownHosts(),
+        process_factory=factory,
+    )
+
+    with pytest.raises(
+        ReplicaPublishRejectedError
+    ) as caught:
+        client.publish(
+            task.id,
+            restore_point.id,
+            destination(),
+        )
+
+    assert (
+        caught.value.code
+        == "PUBLISH_METADATA_MISMATCH"
+    )

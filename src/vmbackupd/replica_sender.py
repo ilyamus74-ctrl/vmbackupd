@@ -33,6 +33,10 @@ from .models import (
     StorageDestination,
     StorageType,
 )
+from .receiver_publish import (
+    PUBLISH_COMMAND,
+    PUBLISH_PROTOCOL_VERSION,
+)
 from .receiver_transfer import (
     MAX_EXTENT_BYTES,
     MAX_FILES,
@@ -61,6 +65,20 @@ class ReplicaSenderError(RuntimeError):
 
 class ReplicaTransferCancelledError(ReplicaSenderError):
     """Daemon shutdown interrupted a transfer with unknown remote progress."""
+
+class ReplicaPublishRejectedError(ReplicaSenderError):
+    """Receiver definitively rejected semantic publication."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+    ) -> None:
+        super().__init__(
+            message
+        )
+        self.code = code
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -716,6 +734,7 @@ class SSHReplicaTransferClient:
     def _ssh_argv(
         self,
         destination: StorageDestination,
+        command: str = TRANSFER_COMMAND,
     ) -> tuple[str, ...]:
         if (
             not destination.ssh_host
@@ -801,7 +820,7 @@ class SSHReplicaTransferClient:
                 f"{destination.ssh_user}"
                 f"@{destination.ssh_host}"
             ),
-            TRANSFER_COMMAND,
+            command,
         )
 
     @staticmethod
@@ -1070,6 +1089,259 @@ class SSHReplicaTransferClient:
 
         except Exception:
             return ""
+
+
+    @staticmethod
+    def _read_publish_response(
+        stream,
+    ) -> dict:
+        line = stream.readline(
+            _MAX_RESPONSE_LINE + 1
+        )
+
+        if (
+            not line
+            or len(line)
+            > _MAX_RESPONSE_LINE
+            or not line.endswith(
+                b"\n"
+            )
+        ):
+            raise ReplicaSenderError(
+                "receiver publish response is missing or oversized"
+            )
+
+        try:
+            value = json.loads(
+                line.decode(
+                    "utf-8"
+                )
+            )
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise ReplicaSenderError(
+                "receiver publish response is not valid JSON"
+            ) from exc
+
+        if (
+            not isinstance(
+                value,
+                dict,
+            )
+            or value.get(
+                "service"
+            )
+            != "vmbackupd-receiver"
+            or value.get(
+                "protocol_version"
+            )
+            != PUBLISH_PROTOCOL_VERSION
+        ):
+            raise ReplicaSenderError(
+                "receiver publish protocol identity mismatch"
+            )
+
+        status = value.get(
+            "status"
+        )
+
+        if status == "ERROR":
+            error = value.get(
+                "error"
+            )
+
+            code = (
+                str(
+                    error.get(
+                        "code",
+                        "PUBLISH_FAILED",
+                    )
+                )
+                if isinstance(
+                    error,
+                    dict,
+                )
+                else "PUBLISH_FAILED"
+            )
+
+            message = (
+                str(
+                    error.get(
+                        "message",
+                        "receiver rejected publication",
+                    )
+                )
+                if isinstance(
+                    error,
+                    dict,
+                )
+                else "receiver rejected publication"
+            )
+
+            raise ReplicaPublishRejectedError(
+                code,
+                message,
+            )
+
+        if status != "PUBLISHED":
+            raise ReplicaSenderError(
+                "unexpected receiver publish status: "
+                f"{status!r}"
+            )
+
+        return value
+
+    def publish(
+        self,
+        transfer_id: str,
+        restore_point_id: str,
+        destination: StorageDestination,
+    ) -> dict:
+        if not destination.remote_storage_id:
+            raise ReplicaSenderError(
+                "SSH replica destination has no remote storage ID"
+            )
+
+        transfer_id = _canonical_uuid(
+            transfer_id,
+            "transfer ID",
+        )
+
+        restore_point_id = _canonical_uuid(
+            restore_point_id,
+            "Restore Point ID",
+        )
+
+        storage_id = _canonical_uuid(
+            destination.remote_storage_id,
+            "remote storage ID",
+        )
+
+        argv = self._ssh_argv(
+            destination,
+            PUBLISH_COMMAND,
+        )
+
+        with tempfile.TemporaryFile(
+            mode="w+b"
+        ) as stderr:
+            try:
+                process = self.process_factory(
+                    argv,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr,
+                    bufsize=0,
+                    env={
+                        **os.environ,
+                        "LC_ALL": "C",
+                        "LANG": "C",
+                    },
+                )
+            except OSError as exc:
+                raise ReplicaSenderError(
+                    "cannot start SSH replica publisher"
+                ) from exc
+
+            if (
+                process.stdin is None
+                or process.stdout is None
+            ):
+                process.kill()
+                raise ReplicaSenderError(
+                    "SSH replica publisher pipes are unavailable"
+                )
+
+            try:
+                self._write_control(
+                    process.stdin,
+                    {
+                        "protocol_version":
+                            PUBLISH_PROTOCOL_VERSION,
+                        "operation":
+                            "PUBLISH",
+                        "storage_id":
+                            storage_id,
+                        "transfer_id":
+                            transfer_id,
+                        "restore_point_id":
+                            restore_point_id,
+                    },
+                )
+
+                result = (
+                    self._read_publish_response(
+                        process.stdout
+                    )
+                )
+
+                process.stdin.close()
+
+                try:
+                    returncode = process.wait(
+                        timeout=320
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    process.kill()
+                    process.wait()
+                    raise ReplicaSenderError(
+                        "SSH receiver publisher did not terminate"
+                    ) from exc
+
+                if returncode != 0:
+                    detail = self._stderr_tail(
+                        stderr
+                    )
+
+                    raise ReplicaSenderError(
+                        "SSH replica publication transport failed"
+                        + (
+                            f": {detail}"
+                            if detail
+                            else ""
+                        )
+                    )
+
+                expected = {
+                    "transfer_id":
+                        transfer_id,
+                    "storage_id":
+                        storage_id,
+                    "restore_point_id":
+                        restore_point_id,
+                }
+
+                for key, value in (
+                    expected.items()
+                ):
+                    if (
+                        result.get(
+                            key
+                        )
+                        != value
+                    ):
+                        raise ReplicaSenderError(
+                            "receiver publication identity mismatch"
+                        )
+
+                return result
+
+            except Exception:
+                try:
+                    process.stdin.close()
+                except Exception:
+                    pass
+
+                try:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                except Exception:
+                    pass
+
+                raise
 
     def transfer(
         self,
