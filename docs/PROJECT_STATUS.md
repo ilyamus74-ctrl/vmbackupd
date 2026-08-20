@@ -3699,20 +3699,130 @@ belong to A3.5.4.
 
 ### A3.5.4 local end-to-end restore acceptance
 
-Acceptance must prove at minimum:
+**Status: CLOSED**
 
-    successful FULL backup
-        -> create RestoreOperation from LOCAL source
-        -> verify source
-        -> materialize independent target
-        -> define restored VM
-        -> optionally start
+Implementation commit:
+
+    173ac7c08570056e80100101886774e172ff685d
+    173ac7c feat: complete local restore execution
+
+Delivered LOCAL restore execution path:
+
+    PLANNED
+        -> VERIFYING
+        -> MATERIALIZING
+        -> DEFINING
+        -> READY
+
+Without optional start:
+
+    READY
         -> SUCCESS
 
-The restored VM must use independent target disk files and the original
-published Restore Point must remain unchanged and valid after restore.
+With `start_after_restore=true`:
 
-Recovery tests must cover daemon interruption in unsafe restore states.
+    READY
+        -> STARTING
+        -> virsh start
+        -> verify running state
+        -> SUCCESS
+
+Runtime integration:
+
+- LOCAL RestoreOperations are cooperatively advanced by the daemon
+  controller runtime;
+- no separate competing restore worker owns restore state;
+- the existing application `restore.create` / `restore.list` /
+  `restore.show` surface remains sufficient;
+- no synthetic `restore.run` RPC was added;
+- restore execution obeys the existing libvirt mutation gate;
+- read-only/debug mode does not execute restore mutation.
+
+Start guarantees:
+
+- `STARTING` is persisted before external VM-start mutation;
+- target domain name and frozen UUID are rechecked before start;
+- persistent domain XML is rechecked before start;
+- DISCONNECTED interfaces must still have link state down;
+- mutating start surface is limited to
+  `virsh --connect <uri> start <target_vm_name>`;
+- successful virsh return alone does not establish SUCCESS;
+- libvirt `domstate` must report `running`;
+- frozen identity and disconnected network definition are checked
+  again after start;
+- any ambiguous failure after entering STARTING becomes
+  `RECOVERY_REQUIRED` with
+  `recovery_from_state = STARTING`.
+
+Controller-restart safety:
+
+- interrupted ACQUIRING is never automatically resumed;
+- interrupted MATERIALIZING is never automatically resumed;
+- interrupted DEFINING is never automatically resumed;
+- interrupted STARTING is never automatically resumed;
+- unsafe operations discovered on controller startup are moved to
+  `RECOVERY_REQUIRED`;
+- normal live progression from freshly completed materialization
+  into DEFINING remains supported on the next cooperative tick.
+
+Remote boundary:
+
+- existing remote restore source identity and manifest work remains
+  preserved;
+- actual SSH restore-byte acquisition remains unimplemented;
+- attempted REMOTE restore execution fails explicitly with
+  `RESTORE_REMOTE_ACQUISITION_NOT_IMPLEMENTED`;
+- no SSH restore-byte transport was introduced by A3.5.4.
+
+End-to-end LOCAL acceptance proves both:
+
+    start_after_restore = false
+    start_after_restore = true
+
+using the real restore pipeline components:
+
+- `LocalRestoreExecutor`;
+- `LocalRestoreSourceInspector`;
+- `LocalRestoreMaterializer`;
+- `LocalRestoreDomainBuilder`;
+- `LocalRestoreDefinitionExecutor`;
+- `LocalRestoreStartExecutor`;
+- `LocalRestorePipeline`.
+
+The acceptance proves:
+
+- a verified FULL LOCAL Restore Point can be consumed;
+- source verification succeeds;
+- target materialization succeeds;
+- persistent disconnected libvirt definition succeeds;
+- optional VM start succeeds when requested;
+- terminal state becomes SUCCESS;
+- restored writable qcow2 is an independent filesystem object;
+- source and target disk inode identities differ;
+- restored disk content matches the source backup disk;
+- defined VM disk paths reference only the restored target copy;
+- published backup paths do not appear in the restored domain
+  definition;
+- the original published Restore Point remains unchanged
+  byte-for-byte and identity-for-identity after complete restore;
+- the original source remains independently verifiable after the
+  restore completes.
+
+Acceptance evidence:
+
+- A3.5.4 runtime focused suite: 18 tests passed;
+- real LOCAL end-to-end pipeline acceptance passed for both optional
+  start modes;
+- complete LOCAL restore acceptance suite passed;
+- existing runtime/bootstrap-discovered test suite passed;
+- full project pytest regression: 100% passed;
+- Python compileall: rc=0;
+- `git diff --check`: clean.
+
+A3.5 LOCAL restore execution is therefore complete.
+
+Remote restore data acquisition remains explicitly deferred to the
+separate remote-acquisition phase.
 
 ### Deferred remote restore acquisition
 
