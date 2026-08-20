@@ -5751,15 +5751,12 @@ class SQLiteRepository:
                     "reclaim catalog retirement lineage changed"
                 )
 
-            if (
-                SpaceReclaimMode(context["space_reclaim_mode"])
-                is not SpaceReclaimMode.SPACE_OPTIMIZED
-            ):
-                raise DomainInvariantError(
-                    "reclaim catalog retirement requires "
-                    "SPACE_OPTIMIZED policy"
-                )
-
+            # SPACE_OPTIMIZED authorization is enforced before the
+            # destructive reclaim transaction begins. Once durable state
+            # reached QUARANTINED, the source bundle has already moved out
+            # of its canonical namespace. A later job-policy change to SAFE
+            # applies to future reclaim decisions and must not strand this
+            # already-destructive transaction indefinitely.
             all_chains = self.connection.execute(
                 """SELECT *
                    FROM backup_chains
@@ -5927,6 +5924,10 @@ class SQLiteRepository:
                 "?" for _ in source_run_ids
             )
 
+            # Only a live execution dependency may prevent retirement.
+            # SUCCESS/FAILED JobRuns are immutable historical audit rows:
+            # keeping their old parent_restore_point_id forever would make
+            # an otherwise-retirable FULL chain permanently undeletable.
             external_run_dependency = self.connection.execute(
                 f"""SELECT id
                     FROM job_runs
@@ -5936,6 +5937,7 @@ class SQLiteRepository:
                       AND id NOT IN (
                         {run_placeholders}
                     )
+                      AND state NOT IN ('SUCCESS', 'FAILED')
                     LIMIT 1""",
                 selected_point_ids + source_run_ids,
             ).fetchone()
@@ -5988,17 +5990,20 @@ class SQLiteRepository:
                     artifact_ids,
                 )
 
-            # Historical source runs may reference an earlier restore point
-            # inside the same retired chain. Those references cannot survive
-            # deletion of the restore-point rows.
+            # Historical terminal runs may reference a Restore Point in
+            # the retired chain. Preserve the audit rows, but sever those
+            # historical FKs atomically before deleting catalog metadata.
+            #
+            # Non-terminal runs were rejected by the dependency guard above
+            # and are never modified here.
             self.connection.execute(
                 f"""UPDATE job_runs
                     SET parent_restore_point_id = NULL
-                    WHERE id IN ({run_placeholders})
-                      AND parent_restore_point_id IN (
-                          {point_placeholders}
-                      )""",
-                source_run_ids + selected_point_ids,
+                    WHERE parent_restore_point_id IN (
+                        {point_placeholders}
+                    )
+                      AND state IN ('SUCCESS', 'FAILED')""",
+                selected_point_ids,
             )
 
             # Delete child incrementals before their parents so immediate

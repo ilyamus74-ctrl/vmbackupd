@@ -773,6 +773,26 @@ class LibvirtBackupExecutor:
         else:
             execution = "NO_COMPLETE_PLAN"
 
+        issue_details = []
+
+        for issue in capacity_plan.inspection_issues[:8]:
+            reason = " ".join(
+                str(issue.reason).split()
+            )
+
+            if len(reason) > 240:
+                reason = reason[:237] + "..."
+
+            issue_details.append(
+                f"{issue.chain_id}:{reason}"
+            )
+
+        issues = (
+            "|".join(issue_details)
+            if issue_details
+            else "-"
+        )
+
         return LibvirtExecutionSafetyError(
             "insufficient staging space: "
             f"estimate={estimate}, free={free}, reserve={reserve}, "
@@ -786,6 +806,7 @@ class LibvirtBackupExecutor:
             "backup_possible_after_reclaim="
             f"{str(reclaim.backup_possible_after_reclaim).lower()}, "
             f"inspection_issues={len(capacity_plan.inspection_issues)}, "
+            f"inspection_issue_details={issues}, "
             f"reclaim_execution={execution}"
         )
 

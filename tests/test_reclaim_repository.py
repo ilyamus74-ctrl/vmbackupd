@@ -1457,6 +1457,178 @@ def test_catalog_retirement_refuses_external_run_dependency_atomically(
     ).fetchone()[0] == 1
 
 
+
+
+@pytest.mark.parametrize(
+    "terminal_state",
+    [
+        RunState.FAILED,
+        RunState.SUCCESS,
+    ],
+)
+def test_catalog_retirement_allows_terminal_external_run_dependency_and_clears_parent(
+    tmp_path,
+    terminal_state,
+):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / f"terminal-external-{terminal_state.value}.db"
+    )
+
+    operation, chain, points = make_quarantined_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+    )
+
+    historical = JobRun(
+        job_id=job.id,
+        storage_destination_id=job.storage_destination_id,
+        state=terminal_state,
+        planned_kind=BackupKind.INCREMENTAL,
+        planned_chain_id=chain.id,
+        planned_sequence=1,
+        parent_restore_point_id=points[0].id,
+        error=(
+            "historical failed incremental"
+            if terminal_state is RunState.FAILED
+            else None
+        ),
+    )
+    repository.add_run(historical)
+
+    operation = repository.retire_reclaim_catalog(
+        operation.id
+    )
+
+    assert (
+        operation.state
+        is ReclaimOperationState.CATALOG_REMOVED
+    )
+
+    persisted = repository.get_run(
+        historical.id
+    )
+
+    assert (
+        persisted.state
+        is terminal_state
+    )
+
+    # Historical audit row survives, but its FK to retired backup
+    # metadata must not keep that Restore Point alive forever.
+    assert (
+        persisted.parent_restore_point_id
+        is None
+    )
+
+    assert repository.connection.execute(
+        "SELECT COUNT(*) FROM restore_points WHERE id = ?",
+        (points[0].id,),
+    ).fetchone()[0] == 0
+
+    assert repository.connection.execute(
+        "SELECT COUNT(*) FROM backup_chains WHERE id = ?",
+        (chain.id,),
+    ).fetchone()[0] == 0
+
+
+def test_catalog_retirement_still_refuses_live_external_run_dependency(
+    tmp_path,
+):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "live-external-dependency.db"
+    )
+
+    operation, chain, points = make_quarantined_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+    )
+
+    live = JobRun(
+        job_id=job.id,
+        storage_destination_id=job.storage_destination_id,
+        state=RunState.QUEUED,
+        planned_kind=BackupKind.INCREMENTAL,
+        planned_chain_id=chain.id,
+        planned_sequence=1,
+        parent_restore_point_id=points[0].id,
+    )
+    repository.add_run(live)
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="external job run depends",
+    ):
+        repository.retire_reclaim_catalog(
+            operation.id
+        )
+
+    assert (
+        repository.get_reclaim_operation(
+            operation.id
+        ).state
+        is ReclaimOperationState.QUARANTINED
+    )
+
+    assert (
+        repository.get_run(
+            live.id
+        ).parent_restore_point_id
+        == points[0].id
+    )
+
+
+
+
+def test_catalog_retirement_finishes_quarantined_reclaim_after_policy_changes_to_safe(
+    tmp_path,
+):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "quarantined-policy-changed.db",
+        mode=SpaceReclaimMode.SPACE_OPTIMIZED,
+    )
+
+    operation, chain, points = make_quarantined_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+    )
+
+    # Reclaim was already authorized and reached the destructive
+    # QUARANTINED stage under SPACE_OPTIMIZED. Changing future policy
+    # to SAFE must not strand the already-moved bundle forever.
+    repository.connection.execute(
+        """UPDATE backup_jobs
+           SET space_reclaim_mode = 'SAFE'
+           WHERE id = ?""",
+        (job.id,),
+    )
+    repository.connection.commit()
+
+    operation = repository.retire_reclaim_catalog(
+        operation.id
+    )
+
+    assert (
+        operation.state
+        is ReclaimOperationState.CATALOG_REMOVED
+    )
+
+    assert repository.connection.execute(
+        "SELECT COUNT(*) FROM restore_points WHERE id = ?",
+        (points[0].id,),
+    ).fetchone()[0] == 0
+
+    assert repository.connection.execute(
+        "SELECT COUNT(*) FROM backup_chains WHERE id = ?",
+        (chain.id,),
+    ).fetchone()[0] == 0
+
+
 def test_catalog_retirement_refuses_snapshot_drift_atomically(
     tmp_path,
 ):
