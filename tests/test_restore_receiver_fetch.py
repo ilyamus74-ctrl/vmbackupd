@@ -13,6 +13,9 @@ from vmbackupd.receiver_resolver import (
     helper_main,
     resolve_receiver_storage_readonly,
 )
+from vmbackupd.receiver_restore import (
+    sanitize_manifest_result,
+)
 
 
 STORAGE_ID = str(uuid.uuid4())
@@ -163,6 +166,15 @@ def test_published_replica_manifest_is_safe_and_stable(
         value["bundle_object_id"]
         == OBJECT_ID
     )
+
+    # The existing published-replica read boundary must remain
+    # wire-compatible with the restricted restore-manifest SSH
+    # protocol.
+    assert sanitize_manifest_result(
+        value,
+        storage_id=STORAGE_ID,
+        restore_point_id=POINT_ID,
+    ) == value
 
     assert {
         item["relative_path"]

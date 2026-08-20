@@ -25,6 +25,10 @@ from .receiver_publish import (
     PUBLISH_COMMAND,
     run_receiver_publish,
 )
+from .receiver_restore import (
+    RESTORE_MANIFEST_COMMAND,
+    run_receiver_restore_manifest,
+)
 from .receiver_transfer import (
     TRANSFER_COMMAND,
     run_receiver_transfer,
@@ -140,6 +144,7 @@ def main(
     catalog_client=None,
     transfer_runner=None,
     publish_runner=None,
+    restore_manifest_runner=None,
 ) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
 
@@ -182,6 +187,14 @@ def main(
             run_receiver_publish
             if publish_runner is None
             else publish_runner
+        )
+        return runner()
+
+    if original == RESTORE_MANIFEST_COMMAND:
+        runner = (
+            run_receiver_restore_manifest
+            if restore_manifest_runner is None
+            else restore_manifest_runner
         )
         return runner()
 
