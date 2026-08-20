@@ -3014,13 +3014,122 @@ outside R3.4 and are the next milestone.
 
 ---
 
+## R3.5 / A3.2 remote restore placement binding
+
+Status:
+
+    CLOSED
+
+Closing implementation commit:
+
+    0d46f84 — Bind remote restore placement to discovered nodes
+    0d46f8496307e84cf807b3fdd26851a4ad560783
+
+A3.2 establishes durable receiver placement identity required for restore from
+a remote REPLICA. It does not yet execute the restore itself.
+
+A controller-side SSH StorageDestination that uses stable
+`remote_storage_id` can now be bound to the stable identity of the discovered
+receiver node:
+
+    remote_storage_id
+        + receiver discovery
+        -> node.node_id / node.node_name
+        -> registered remote node
+        -> storage_destinations.remote_node_id
+
+Schema version advanced:
+
+    v14 -> v15
+
+The v15 storage contract adds nullable `remote_node_id` referencing
+`nodes(id)`.
+
+Existing v14 SSH destinations migrate without network access or receiver
+discovery:
+
+    remote_node_id = NULL
+
+This preserves existing destination IDs, jobs, runs, restore points, replica
+metadata, and remote storage identity while allowing placement identity to be
+enriched later.
+
+Receiver node registration is fail-closed:
+
+- rediscovery of the same `node_id` and same `node_name` is idempotent;
+- an existing `node_id` with a different name is rejected;
+- an existing node name presented with a different `node_id` is rejected;
+- a storage destination cannot reference an unregistered remote node.
+
+Transport invariants remain explicit:
+
+- LOCAL destinations cannot contain `remote_node_id`;
+- legacy SSH destinations using `ssh_remote_root` cannot contain
+  `remote_node_id`;
+- `remote_node_id` belongs only to the stable `remote_storage_id` SSH
+  identity contract;
+- SSH backup execution remains guarded by the existing
+  `REMOTE_TRANSPORT_NOT_IMPLEMENTED` boundary.
+
+Historical destination identity remains immutable. For a destination already
+referenced by a job run, A3.2 permits exactly one placement enrichment:
+
+    NULL -> remote_node_id
+
+After enrichment, both operations are rejected:
+
+    remote_node_id A -> remote_node_id B
+    remote_node_id A -> NULL
+
+The rule is enforced both by repository invariants and by the SQLite
+`storage_destination_remote_node_immutable_after_run` trigger.
+
+Application storage discovery now records the receiver node identity together
+with the selected stable remote storage identity. The serialized storage API
+also exposes `remote_node_id`.
+
+Acceptance passed:
+
+- dedicated remote restore placement regression;
+- stable and fail-closed receiver node registration tests;
+- locked destination one-time placement enrichment test;
+- direct SQLite immutable-trigger regression;
+- LOCAL/remote-node transport-contract regression;
+- v14 -> v15 schema migration regression;
+- migration preservation and foreign-key validation;
+- historical v1-v14 migration fixture regressions;
+- focused A3.2 regression suite;
+- full project pytest regression;
+- Python compilation;
+- `git diff --check`.
+
+A3.2 therefore closes the durable remote restore placement binding required
+before remote replica restore execution.
+
+R3.5 itself remains in progress. Remote restore execution and end-to-end
+restore acceptance are not completed by A3.2.
+
+---
+
 # Current position
 
 Current implementation milestone:
 
+    R3.5 remote replica restore acceptance — IN PROGRESS
+
+Completed R3.5 sub-milestone:
+
+    A3.2 remote restore placement binding — CLOSED
+
+A3.2 closing implementation commit:
+
+    0d46f84 — Bind remote restore placement to discovered nodes
+
+Previous closed milestone:
+
     R3.4 remote semantic verification and atomic replica publication — CLOSED
 
-Closing implementation head:
+R3.4 closing implementation head:
 
     c2727c7 — Finalize remote replica publication
 
@@ -3028,9 +3137,9 @@ Supporting receiver publication commit:
 
     7e7613e — Add remote replica verification and publication
 
-Next implementation milestone:
+Next R3.5 work:
 
-    R3.5 remote replica restore acceptance
+    remote replica restore execution and end-to-end restore acceptance
 
 Current safety boundary:
 
@@ -3079,4 +3188,7 @@ Current safety boundary:
     CLI replica controls          YES
     sender SSH transfer           YES
     replica transfer execution    YES
-    remote verification/publish   NO
+    remote verification/publish   YES
+    remote restore placement      YES
+    remote restore execution      NO
+    remote restore acceptance     NO
