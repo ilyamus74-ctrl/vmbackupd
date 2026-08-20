@@ -34,6 +34,9 @@ from .reclaim_execution import (
     ReclaimExecutor, ReclaimInsufficientSpaceError,
     ReclaimRecoveryRequiredError,
 )
+from .retention_execution import (
+    RetentionReclaimService,
+)
 from .planner import BackupPlanner
 from .repository import DomainInvariantError, SQLiteRepository
 
@@ -561,6 +564,14 @@ class LibvirtBackupExecutor:
                 BundlePhysicalInspector(self.bundle_planner)
             ),
         )
+        self.retention_reclaim = RetentionReclaimService(
+            repository,
+            self.bundle_planner,
+            free_space_reader=(
+                lambda _:
+                    self.staging.free_space()[0]
+            ),
+        )
         self._ownership_tokens: set[str] = set()
         self._current_step_owned = False
 
@@ -610,13 +621,239 @@ class LibvirtBackupExecutor:
         if run.state is RunState.FINALIZING:
             try:
                 self._publish_bundle(run)
-                return self.repository.finalize_success(run_id)
+                successful = self.repository.finalize_success(
+                    run_id
+                )
             except Exception as exc:
                 return self.repository.mark_recovery_required(
-                    run_id, f"bundle publication/finalization requires recovery: {exc}",
+                    run_id,
+                    "bundle publication/finalization "
+                    f"requires recovery: {exc}",
                     self.clock.now(),
                 )
+
+            # SUCCESS is already durably committed here. Retention is
+            # subordinate maintenance and must never rewrite that outcome.
+            self._post_success_retention(
+                successful
+            )
+            return successful
         return run
+
+    def _record_retention_event(
+        self,
+        run_id: str,
+        event_type: str,
+        message: str,
+    ) -> None:
+        """Retention diagnostics must never alter backup SUCCESS."""
+
+        try:
+            self.repository.record_event(
+                Event(
+                    job_run_id=run_id,
+                    event_type=event_type,
+                    message=message,
+                )
+            )
+        except Exception:
+            # The backup result is already SUCCESS. Even failure to persist
+            # subordinate diagnostics cannot rewrite that durable outcome.
+            pass
+
+    def catch_up_retention(
+        self,
+        run_id: str,
+    ) -> None:
+        """Catch one SUCCESS whose post-success maintenance was interrupted."""
+
+        run = self.repository.get_run(
+            run_id
+        )
+
+        if run.state is not RunState.SUCCESS:
+            return
+
+        existing = (
+            self.repository.get_reclaim_operation_for_run(
+                run.id,
+                purpose="RETENTION",
+            )
+        )
+
+        if existing is not None:
+            if (
+                existing.state
+                is ReclaimOperationState.RECOVERY_REQUIRED
+            ):
+                self._record_retention_event(
+                    run.id,
+                    "RETENTION_RECLAIM_RECOVERY_REQUIRED",
+                    (
+                        f"operation={existing.id}; "
+                        "automatic recovery is disabled"
+                    ),
+                )
+                return
+
+            destructive_states = {
+                ReclaimOperationState.RETIRING,
+                ReclaimOperationState.QUARANTINED,
+                ReclaimOperationState.CATALOG_REMOVED,
+                ReclaimOperationState.PURGING,
+                ReclaimOperationState.PURGED,
+            }
+
+            if existing.state in destructive_states:
+                try:
+                    frozen = (
+                        self.repository.require_reclaim_recovery(
+                            existing.id,
+                            (
+                                "post-success retention was interrupted "
+                                "during destructive execution; "
+                                "explicit repair is required"
+                            ),
+                        )
+                    )
+                except Exception as exc:
+                    self._record_retention_event(
+                        run.id,
+                        "RETENTION_RECLAIM_FAILED",
+                        (
+                            "failed to freeze interrupted retention "
+                            f"reclaim: {type(exc).__name__}: {exc}"
+                        ),
+                    )
+                    return
+
+                self._record_retention_event(
+                    run.id,
+                    "RETENTION_RECLAIM_RECOVERY_REQUIRED",
+                    (
+                        f"operation={frozen.id}; "
+                        "interrupted_from="
+                        f"{frozen.recovery_from_state.value}; "
+                        "automatic destructive recovery is disabled"
+                    ),
+                )
+                return
+
+        # No operation, PLANNED, COMPLETED or ABORTED are safe to feed
+        # through the normal idempotent post-success maintenance path.
+        self._post_success_retention(
+            run
+        )
+
+    def _post_success_retention(
+        self,
+        run: JobRun,
+    ) -> None:
+        try:
+            result = (
+                self.retention_reclaim.execute_for_run(
+                    run.id
+                )
+            )
+        except Exception as exc:
+            self._record_retention_event(
+                run.id,
+                "RETENTION_RECLAIM_FAILED",
+                (
+                    f"{type(exc).__name__}: "
+                    f"{exc}"
+                ),
+            )
+            return
+
+        if result.skipped_chain_ids:
+            issue_by_chain = {
+                issue.chain_id: " ".join(
+                    str(issue.reason).split()
+                )
+                for issue in result.inspection_issues
+            }
+
+            details = []
+
+            for chain_id in result.skipped_chain_ids[:8]:
+                reason = issue_by_chain.get(
+                    chain_id,
+                    "physical inspection unavailable",
+                )
+
+                if len(reason) > 240:
+                    reason = (
+                        reason[:237]
+                        + "..."
+                    )
+
+                details.append(
+                    f"{chain_id}:{reason}"
+                )
+
+            self._record_retention_event(
+                run.id,
+                "RETENTION_RECLAIM_SKIPPED",
+                (
+                    "automatic retention skipped unsafe "
+                    "or ambiguous chains: "
+                    + "|".join(details)
+                ),
+            )
+
+        operation = result.operation
+
+        if (
+            operation is None
+            and not result.expired_chain_ids
+        ):
+            self._record_retention_event(
+                run.id,
+                "RETENTION_RECLAIM_NOOP",
+                "current retention policy has no expired chains",
+            )
+            return
+
+        if (
+            operation is not None
+            and operation.state
+                is ReclaimOperationState.ABORTED
+        ):
+            self._record_retention_event(
+                run.id,
+                "RETENTION_RECLAIM_ABORTED",
+                (
+                    f"operation={operation.id}; "
+                    "retention reclaim was aborted before "
+                    "destructive execution"
+                ),
+            )
+            return
+
+        if (
+            operation is not None
+            and operation.state
+                is ReclaimOperationState.COMPLETED
+        ):
+            self._record_retention_event(
+                run.id,
+                "RETENTION_RECLAIM_COMPLETED",
+                (
+                    f"operation={operation.id}, "
+                    "selected_chain_ids="
+                    + (
+                        ",".join(
+                            result.selected_chain_ids
+                        )
+                        or "-"
+                    )
+                    + ", expected_reclaim_bytes="
+                    f"{operation.expected_reclaim_bytes}, "
+                    "free_bytes_after="
+                    f"{operation.free_bytes_after}"
+                ),
+            )
 
     def _advance_backup(self, run: JobRun) -> JobRun:
         operation = self._operation(run.id)

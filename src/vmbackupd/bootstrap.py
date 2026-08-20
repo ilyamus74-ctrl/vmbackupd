@@ -94,6 +94,9 @@ class StorageRoutingExecutor:
     def advance_run(self, run_id): return self._for_run(run_id).advance_run(run_id)
     def advance_cleanup(self, run_id): return self._for_run(run_id).advance_cleanup(run_id)
 
+    def catch_up_retention(self, run_id):
+        return self._for_run(run_id).catch_up_retention(run_id)
+
 
 class RuntimeWorkerState(StrEnum):
     STARTING = "STARTING"

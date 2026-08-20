@@ -6,7 +6,7 @@ import pytest
 
 from vmbackupd.models import (
     BackupChain, BackupChainStatus, BackupJob, BackupKind, JobRun, Node,
-    ReclaimBundleState, ReclaimOperation, ReclaimOperationState,
+    ReclaimBundleState, ReclaimOperation, ReclaimOperationState, ReclaimPurpose,
     RestorePoint, RetentionPolicy,
     RunState, SpaceReclaimMode, StorageDestination, VM,
 )
@@ -2039,3 +2039,453 @@ def test_begin_bundle_purge_intent_requires_operation_purging(
     )[0]
 
     assert bundle.state.value == "QUARANTINED"
+
+
+
+def test_capacity_reclaim_persists_capacity_purpose(
+    tmp_path,
+):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "capacity-purpose.db",
+        mode=SpaceReclaimMode.SPACE_OPTIMIZED,
+    )
+
+    operation, _, _ = make_planned_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+    )
+
+    assert operation.purpose is ReclaimPurpose.CAPACITY
+
+    persisted = repository.get_reclaim_operation_for_run(
+        target_run.id
+    )
+
+    assert persisted is not None
+    assert persisted.id == operation.id
+    assert persisted.purpose is ReclaimPurpose.CAPACITY
+
+def retention_catalog(path):
+    repository, node, destination, vm, job, target_run = catalog(
+        path,
+        mode=SpaceReclaimMode.SAFE,
+        minimum_full_chains=1,
+    )
+
+    repository.connection.execute(
+        """UPDATE job_runs
+           SET state = 'SUCCESS',
+               recovery_required = 0,
+               recovery_reason = NULL
+           WHERE id = ?""",
+        (target_run.id,),
+    )
+
+    repository.connection.execute(
+        """UPDATE backup_jobs
+           SET restore_points_to_retain = 0,
+               full_chains_to_retain = 1,
+               minimum_full_chains = 1,
+               space_reclaim_mode = 'SAFE'
+           WHERE id = ?""",
+        (job.id,),
+    )
+
+    repository.connection.commit()
+
+    old_chain, old_points = add_chain(
+        repository,
+        job,
+        vm,
+        "retention-old",
+        status=BackupChainStatus.CLOSED,
+        points=1,
+        created_offset=-20,
+    )
+
+    active_chain, active_points = add_chain(
+        repository,
+        job,
+        vm,
+        "retention-active",
+        status=BackupChainStatus.ACTIVE,
+        points=1,
+        created_offset=-10,
+    )
+
+    return (
+        repository,
+        node,
+        destination,
+        vm,
+        job,
+        target_run,
+        old_chain,
+        old_points,
+        active_chain,
+        active_points,
+    )
+
+
+def test_retention_reclaim_persists_safe_post_success_snapshot(
+    tmp_path,
+):
+    (
+        repository,
+        _,
+        destination,
+        vm,
+        job,
+        target_run,
+        old_chain,
+        old_points,
+        _,
+        _,
+    ) = retention_catalog(
+        tmp_path / "retention-snapshot.db"
+    )
+
+    operation = (
+        repository.create_retention_reclaim_operation(
+            target_run.id,
+            [(old_chain.id, 123)],
+            free_bytes_before=456,
+        )
+    )
+
+    assert (
+        operation.purpose
+        is ReclaimPurpose.RETENTION
+    )
+    assert (
+        operation.state
+        is ReclaimOperationState.PLANNED
+    )
+    assert operation.job_run_id == target_run.id
+    assert operation.job_id == job.id
+    assert operation.vm_id == vm.id
+    assert (
+        operation.storage_destination_id
+        == destination.id
+    )
+    assert operation.required_backup_bytes == 0
+    assert operation.reserve_bytes == 0
+    assert operation.free_bytes_before == 456
+    assert operation.expected_reclaim_bytes == 123
+
+    chains = repository.list_reclaim_chains(
+        operation.id
+    )
+    assert [
+        (
+            item.chain_id,
+            item.expected_physical_bytes,
+        )
+        for item in chains
+    ] == [
+        (old_chain.id, 123)
+    ]
+
+    bundles = repository.list_reclaim_bundles(
+        operation.id
+    )
+
+    assert [
+        item.restore_point_id
+        for item in bundles
+    ] == [
+        old_points[0].id
+    ]
+
+
+def test_retention_reclaim_revalidates_mutable_policy_before_retiring(
+    tmp_path,
+):
+    (
+        repository,
+        _,
+        _,
+        _,
+        job,
+        target_run,
+        old_chain,
+        _,
+        _,
+        _,
+    ) = retention_catalog(
+        tmp_path / "retention-policy-drift.db"
+    )
+
+    operation = (
+        repository.create_retention_reclaim_operation(
+            target_run.id,
+            [(old_chain.id, 100)],
+            free_bytes_before=1000,
+        )
+    )
+
+    # The selected CLOSED chain is no longer expired.
+    repository.connection.execute(
+        """UPDATE backup_jobs
+           SET restore_points_to_retain = 10,
+               full_chains_to_retain = 2
+           WHERE id = ?""",
+        (job.id,),
+    )
+    repository.connection.commit()
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="no longer expired",
+    ):
+        repository.begin_reclaim_retirement(
+            operation.id
+        )
+
+    assert (
+        repository.get_reclaim_operation(
+            operation.id
+        ).state
+        is ReclaimOperationState.PLANNED
+    )
+
+
+def test_retention_reclaim_creation_refuses_replica_task_atomically(
+    tmp_path,
+):
+    (
+        repository,
+        node,
+        _,
+        _,
+        _,
+        target_run,
+        old_chain,
+        old_points,
+        _,
+        _,
+    ) = retention_catalog(
+        tmp_path / "retention-replica-task.db"
+    )
+
+    replica = StorageDestination(
+        node_id=node.id,
+        name="replica",
+        backup_data_root="/replica",
+    )
+    repository.add_storage_destination(
+        replica
+    )
+
+    repository.connection.execute(
+        """INSERT INTO replica_tasks (
+               id,
+               restore_point_id,
+               destination_id,
+               state,
+               attempts,
+               last_error,
+               next_retry_at,
+               created_at,
+               updated_at
+           ) VALUES (
+               ?, ?, ?,
+               'FAILED',
+               1,
+               'synthetic failure',
+               NULL,
+               ?, ?
+           )""",
+        (
+            "retention-replica-task",
+            old_points[0].id,
+            replica.id,
+            NOW.isoformat(),
+            NOW.isoformat(),
+        ),
+    )
+    repository.connection.commit()
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="replica task",
+    ):
+        repository.create_retention_reclaim_operation(
+            target_run.id,
+            [(old_chain.id, 100)],
+            free_bytes_before=1000,
+        )
+
+    assert (
+        repository.get_reclaim_operation_for_run(
+            target_run.id,
+            purpose=ReclaimPurpose.RETENTION,
+        )
+        is None
+    )
+
+
+def test_retention_reclaim_refuses_replica_location_before_destructive_stage(
+    tmp_path,
+):
+    (
+        repository,
+        node,
+        _,
+        _,
+        _,
+        target_run,
+        old_chain,
+        old_points,
+        _,
+        _,
+    ) = retention_catalog(
+        tmp_path / "retention-replica-location.db"
+    )
+
+    operation = (
+        repository.create_retention_reclaim_operation(
+            target_run.id,
+            [(old_chain.id, 100)],
+            free_bytes_before=1000,
+        )
+    )
+
+    replica = StorageDestination(
+        node_id=node.id,
+        name="replica",
+        backup_data_root="/replica",
+    )
+    repository.add_storage_destination(
+        replica
+    )
+
+    repository.connection.execute(
+        """INSERT INTO restore_point_locations (
+               restore_point_id,
+               destination_id,
+               role,
+               state,
+               bundle_object_id,
+               verified_at,
+               created_at
+           ) VALUES (
+               ?, ?,
+               'REPLICA',
+               'AVAILABLE',
+               ?,
+               ?,
+               ?
+           )""",
+        (
+            old_points[0].id,
+            replica.id,
+            "/replica/retention-old",
+            NOW.isoformat(),
+            NOW.isoformat(),
+        ),
+    )
+    repository.connection.commit()
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="replica location",
+    ):
+        repository.begin_reclaim_retirement(
+            operation.id
+        )
+
+    assert (
+        repository.get_reclaim_operation(
+            operation.id
+        ).state
+        is ReclaimOperationState.PLANNED
+    )
+
+
+def test_catalog_retirement_refuses_late_replica_location_atomically(
+    tmp_path,
+):
+    repository, node, _, vm, job, target_run = catalog(
+        tmp_path / "late-replica-location.db"
+    )
+
+    operation, chain, points = make_quarantined_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+    )
+
+    replica = StorageDestination(
+        node_id=node.id,
+        name="replica",
+        backup_data_root="/replica",
+    )
+    repository.add_storage_destination(
+        replica
+    )
+
+    repository.connection.execute(
+        """INSERT INTO restore_point_locations (
+               restore_point_id,
+               destination_id,
+               role,
+               state,
+               bundle_object_id,
+               verified_at,
+               created_at
+           ) VALUES (
+               ?, ?,
+               'REPLICA',
+               'AVAILABLE',
+               ?,
+               ?,
+               ?
+           )""",
+        (
+            points[0].id,
+            replica.id,
+            "/replica/late",
+            NOW.isoformat(),
+            NOW.isoformat(),
+        ),
+    )
+    repository.connection.commit()
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="replica location",
+    ):
+        repository.retire_reclaim_catalog(
+            operation.id
+        )
+
+    assert (
+        repository.get_reclaim_operation(
+            operation.id
+        ).state
+        is ReclaimOperationState.QUARANTINED
+    )
+
+    assert (
+        repository.connection.execute(
+            """SELECT COUNT(*)
+               FROM restore_points
+               WHERE id = ?""",
+            (points[0].id,),
+        ).fetchone()[0]
+        == 1
+    )
+
+    assert (
+        repository.connection.execute(
+            """SELECT COUNT(*)
+               FROM backup_chains
+               WHERE id = ?""",
+            (chain.id,),
+        ).fetchone()[0]
+        == 1
+    )

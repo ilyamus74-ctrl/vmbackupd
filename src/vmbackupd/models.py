@@ -138,6 +138,11 @@ class SpaceReclaimMode(StrEnum):
     SPACE_OPTIMIZED = "SPACE_OPTIMIZED"
 
 
+class ReclaimPurpose(StrEnum):
+    CAPACITY = "CAPACITY"
+    RETENTION = "RETENTION"
+
+
 class ReclaimOperationState(StrEnum):
     PLANNED = "PLANNED"
     RETIRING = "RETIRING"
@@ -776,6 +781,7 @@ class ReclaimOperation:
     free_bytes_before: int
     reserve_bytes: int
     expected_reclaim_bytes: int
+    purpose: ReclaimPurpose = ReclaimPurpose.CAPACITY
     state: ReclaimOperationState = ReclaimOperationState.PLANNED
     recovery_from_state: ReclaimOperationState | None = None
     free_bytes_after: int | None = None
@@ -795,6 +801,12 @@ class ReclaimOperation:
                 raise ValueError(f"{name} must be non-negative")
         if self.free_bytes_after is not None and self.free_bytes_after < 0:
             raise ValueError("free_bytes_after must be non-negative")
+        try:
+            purpose = ReclaimPurpose(self.purpose)
+        except ValueError as exc:
+            raise ValueError("invalid reclaim purpose") from exc
+        object.__setattr__(self, "purpose", purpose)
+
         try:
             state = ReclaimOperationState(self.state)
         except ValueError as exc:

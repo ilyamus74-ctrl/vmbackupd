@@ -4,7 +4,7 @@ import pytest
 
 from vmbackupd.clock import FakeClock
 from vmbackupd.engine import MockBackupEngine
-from vmbackupd.models import BackupJob, JobRun, Node, RunState, StorageDestination, VM
+from vmbackupd.models import BackupJob, Event, JobRun, Node, RunState, StorageDestination, VM
 from vmbackupd.repository import SQLiteRepository
 from vmbackupd.runtime import DaemonRuntime
 
@@ -189,3 +189,318 @@ def test_stale_unsafe_lease_is_removed_without_restart(runtime_domain):
     runtime.tick()
     assert repository.get_run(run.id).state is RunState.BACKING_UP
     assert repository.list_restore_points(vm.id) == []
+
+
+def test_first_tick_catches_latest_success_retention_once_before_scheduler(
+    runtime_domain,
+):
+    repository, node, _, first, _, clock = runtime_domain
+
+    engine = MockBackupEngine(
+        repository
+    )
+
+    older = engine.execute(
+        first.id,
+        backup_object_id="mock://older",
+    )
+
+    newer = engine.execute(
+        first.id,
+        backup_object_id="mock://newer",
+    )
+
+    # Keep scheduler out of this crash-window test.
+    repository.connection.execute(
+        """UPDATE backup_jobs
+           SET enabled = 0"""
+    )
+    repository.connection.commit()
+
+    class CatchUpExecutor:
+        def __init__(self):
+            self.calls = []
+
+        def catch_up_retention(
+            self,
+            run_id,
+        ):
+            self.calls.append(
+                run_id
+            )
+
+        def advance_run(
+            self,
+            run_id,
+        ):
+            raise AssertionError(
+                "no backup run should advance"
+            )
+
+        def advance_cleanup(
+            self,
+            run_id,
+        ):
+            raise AssertionError(
+                "no cleanup should advance"
+            )
+
+    executor = CatchUpExecutor()
+
+    runtime = DaemonRuntime(
+        repository,
+        node.id,
+        clock,
+        executor,
+    )
+
+    runtime.start()
+
+    # start() itself must remain lightweight.
+    assert executor.calls == []
+
+    runtime.tick()
+
+    # Only the newest SUCCESS for this job represents current
+    # post-success retention responsibility.
+    assert executor.calls == [
+        newer.id
+    ]
+
+    assert older.id not in executor.calls
+
+    # Catch-up is one-shot for one controller lifetime.
+    runtime.tick()
+
+    assert executor.calls == [
+        newer.id
+    ]
+
+
+def test_terminal_retention_event_suppresses_restart_catchup(
+    runtime_domain,
+):
+    repository, node, _, first, _, clock = runtime_domain
+
+    run = MockBackupEngine(
+        repository
+    ).execute(
+        first.id,
+        backup_object_id="mock://success",
+    )
+
+    repository.record_event(
+        Event(
+            job_run_id=run.id,
+            event_type="RETENTION_RECLAIM_NOOP",
+            message="already reconciled",
+            created_at=clock.now(),
+        )
+    )
+
+    repository.connection.execute(
+        """UPDATE backup_jobs
+           SET enabled = 0"""
+    )
+    repository.connection.commit()
+
+    class CatchUpExecutor:
+        def __init__(self):
+            self.calls = []
+
+        def catch_up_retention(
+            self,
+            run_id,
+        ):
+            self.calls.append(
+                run_id
+            )
+
+        def advance_run(
+            self,
+            run_id,
+        ):
+            raise AssertionError
+
+        def advance_cleanup(
+            self,
+            run_id,
+        ):
+            raise AssertionError
+
+    executor = CatchUpExecutor()
+
+    runtime = DaemonRuntime(
+        repository,
+        node.id,
+        clock,
+        executor,
+    )
+
+    runtime.start()
+    runtime.tick()
+
+    assert executor.calls == []
+
+
+def test_failed_retention_event_remains_retryable_after_restart(
+    runtime_domain,
+):
+    repository, node, _, first, _, clock = runtime_domain
+
+    run = MockBackupEngine(
+        repository
+    ).execute(
+        first.id,
+        backup_object_id="mock://success",
+    )
+
+    repository.record_event(
+        Event(
+            job_run_id=run.id,
+            event_type="RETENTION_RECLAIM_FAILED",
+            message="transient inspection failure",
+            created_at=clock.now(),
+        )
+    )
+
+    repository.connection.execute(
+        """UPDATE backup_jobs
+           SET enabled = 0"""
+    )
+    repository.connection.commit()
+
+    class CatchUpExecutor:
+        def __init__(self):
+            self.calls = []
+
+        def catch_up_retention(
+            self,
+            run_id,
+        ):
+            self.calls.append(run_id)
+
+        def advance_run(self, run_id):
+            raise AssertionError
+
+        def advance_cleanup(self, run_id):
+            raise AssertionError
+
+    executor = CatchUpExecutor()
+
+    runtime = DaemonRuntime(
+        repository,
+        node.id,
+        clock,
+        executor,
+    )
+
+    runtime.start()
+    runtime.tick()
+
+    assert executor.calls == [
+        run.id
+    ]
+
+
+def test_older_success_with_interrupted_retention_is_not_hidden_by_newer_success(
+    runtime_domain,
+):
+    repository, node, vm, first, _, clock = runtime_domain
+
+    engine = MockBackupEngine(
+        repository
+    )
+
+    older = engine.execute(
+        first.id,
+        backup_object_id="mock://older",
+    )
+
+    newer = engine.execute(
+        first.id,
+        backup_object_id="mock://newer",
+    )
+
+    assert older.storage_destination_id is not None
+
+    repository.connection.execute(
+        """INSERT INTO reclaim_operations (
+               id,
+               job_run_id,
+               job_id,
+               vm_id,
+               storage_destination_id,
+               purpose,
+               state,
+               required_backup_bytes,
+               free_bytes_before,
+               reserve_bytes,
+               expected_reclaim_bytes,
+               free_bytes_after,
+               error,
+               recovery_from_state,
+               created_at,
+               updated_at
+           ) VALUES (
+               'interrupted-old-retention',
+               ?, ?, ?, ?,
+               'RETENTION',
+               'QUARANTINED',
+               0, 1000, 0, 100,
+               NULL, NULL, NULL,
+               ?, ?
+           )""",
+        (
+            older.id,
+            first.id,
+            vm.id,
+            older.storage_destination_id,
+            clock.now().isoformat(),
+            clock.now().isoformat(),
+        ),
+    )
+
+    repository.connection.execute(
+        """UPDATE backup_jobs
+           SET enabled = 0"""
+    )
+    repository.connection.commit()
+
+    class CatchUpExecutor:
+        def __init__(self):
+            self.calls = []
+
+        def catch_up_retention(
+            self,
+            run_id,
+        ):
+            self.calls.append(run_id)
+
+        def advance_run(self, run_id):
+            raise AssertionError
+
+        def advance_cleanup(self, run_id):
+            raise AssertionError
+
+    executor = CatchUpExecutor()
+
+    runtime = DaemonRuntime(
+        repository,
+        node.id,
+        clock,
+        executor,
+    )
+
+    runtime.start()
+    runtime.tick()
+
+    # The current newest SUCCESS still needs normal retention handling,
+    # but the older interrupted destructive journal must not disappear
+    # merely because a newer successful backup exists.
+    assert set(executor.calls) == {
+        older.id,
+        newer.id,
+    }
+
+    assert len(executor.calls) == 2

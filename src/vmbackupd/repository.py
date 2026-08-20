@@ -13,7 +13,8 @@ from .models import (
     DaemonInstance, Event, ExecutionLease, JobRun, JobRunReplica,
     LibvirtBackupOperation, LibvirtExternalState, Node, NodeControllerLease,
     OverlapPolicy, PersistedLibvirtPlan, ReclaimBundle, ReclaimBundleState,
-    ReclaimChain, ReclaimOperation, ReclaimOperationState, ReplicaTask,
+    ReclaimChain, ReclaimOperation, ReclaimOperationState, ReclaimPurpose,
+    ReplicaTask,
     ReplicaTaskState, RestoreOperation, RestoreOperationState,
     RestoreNetworkMode, RestorePoint, RestorePointLocation,
     RestorePointLocationRole, RestorePointLocationState, RestorePointStatus,
@@ -4012,6 +4013,79 @@ class SQLiteRepository:
         sql += " ORDER BY jr.created_at, jr.id"
         return [self.get_run(row["id"]) for row in self.connection.execute(sql, params)]
 
+    def list_success_runs_pending_retention_for_node(
+        self,
+        node_id: str,
+    ) -> list[JobRun]:
+        """Return SUCCESS runs requiring post-success retention handling.
+
+        A SUCCESS without a RETENTION journal is considered only when it is
+        the newest SUCCESS for its job. Historical SUCCESS runs are otherwise
+        skipped because retention plans against the current VM catalog.
+
+        An existing unfinished RETENTION journal is different: it must always
+        be surfaced, even when a newer SUCCESS exists, so interrupted
+        destructive work can be frozen as RECOVERY_REQUIRED.
+        """
+
+        rows = self.connection.execute(
+            """SELECT jr.id
+               FROM job_runs jr
+               JOIN backup_jobs bj
+                 ON bj.id = jr.job_id
+               JOIN vms vm
+                 ON vm.id = bj.vm_id
+               WHERE vm.node_id = ?
+                 AND jr.state = 'SUCCESS'
+
+                 AND (
+                     EXISTS (
+                         SELECT 1
+                         FROM reclaim_operations ro
+                         WHERE ro.job_run_id = jr.id
+                           AND ro.purpose = 'RETENTION'
+                           AND ro.state NOT IN (
+                               'COMPLETED',
+                               'ABORTED'
+                           )
+                     )
+                     OR NOT EXISTS (
+                         SELECT 1
+                         FROM job_runs newer
+                         WHERE newer.job_id = jr.job_id
+                           AND newer.state = 'SUCCESS'
+                           AND (
+                               newer.created_at > jr.created_at
+                               OR (
+                                   newer.created_at = jr.created_at
+                                   AND newer.id > jr.id
+                               )
+                           )
+                     )
+                 )
+
+                 AND NOT EXISTS (
+                     SELECT 1
+                     FROM events e
+                     WHERE e.job_run_id = jr.id
+                       AND e.event_type IN (
+                           'RETENTION_RECLAIM_COMPLETED',
+                           'RETENTION_RECLAIM_SKIPPED',
+                           'RETENTION_RECLAIM_NOOP',
+                           'RETENTION_RECLAIM_ABORTED',
+                           'RETENTION_RECLAIM_RECOVERY_REQUIRED'
+                       )
+                 )
+
+               ORDER BY jr.created_at, jr.id""",
+            (node_id,),
+        )
+
+        return [
+            self.get_run(row["id"])
+            for row in rows
+        ]
+
     def list_runs_page_for_node(
         self,
         node_id: str,
@@ -4954,7 +5028,10 @@ class SQLiteRepository:
                 )
 
             existing_for_run = self.connection.execute(
-                "SELECT id FROM reclaim_operations WHERE job_run_id = ?",
+                """SELECT id
+                   FROM reclaim_operations
+                   WHERE job_run_id = ?
+                     AND purpose = 'CAPACITY'""",
                 (run_id,),
             ).fetchone()
             if existing_for_run is not None:
@@ -5059,6 +5136,7 @@ class SQLiteRepository:
                 free_bytes_before=free_bytes_before,
                 reserve_bytes=reserve_bytes,
                 expected_reclaim_bytes=expected_reclaim_bytes,
+                purpose=ReclaimPurpose.CAPACITY,
                 created_at=now,
                 updated_at=now,
             )
@@ -5066,17 +5144,18 @@ class SQLiteRepository:
             self.connection.execute(
                 """INSERT INTO reclaim_operations (
                        id, job_run_id, job_id, vm_id,
-                       storage_destination_id, state,
+                       storage_destination_id, purpose, state,
                        required_backup_bytes, free_bytes_before,
                        reserve_bytes, expected_reclaim_bytes,
                        free_bytes_after, error, created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)""",
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)""",
                 (
                     operation.id,
                     operation.job_run_id,
                     operation.job_id,
                     operation.vm_id,
                     operation.storage_destination_id,
+                    operation.purpose,
                     operation.state,
                     operation.required_backup_bytes,
                     operation.free_bytes_before,
@@ -5133,7 +5212,784 @@ class SQLiteRepository:
 
         return self.get_reclaim_operation(operation.id)
 
+
+    def _assert_reclaim_has_no_replica_dependencies(
+        self,
+        operation_id: str,
+    ) -> None:
+        """Fail closed while any replica metadata depends on reclaim."""
+
+        replica_location = self.connection.execute(
+            """SELECT 1
+               FROM reclaim_bundles rb
+               JOIN restore_point_locations rpl
+                 ON rpl.restore_point_id = rb.restore_point_id
+               WHERE rb.operation_id = ?
+                 AND rpl.role = 'REPLICA'
+               LIMIT 1""",
+            (operation_id,),
+        ).fetchone()
+
+        if replica_location is not None:
+            raise DomainInvariantError(
+                "reclaim is blocked by replica location"
+            )
+
+        replica_task = self.connection.execute(
+            """SELECT 1
+               FROM reclaim_bundles rb
+               JOIN replica_tasks rt
+                 ON rt.restore_point_id = rb.restore_point_id
+               WHERE rb.operation_id = ?
+               LIMIT 1""",
+            (operation_id,),
+        ).fetchone()
+
+        if replica_task is not None:
+            raise DomainInvariantError(
+                "reclaim is blocked by replica task"
+            )
+
+    def create_retention_reclaim_operation(
+        self,
+        run_id: str,
+        selected_chains: list[tuple[str, int]],
+        *,
+        free_bytes_before: int,
+    ) -> ReclaimOperation:
+        """Persist one immutable post-SUCCESS retention reclaim snapshot."""
+
+        from .retention import RetentionPlanner
+
+        if not selected_chains:
+            raise ValueError(
+                "selected retention reclaim chains must not be empty"
+            )
+
+        chain_ids = [
+            chain_id
+            for chain_id, _ in selected_chains
+        ]
+
+        if any(not chain_id for chain_id in chain_ids):
+            raise ValueError(
+                "selected retention reclaim chain ID must not be empty"
+            )
+
+        if len(chain_ids) != len(set(chain_ids)):
+            raise ValueError(
+                "selected retention reclaim chains contain duplicate IDs"
+            )
+
+        for _, physical_bytes in selected_chains:
+            if physical_bytes < 0:
+                raise ValueError(
+                    "selected retention reclaim physical bytes "
+                    "must be non-negative"
+                )
+
+        if free_bytes_before < 0:
+            raise ValueError(
+                "free_bytes_before must be non-negative"
+            )
+
+        expected_reclaim_bytes = sum(
+            physical_bytes
+            for _, physical_bytes in selected_chains
+        )
+
+        now = utcnow()
+
+        try:
+            self.connection.execute(
+                "BEGIN IMMEDIATE"
+            )
+
+            context = self.connection.execute(
+                """SELECT
+                       jr.id AS run_id,
+                       jr.job_id AS job_id,
+                       jr.storage_destination_id AS run_destination_id,
+                       jr.state AS run_state,
+                       jr.recovery_required AS run_recovery_required,
+                       bj.vm_id AS vm_id,
+                       bj.storage_destination_id AS job_destination_id,
+                       bj.minimum_full_chains AS minimum_full_chains,
+                       vm.node_id AS vm_node_id,
+                       sd.node_id AS storage_node_id,
+                       sd.storage_type AS storage_type
+                   FROM job_runs jr
+                   JOIN backup_jobs bj
+                     ON bj.id = jr.job_id
+                   JOIN vms vm
+                     ON vm.id = bj.vm_id
+                   LEFT JOIN storage_destinations sd
+                     ON sd.id = jr.storage_destination_id
+                   WHERE jr.id = ?""",
+                (run_id,),
+            ).fetchone()
+
+            if context is None:
+                raise KeyError(run_id)
+
+            if (
+                RunState(context["run_state"])
+                is not RunState.SUCCESS
+            ):
+                raise DomainInvariantError(
+                    "retention reclaim requires SUCCESS"
+                )
+
+            if bool(context["run_recovery_required"]):
+                raise DomainInvariantError(
+                    "retention reclaim is forbidden while "
+                    "run recovery is required"
+                )
+
+            if (
+                context["run_destination_id"] is None
+                or context["job_destination_id"] is None
+                or context["run_destination_id"]
+                    != context["job_destination_id"]
+                or context["storage_node_id"] is None
+                or context["storage_node_id"]
+                    != context["vm_node_id"]
+            ):
+                raise DomainInvariantError(
+                    "retention reclaim run/job storage "
+                    "destination mismatch"
+                )
+
+            if (
+                StorageType(context["storage_type"])
+                is not StorageType.LOCAL
+            ):
+                raise DomainInvariantError(
+                    "retention reclaim requires LOCAL storage"
+                )
+
+            existing = self.connection.execute(
+                """SELECT id
+                   FROM reclaim_operations
+                   WHERE job_run_id = ?
+                     AND purpose = 'RETENTION'
+                   LIMIT 1""",
+                (run_id,),
+            ).fetchone()
+
+            if existing is not None:
+                raise DomainInvariantError(
+                    "retention reclaim operation already exists for run"
+                )
+
+            active = self.connection.execute(
+                """SELECT id
+                   FROM reclaim_operations
+                   WHERE vm_id = ?
+                     AND state NOT IN ('COMPLETED', 'ABORTED')
+                   LIMIT 1""",
+                (context["vm_id"],),
+            ).fetchone()
+
+            if active is not None:
+                raise DomainInvariantError(
+                    "another reclaim operation is active for VM"
+                )
+
+            chains = self.connection.execute(
+                """SELECT *
+                   FROM backup_chains
+                   WHERE vm_id = ?
+                   ORDER BY created_at, id""",
+                (context["vm_id"],),
+            ).fetchall()
+
+            restore_points = self.connection.execute(
+                """SELECT
+                       rp.*,
+                       jr.state AS source_run_state
+                   FROM restore_points rp
+                   JOIN backup_chains bc
+                     ON bc.id = rp.chain_id
+                   JOIN job_runs jr
+                     ON jr.id = rp.job_run_id
+                   WHERE bc.vm_id = ?
+                   ORDER BY
+                       rp.chain_id,
+                       rp.sequence,
+                       rp.id""",
+                (context["vm_id"],),
+            ).fetchall()
+
+            chain_by_id = {
+                row["id"]: row
+                for row in chains
+            }
+
+            members = {
+                row["id"]: []
+                for row in chains
+            }
+
+            for point in restore_points:
+                members[point["chain_id"]].append(
+                    point
+                )
+
+            duplicate_bundles = {
+                row["bundle_object_id"]
+                for row in self.connection.execute(
+                    """SELECT bundle_object_id
+                       FROM restore_points
+                       WHERE bundle_object_id IS NOT NULL
+                       GROUP BY bundle_object_id
+                       HAVING COUNT(*) > 1"""
+                )
+            }
+
+            valid_members = {}
+
+            for chain in chains:
+                chain_members = sorted(
+                    members[chain["id"]],
+                    key=lambda row: (
+                        row["sequence"],
+                        row["id"],
+                    ),
+                )
+
+                if (
+                    self._reclaim_chain_problem(
+                        chain_members,
+                        duplicate_bundles,
+                    )
+                    is None
+                ):
+                    valid_members[
+                        chain["id"]
+                    ] = chain_members
+
+            try:
+                retention_plan = RetentionPlanner().plan(
+                    [
+                        self._chain(row)
+                        for row in chains
+                    ],
+                    [
+                        self._restore_point(row)
+                        for row in restore_points
+                    ],
+                    self.get_job(
+                        context["job_id"]
+                    ).retention_policy,
+                )
+            except ValueError as exc:
+                raise DomainInvariantError(
+                    "retention reclaim planning rejected: "
+                    f"{exc}"
+                ) from exc
+
+            selected_set = set(chain_ids)
+
+            if not selected_set.issubset(
+                set(retention_plan.expired_chain_ids)
+            ):
+                raise DomainInvariantError(
+                    "selected retention reclaim chain "
+                    "is not expired by current policy"
+                )
+
+            for chain_id in chain_ids:
+                chain = chain_by_id.get(chain_id)
+
+                if chain is None:
+                    raise DomainInvariantError(
+                        "selected retention reclaim chain "
+                        "does not belong to run VM"
+                    )
+
+                if (
+                    BackupChainStatus(chain["status"])
+                    is not BackupChainStatus.CLOSED
+                ):
+                    raise DomainInvariantError(
+                        "selected retention reclaim chain "
+                        "must be CLOSED"
+                    )
+
+                if chain_id not in valid_members:
+                    raise DomainInvariantError(
+                        "selected retention reclaim chain "
+                        "is not a valid populated FULL chain"
+                    )
+
+            if (
+                len(valid_members)
+                - len(selected_set)
+                < context["minimum_full_chains"]
+            ):
+                raise DomainInvariantError(
+                    "selected retention reclaim chains "
+                    "violate minimum_full_chains"
+                )
+
+            operation = ReclaimOperation(
+                job_run_id=run_id,
+                job_id=context["job_id"],
+                vm_id=context["vm_id"],
+                storage_destination_id=(
+                    context["run_destination_id"]
+                ),
+                purpose=ReclaimPurpose.RETENTION,
+                required_backup_bytes=0,
+                free_bytes_before=free_bytes_before,
+                reserve_bytes=0,
+                expected_reclaim_bytes=(
+                    expected_reclaim_bytes
+                ),
+                created_at=now,
+                updated_at=now,
+            )
+
+            self.connection.execute(
+                """INSERT INTO reclaim_operations (
+                       id,
+                       job_run_id,
+                       job_id,
+                       vm_id,
+                       storage_destination_id,
+                       purpose,
+                       state,
+                       required_backup_bytes,
+                       free_bytes_before,
+                       reserve_bytes,
+                       expected_reclaim_bytes,
+                       free_bytes_after,
+                       error,
+                       recovery_from_state,
+                       created_at,
+                       updated_at
+                   ) VALUES (
+                       ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?,
+                       NULL, NULL, NULL,
+                       ?, ?
+                   )""",
+                (
+                    operation.id,
+                    operation.job_run_id,
+                    operation.job_id,
+                    operation.vm_id,
+                    operation.storage_destination_id,
+                    operation.purpose,
+                    operation.state,
+                    operation.required_backup_bytes,
+                    operation.free_bytes_before,
+                    operation.reserve_bytes,
+                    operation.expected_reclaim_bytes,
+                    operation.created_at.isoformat(),
+                    operation.updated_at.isoformat(),
+                ),
+            )
+
+            for ordinal, (
+                chain_id,
+                physical_bytes,
+            ) in enumerate(selected_chains):
+                self.connection.execute(
+                    """INSERT INTO reclaim_chains (
+                           operation_id,
+                           chain_id,
+                           ordinal,
+                           expected_physical_bytes
+                       ) VALUES (?, ?, ?, ?)""",
+                    (
+                        operation.id,
+                        chain_id,
+                        ordinal,
+                        physical_bytes,
+                    ),
+                )
+
+                for point in valid_members[
+                    chain_id
+                ]:
+                    self.connection.execute(
+                        """INSERT INTO reclaim_bundles (
+                               operation_id,
+                               chain_id,
+                               restore_point_id,
+                               source_bundle_object_id,
+                               quarantine_object_id,
+                               expected_physical_bytes,
+                               source_device,
+                               source_inode,
+                               state
+                           ) VALUES (
+                               ?, ?, ?, ?,
+                               NULL, NULL,
+                               NULL, NULL, ?
+                           )""",
+                        (
+                            operation.id,
+                            chain_id,
+                            point["id"],
+                            point["bundle_object_id"],
+                            ReclaimBundleState.PLANNED,
+                        ),
+                    )
+
+            self._assert_reclaim_has_no_replica_dependencies(
+                operation.id
+            )
+
+            self.connection.commit()
+
+        except sqlite3.IntegrityError as exc:
+            self.connection.rollback()
+            raise DomainInvariantError(
+                "retention reclaim snapshot rejected: "
+                f"{exc}"
+            ) from exc
+
+        except Exception:
+            self.connection.rollback()
+            raise
+
+        return self.get_reclaim_operation(
+            operation.id
+        )
+
+    def _validate_retention_reclaim_retirement_snapshot(
+        self,
+        operation: sqlite3.Row,
+    ) -> None:
+        """Revalidate RETENTION while it is still non-destructive."""
+
+        from .retention import RetentionPlanner
+
+        if (
+            ReclaimPurpose(operation["purpose"])
+            is not ReclaimPurpose.RETENTION
+        ):
+            raise DomainInvariantError(
+                "retention reclaim purpose mismatch"
+            )
+
+        context = self.connection.execute(
+            """SELECT
+                   jr.job_id AS run_job_id,
+                   jr.storage_destination_id AS run_destination_id,
+                   jr.state AS run_state,
+                   jr.recovery_required AS run_recovery_required,
+                   bj.vm_id AS job_vm_id,
+                   bj.storage_destination_id AS job_destination_id,
+                   bj.minimum_full_chains AS minimum_full_chains,
+                   vm.node_id AS vm_node_id,
+                   sd.node_id AS storage_node_id,
+                   sd.storage_type AS storage_type
+               FROM job_runs jr
+               JOIN backup_jobs bj
+                 ON bj.id = jr.job_id
+               JOIN vms vm
+                 ON vm.id = bj.vm_id
+               LEFT JOIN storage_destinations sd
+                 ON sd.id = jr.storage_destination_id
+               WHERE jr.id = ?""",
+            (operation["job_run_id"],),
+        ).fetchone()
+
+        if context is None:
+            raise DomainInvariantError(
+                "retention reclaim lineage is missing"
+            )
+
+        if (
+            context["run_job_id"] != operation["job_id"]
+            or context["job_vm_id"] != operation["vm_id"]
+            or context["job_destination_id"]
+                != operation["storage_destination_id"]
+            or context["run_destination_id"]
+                != operation["storage_destination_id"]
+            or context["storage_node_id"] is None
+            or context["storage_node_id"]
+                != context["vm_node_id"]
+        ):
+            raise DomainInvariantError(
+                "retention reclaim lineage changed"
+            )
+
+        if (
+            RunState(context["run_state"])
+            is not RunState.SUCCESS
+        ):
+            raise DomainInvariantError(
+                "retention reclaim retirement requires SUCCESS"
+            )
+
+        if bool(context["run_recovery_required"]):
+            raise DomainInvariantError(
+                "retention reclaim retirement is forbidden "
+                "during run recovery"
+            )
+
+        if (
+            StorageType(context["storage_type"])
+            is not StorageType.LOCAL
+        ):
+            raise DomainInvariantError(
+                "retention reclaim requires LOCAL storage"
+            )
+
+        reclaim_chains = self.connection.execute(
+            """SELECT *
+               FROM reclaim_chains
+               WHERE operation_id = ?
+               ORDER BY ordinal, chain_id""",
+            (operation["id"],),
+        ).fetchall()
+
+        reclaim_bundles = self.connection.execute(
+            """SELECT *
+               FROM reclaim_bundles
+               WHERE operation_id = ?
+               ORDER BY chain_id, restore_point_id""",
+            (operation["id"],),
+        ).fetchall()
+
+        if not reclaim_chains or not reclaim_bundles:
+            raise DomainInvariantError(
+                "retention reclaim snapshot is empty"
+            )
+
+        if (
+            sum(
+                row["expected_physical_bytes"]
+                for row in reclaim_chains
+            )
+            != operation["expected_reclaim_bytes"]
+        ):
+            raise DomainInvariantError(
+                "retention reclaim expected byte total changed"
+            )
+
+        selected_chain_ids = tuple(
+            row["chain_id"]
+            for row in reclaim_chains
+        )
+        selected_set = set(
+            selected_chain_ids
+        )
+
+        if len(selected_set) != len(
+            selected_chain_ids
+        ):
+            raise DomainInvariantError(
+                "retention reclaim chain journal is invalid"
+            )
+
+        self._assert_reclaim_has_no_replica_dependencies(
+            operation["id"]
+        )
+
+        all_chains = self.connection.execute(
+            """SELECT *
+               FROM backup_chains
+               WHERE vm_id = ?
+               ORDER BY created_at, id""",
+            (operation["vm_id"],),
+        ).fetchall()
+
+        all_points = self.connection.execute(
+            """SELECT
+                   rp.*,
+                   jr.state AS source_run_state
+               FROM restore_points rp
+               JOIN backup_chains bc
+                 ON bc.id = rp.chain_id
+               JOIN job_runs jr
+                 ON jr.id = rp.job_run_id
+               WHERE bc.vm_id = ?
+               ORDER BY
+                   rp.chain_id,
+                   rp.sequence,
+                   rp.id""",
+            (operation["vm_id"],),
+        ).fetchall()
+
+        members = {
+            row["id"]: []
+            for row in all_chains
+        }
+
+        for point in all_points:
+            members[
+                point["chain_id"]
+            ].append(point)
+
+        duplicate_bundles = {
+            row["bundle_object_id"]
+            for row in self.connection.execute(
+                """SELECT bundle_object_id
+                   FROM restore_points
+                   WHERE bundle_object_id IS NOT NULL
+                   GROUP BY bundle_object_id
+                   HAVING COUNT(*) > 1"""
+            )
+        }
+
+        valid_members = {}
+
+        for chain in all_chains:
+            chain_members = sorted(
+                members[chain["id"]],
+                key=lambda row: (
+                    row["sequence"],
+                    row["id"],
+                ),
+            )
+
+            if (
+                self._reclaim_chain_problem(
+                    chain_members,
+                    duplicate_bundles,
+                )
+                is None
+            ):
+                valid_members[
+                    chain["id"]
+                ] = chain_members
+
+        chain_by_id = {
+            row["id"]: row
+            for row in all_chains
+        }
+
+        snapshot_by_chain = {}
+
+        for bundle in reclaim_bundles:
+            snapshot_by_chain.setdefault(
+                bundle["chain_id"],
+                {},
+            )[
+                bundle["restore_point_id"]
+            ] = bundle["source_bundle_object_id"]
+
+        if set(snapshot_by_chain) != selected_set:
+            raise DomainInvariantError(
+                "retention reclaim chain membership changed"
+            )
+
+        for chain_id in selected_chain_ids:
+            chain = chain_by_id.get(chain_id)
+
+            if chain is None:
+                raise DomainInvariantError(
+                    "selected retention reclaim chain disappeared"
+                )
+
+            if (
+                BackupChainStatus(chain["status"])
+                is not BackupChainStatus.CLOSED
+            ):
+                raise DomainInvariantError(
+                    "selected retention reclaim chain "
+                    "is no longer CLOSED"
+                )
+
+            current_members = valid_members.get(
+                chain_id
+            )
+
+            if current_members is None:
+                raise DomainInvariantError(
+                    "selected retention reclaim chain "
+                    "is no longer valid"
+                )
+
+            current_snapshot = {
+                point["id"]:
+                    point["bundle_object_id"]
+                for point in current_members
+            }
+
+            if (
+                current_snapshot
+                != snapshot_by_chain[chain_id]
+            ):
+                raise DomainInvariantError(
+                    "selected retention reclaim catalog "
+                    "snapshot changed"
+                )
+
+        if (
+            len(valid_members)
+            - len(selected_set)
+            < context["minimum_full_chains"]
+        ):
+            raise DomainInvariantError(
+                "retention reclaim violates minimum_full_chains"
+            )
+
+        try:
+            retention_plan = RetentionPlanner().plan(
+                [
+                    self._chain(row)
+                    for row in all_chains
+                ],
+                [
+                    self._restore_point(row)
+                    for row in all_points
+                ],
+                self.get_job(
+                    operation["job_id"]
+                ).retention_policy,
+            )
+        except ValueError as exc:
+            raise DomainInvariantError(
+                "retention reclaim policy "
+                "revalidation failed: "
+                f"{exc}"
+            ) from exc
+
+        if not selected_set.issubset(
+            set(retention_plan.expired_chain_ids)
+        ):
+            raise DomainInvariantError(
+                "selected retention reclaim chain "
+                "is no longer expired"
+            )
+
     def _validate_reclaim_retirement_snapshot(
+        self,
+        operation: sqlite3.Row,
+    ) -> None:
+        """Dispatch reclaim validation by immutable purpose."""
+
+        purpose = ReclaimPurpose(
+            operation["purpose"]
+        )
+
+        if purpose is ReclaimPurpose.CAPACITY:
+            self._validate_capacity_reclaim_retirement_snapshot(
+                operation
+            )
+            self._assert_reclaim_has_no_replica_dependencies(
+                operation["id"]
+            )
+            return
+
+        if purpose is ReclaimPurpose.RETENTION:
+            self._validate_retention_reclaim_retirement_snapshot(
+                operation
+            )
+            return
+
+        raise DomainInvariantError(
+            "unsupported reclaim purpose"
+        )
+
+    def _validate_capacity_reclaim_retirement_snapshot(
         self,
         operation: sqlite3.Row,
     ) -> None:
@@ -5622,6 +6478,13 @@ class SQLiteRepository:
             operation = self._require_reclaim_operation_state(
                 operation_id,
                 ReclaimOperationState.QUARANTINED,
+            )
+
+            # Serialize the final replica dependency check with catalog
+            # retirement. No replica task/location may appear between this
+            # check and deletion of the selected Restore Points.
+            self._assert_reclaim_has_no_replica_dependencies(
+                operation_id
             )
 
             reclaim_chains = self.connection.execute(
@@ -6875,10 +7738,18 @@ class SQLiteRepository:
     def get_reclaim_operation_for_run(
         self,
         run_id: str,
+        purpose: ReclaimPurpose = ReclaimPurpose.CAPACITY,
     ) -> ReclaimOperation | None:
+        purpose = ReclaimPurpose(purpose)
         row = self.connection.execute(
-            "SELECT * FROM reclaim_operations WHERE job_run_id = ?",
-            (run_id,),
+            """SELECT *
+               FROM reclaim_operations
+               WHERE job_run_id = ?
+                 AND purpose = ?""",
+            (
+                run_id,
+                purpose,
+            ),
         ).fetchone()
         return self._reclaim_operation(row) if row is not None else None
 
@@ -7169,6 +8040,7 @@ class SQLiteRepository:
             job_id=row["job_id"],
             vm_id=row["vm_id"],
             storage_destination_id=row["storage_destination_id"],
+            purpose=ReclaimPurpose(row["purpose"]),
             state=ReclaimOperationState(row["state"]),
             recovery_from_state=(
                 ReclaimOperationState(row["recovery_from_state"])

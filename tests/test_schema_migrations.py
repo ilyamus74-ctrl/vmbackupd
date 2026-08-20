@@ -56,10 +56,222 @@ VERSION_9_STORAGE_IDENTITY_TRIGGER_SQL = """CREATE TRIGGER
         END"""
 
 
+
+def drop_v18_reclaim_purpose(
+    connection,
+):
+    """Restore the exact schema-v17 reclaim journal shape."""
+
+    columns = {
+        row[1]
+        for row in connection.execute(
+            "PRAGMA table_info(reclaim_operations)"
+        )
+    }
+
+    if "purpose" not in columns:
+        return
+
+    connection.execute(
+        "ALTER TABLE reclaim_bundles "
+        "RENAME TO reclaim_bundles_v18"
+    )
+    connection.execute(
+        "ALTER TABLE reclaim_chains "
+        "RENAME TO reclaim_chains_v18"
+    )
+    connection.execute(
+        "ALTER TABLE reclaim_operations "
+        "RENAME TO reclaim_operations_v18"
+    )
+
+    connection.execute(
+        """CREATE TABLE reclaim_operations (
+            id TEXT PRIMARY KEY,
+            job_run_id TEXT NOT NULL REFERENCES job_runs(id),
+            job_id TEXT NOT NULL REFERENCES backup_jobs(id),
+            vm_id TEXT NOT NULL REFERENCES vms(id),
+            storage_destination_id TEXT NOT NULL
+                REFERENCES storage_destinations(id),
+            state TEXT NOT NULL CHECK(state IN (
+                'PLANNED',
+                'RETIRING',
+                'QUARANTINED',
+                'CATALOG_REMOVED',
+                'PURGING',
+                'PURGED',
+                'COMPLETED',
+                'RECOVERY_REQUIRED',
+                'ABORTED'
+            )),
+            required_backup_bytes INTEGER NOT NULL
+                CHECK(required_backup_bytes >= 0),
+            free_bytes_before INTEGER NOT NULL
+                CHECK(free_bytes_before >= 0),
+            reserve_bytes INTEGER NOT NULL
+                CHECK(reserve_bytes >= 0),
+            expected_reclaim_bytes INTEGER NOT NULL
+                CHECK(expected_reclaim_bytes >= 0),
+            free_bytes_after INTEGER CHECK(
+                free_bytes_after IS NULL
+                OR free_bytes_after >= 0
+            ),
+            error TEXT,
+            recovery_from_state TEXT CHECK(
+                recovery_from_state IS NULL
+                OR recovery_from_state IN (
+                    'RETIRING',
+                    'QUARANTINED',
+                    'CATALOG_REMOVED',
+                    'PURGING',
+                    'PURGED'
+                )
+            ),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(job_run_id)
+        )"""
+    )
+
+    connection.execute(
+        """CREATE TABLE reclaim_chains (
+            operation_id TEXT NOT NULL
+                REFERENCES reclaim_operations(id),
+            chain_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+            expected_physical_bytes INTEGER NOT NULL
+                CHECK(expected_physical_bytes >= 0),
+            PRIMARY KEY(operation_id, chain_id),
+            UNIQUE(operation_id, ordinal)
+        )"""
+    )
+
+    connection.execute(
+        """CREATE TABLE reclaim_bundles (
+            operation_id TEXT NOT NULL
+                REFERENCES reclaim_operations(id),
+            chain_id TEXT NOT NULL,
+            restore_point_id TEXT NOT NULL,
+            source_bundle_object_id TEXT NOT NULL,
+            quarantine_object_id TEXT,
+            expected_physical_bytes INTEGER CHECK(
+                expected_physical_bytes IS NULL
+                OR expected_physical_bytes >= 0
+            ),
+            source_device INTEGER,
+            source_inode INTEGER,
+            state TEXT NOT NULL CHECK(state IN (
+                'PLANNED',
+                'QUARANTINED',
+                'PURGING',
+                'PURGED'
+            )),
+            PRIMARY KEY(operation_id, restore_point_id),
+            UNIQUE(operation_id, source_bundle_object_id),
+            FOREIGN KEY(operation_id, chain_id)
+                REFERENCES reclaim_chains(
+                    operation_id,
+                    chain_id
+                )
+        )"""
+    )
+
+    connection.execute(
+        """INSERT INTO reclaim_operations (
+               id,
+               job_run_id,
+               job_id,
+               vm_id,
+               storage_destination_id,
+               state,
+               required_backup_bytes,
+               free_bytes_before,
+               reserve_bytes,
+               expected_reclaim_bytes,
+               free_bytes_after,
+               error,
+               recovery_from_state,
+               created_at,
+               updated_at
+           )
+           SELECT
+               id,
+               job_run_id,
+               job_id,
+               vm_id,
+               storage_destination_id,
+               state,
+               required_backup_bytes,
+               free_bytes_before,
+               reserve_bytes,
+               expected_reclaim_bytes,
+               free_bytes_after,
+               error,
+               recovery_from_state,
+               created_at,
+               updated_at
+           FROM reclaim_operations_v18"""
+    )
+
+    connection.execute(
+        """INSERT INTO reclaim_chains (
+               operation_id,
+               chain_id,
+               ordinal,
+               expected_physical_bytes
+           )
+           SELECT
+               operation_id,
+               chain_id,
+               ordinal,
+               expected_physical_bytes
+           FROM reclaim_chains_v18"""
+    )
+
+    connection.execute(
+        """INSERT INTO reclaim_bundles (
+               operation_id,
+               chain_id,
+               restore_point_id,
+               source_bundle_object_id,
+               quarantine_object_id,
+               expected_physical_bytes,
+               source_device,
+               source_inode,
+               state
+           )
+           SELECT
+               operation_id,
+               chain_id,
+               restore_point_id,
+               source_bundle_object_id,
+               quarantine_object_id,
+               expected_physical_bytes,
+               source_device,
+               source_inode,
+               state
+           FROM reclaim_bundles_v18"""
+    )
+
+    connection.execute(
+        "DROP TABLE reclaim_bundles_v18"
+    )
+    connection.execute(
+        "DROP TABLE reclaim_chains_v18"
+    )
+    connection.execute(
+        "DROP TABLE reclaim_operations_v18"
+    )
+
+
 def drop_v17_restore_recovery_provenance(
     connection,
 ):
     """Remove v17-only restore recovery provenance."""
+
+    drop_v18_reclaim_purpose(
+        connection
+    )
 
     for trigger in (
         "restore_operation_recovery_contract_insert",
@@ -1553,8 +1765,8 @@ def test_v13_to_v14_adds_durable_restore_operations_without_data_loss(
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 17
-    assert migrated.get_database_schema_version() == 17
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 18
+    assert migrated.get_database_schema_version() == 18
 
     columns = {
         row[1]
@@ -1671,10 +1883,10 @@ def test_v14_to_v15_adds_remote_node_binding_without_data_loss(
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == 17
+    assert migrated.schema_version == 18
     assert (
         migrated.get_database_schema_version()
-        == 17
+        == 18
     )
 
     columns = {
@@ -1784,7 +1996,7 @@ def test_v15_to_v16_adds_durable_remote_restore_source_snapshot(
     assert (
         migrated.schema_version
         == CURRENT_SCHEMA_VERSION
-        == 17
+        == 18
     )
 
     columns = {
@@ -1923,9 +2135,9 @@ def test_v16_to_v17_adds_restore_recovery_provenance_without_data_loss(
     assert (
         migrated.schema_version
         == CURRENT_SCHEMA_VERSION
-        == 17
+        == 18
     )
-    assert migrated.get_database_schema_version() == 17
+    assert migrated.get_database_schema_version() == 18
 
     columns = {
         row[1]
@@ -1974,5 +2186,193 @@ def test_v16_to_v17_adds_restore_recovery_provenance_without_data_loss(
         ).fetchone()[0]
         == "ok"
     )
+
+    migrated.close()
+
+
+
+def test_current_schema_v18_has_reclaim_purpose_contract(
+    tmp_path,
+):
+    from vmbackupd.schema import CURRENT_SCHEMA_VERSION
+
+    path = tmp_path / "schema-v18-reclaim-purpose.db"
+    repository = SQLiteRepository(path)
+
+    assert CURRENT_SCHEMA_VERSION == 18
+    assert repository.schema_version == 18
+
+    columns = {
+        row[1]
+        for row in repository.connection.execute(
+            "PRAGMA table_info(reclaim_operations)"
+        )
+    }
+
+    assert "purpose" in columns
+
+    sql = repository.connection.execute(
+        """SELECT sql
+           FROM sqlite_master
+           WHERE type = 'table'
+             AND name = 'reclaim_operations'"""
+    ).fetchone()[0]
+
+    normalized = " ".join(sql.split())
+
+    assert "purpose TEXT NOT NULL" in normalized
+    assert "UNIQUE(job_run_id, purpose)" in normalized
+
+    repository.close()
+
+
+
+def test_v17_to_v18_adds_reclaim_purpose_without_journal_loss(
+    tmp_path,
+):
+    from vmbackupd.models import ReclaimPurpose
+    from vmbackupd.schema import RECLAIM_SCHEMA_STATEMENTS
+
+    path = tmp_path / "v17-to-v18.db"
+
+    (
+        node,
+        destination,
+        vm,
+        job,
+        run,
+        point,
+        _artifact_ids,
+    ) = populated_database(path)
+
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA foreign_keys = OFF")
+
+    connection.execute("DROP TABLE reclaim_bundles")
+    connection.execute("DROP TABLE reclaim_chains")
+    connection.execute("DROP TABLE reclaim_operations")
+
+    connection.execute(
+        """CREATE TABLE reclaim_operations (
+            id TEXT PRIMARY KEY,
+            job_run_id TEXT NOT NULL REFERENCES job_runs(id),
+            job_id TEXT NOT NULL REFERENCES backup_jobs(id),
+            vm_id TEXT NOT NULL REFERENCES vms(id),
+            storage_destination_id TEXT NOT NULL
+                REFERENCES storage_destinations(id),
+            state TEXT NOT NULL CHECK(state IN (
+                'PLANNED', 'RETIRING', 'QUARANTINED',
+                'CATALOG_REMOVED', 'PURGING', 'PURGED',
+                'COMPLETED', 'RECOVERY_REQUIRED', 'ABORTED'
+            )),
+            required_backup_bytes INTEGER NOT NULL
+                CHECK(required_backup_bytes >= 0),
+            free_bytes_before INTEGER NOT NULL
+                CHECK(free_bytes_before >= 0),
+            reserve_bytes INTEGER NOT NULL
+                CHECK(reserve_bytes >= 0),
+            expected_reclaim_bytes INTEGER NOT NULL
+                CHECK(expected_reclaim_bytes >= 0),
+            free_bytes_after INTEGER CHECK(
+                free_bytes_after IS NULL
+                OR free_bytes_after >= 0
+            ),
+            error TEXT,
+            recovery_from_state TEXT CHECK(
+                recovery_from_state IS NULL
+                OR recovery_from_state IN (
+                    'RETIRING', 'QUARANTINED',
+                    'CATALOG_REMOVED', 'PURGING', 'PURGED'
+                )
+            ),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(job_run_id)
+        )"""
+    )
+
+    # Child table shapes did not change in v18.
+    connection.execute(RECLAIM_SCHEMA_STATEMENTS[1])
+    connection.execute(RECLAIM_SCHEMA_STATEMENTS[2])
+
+    operation_id = "11111111-1111-4111-8111-111111111111"
+
+    connection.execute(
+        """INSERT INTO reclaim_operations (
+               id, job_run_id, job_id, vm_id,
+               storage_destination_id, state,
+               required_backup_bytes, free_bytes_before,
+               reserve_bytes, expected_reclaim_bytes,
+               free_bytes_after, error, recovery_from_state,
+               created_at, updated_at
+           )
+           VALUES (
+               ?, ?, ?, ?, ?, 'COMPLETED',
+               1, 100, 1, 10,
+               110, NULL, NULL,
+               ?, ?
+           )""",
+        (
+            operation_id,
+            run.id,
+            job.id,
+            vm.id,
+            destination.id,
+            run.created_at.isoformat(),
+            run.updated_at.isoformat(),
+        ),
+    )
+
+    connection.execute(
+        """INSERT INTO reclaim_chains (
+               operation_id,
+               chain_id,
+               ordinal,
+               expected_physical_bytes
+           )
+           VALUES (?, ?, 0, 10)""",
+        (
+            operation_id,
+            point.chain_id,
+        ),
+    )
+
+    connection.execute(
+        "UPDATE schema_version SET version = 17 WHERE id = 1"
+    )
+
+    connection.commit()
+    connection.close()
+
+    migrated = SQLiteRepository(path)
+
+    assert migrated.schema_version == 18
+    assert migrated.get_database_schema_version() == 18
+
+    operation = migrated.get_reclaim_operation(
+        operation_id
+    )
+
+    assert operation.purpose is ReclaimPurpose.CAPACITY
+    assert operation.job_run_id == run.id
+    assert operation.expected_reclaim_bytes == 10
+    assert operation.free_bytes_after == 110
+
+    sql = migrated.connection.execute(
+        """SELECT sql
+           FROM sqlite_master
+           WHERE type = 'table'
+             AND name = 'reclaim_operations'"""
+    ).fetchone()[0]
+
+    assert "UNIQUE(job_run_id, purpose)" in " ".join(
+        sql.split()
+    )
+
+    assert list(
+        migrated.connection.execute(
+            "PRAGMA foreign_key_check"
+        )
+    ) == []
 
     migrated.close()

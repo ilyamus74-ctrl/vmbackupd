@@ -2163,3 +2163,222 @@ def test_authorized_cleanup_blocks_if_live_libvirt_job_reappears(
     assert repository.list_restore_points(
         vm.id
     ) == []
+
+
+def test_post_success_retention_failure_never_rewrites_backup_success(
+    execution,
+):
+    value, _, _ = prepare_verification(
+        execution
+    )
+
+    run = execution[3]
+
+    assert (
+        value.advance_run(run.id).state
+        is RunState.FINALIZING
+    )
+
+    class FailingRetention:
+        def execute_for_run(
+            self,
+            run_id,
+        ):
+            assert run_id == run.id
+            raise RuntimeError(
+                "synthetic retention failure"
+            )
+
+    value.retention_reclaim = (
+        FailingRetention()
+    )
+
+    result = value.advance_run(
+        run.id
+    )
+
+    assert result.state is RunState.SUCCESS
+    assert result.recovery_required is False
+
+    persisted = execution[0].get_run(
+        run.id
+    )
+
+    assert persisted.state is RunState.SUCCESS
+    assert persisted.recovery_required is False
+
+    points = execution[0].list_restore_points(
+        execution[1].id
+    )
+
+    assert len(points) == 1
+
+    events = execution[0].list_events(
+        run.id
+    )
+
+    failures = [
+        event
+        for event in events
+        if event.event_type
+        == "RETENTION_RECLAIM_FAILED"
+    ]
+
+    assert len(failures) == 1
+    assert (
+        "synthetic retention failure"
+        in failures[0].message
+    )
+
+
+def test_retention_catchup_freezes_interrupted_destructive_reclaim(
+    execution,
+):
+    from vmbackupd.models import (
+        ReclaimOperation,
+        ReclaimOperationState,
+        ReclaimPurpose,
+    )
+
+    value, _, _ = prepare_verification(
+        execution
+    )
+
+    run = execution[3]
+
+    assert (
+        value.advance_run(run.id).state
+        is RunState.FINALIZING
+    )
+
+    successful = value.advance_run(
+        run.id
+    )
+
+    assert successful.state is RunState.SUCCESS
+
+    operation = ReclaimOperation(
+        id="interrupted-retention",
+        job_run_id=run.id,
+        job_id=run.job_id,
+        vm_id=execution[1].id,
+        storage_destination_id=(
+            run.storage_destination_id
+        ),
+        purpose=ReclaimPurpose.RETENTION,
+        state=ReclaimOperationState.QUARANTINED,
+        required_backup_bytes=0,
+        free_bytes_before=100,
+        reserve_bytes=0,
+        expected_reclaim_bytes=10,
+    )
+
+    original_lookup = (
+        execution[0].get_reclaim_operation_for_run
+    )
+    original_require = (
+        execution[0].require_reclaim_recovery
+    )
+
+    frozen = []
+
+    def fake_lookup(
+        run_id,
+        purpose=ReclaimPurpose.CAPACITY,
+    ):
+        if (
+            run_id == run.id
+            and purpose == "RETENTION"
+        ):
+            return operation
+        return original_lookup(
+            run_id,
+            purpose=purpose,
+        )
+
+    def fake_require(
+        operation_id,
+        error,
+    ):
+        assert operation_id == operation.id
+        assert "interrupted" in error
+
+        frozen.append(
+            operation_id
+        )
+
+        return ReclaimOperation(
+            id=operation.id,
+            job_run_id=operation.job_run_id,
+            job_id=operation.job_id,
+            vm_id=operation.vm_id,
+            storage_destination_id=(
+                operation.storage_destination_id
+            ),
+            purpose=operation.purpose,
+            state=(
+                ReclaimOperationState.RECOVERY_REQUIRED
+            ),
+            recovery_from_state=(
+                ReclaimOperationState.QUARANTINED
+            ),
+            required_backup_bytes=0,
+            free_bytes_before=100,
+            reserve_bytes=0,
+            expected_reclaim_bytes=10,
+            error=error,
+        )
+
+    execution[0].get_reclaim_operation_for_run = (
+        fake_lookup
+    )
+    execution[0].require_reclaim_recovery = (
+        fake_require
+    )
+
+    class MustNotExecute:
+        def execute_for_run(
+            self,
+            run_id,
+        ):
+            raise AssertionError(
+                "destructive retention must not auto-resume"
+            )
+
+    value.retention_reclaim = MustNotExecute()
+
+    try:
+        value.catch_up_retention(
+            run.id
+        )
+    finally:
+        execution[0].get_reclaim_operation_for_run = (
+            original_lookup
+        )
+        execution[0].require_reclaim_recovery = (
+            original_require
+        )
+
+    assert frozen == [
+        operation.id
+    ]
+
+    persisted = execution[0].get_run(
+        run.id
+    )
+
+    # Backup result remains immutable.
+    assert persisted.state is RunState.SUCCESS
+    assert persisted.recovery_required is False
+
+    events = execution[0].list_events(
+        run.id
+    )
+
+    assert (
+        "RETENTION_RECLAIM_RECOVERY_REQUIRED"
+        in {
+            event.event_type
+            for event in events
+        }
+    )

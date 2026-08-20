@@ -36,8 +36,10 @@ class DaemonRuntime:
         self.controller_lease_seconds = controller_lease_seconds
         self.scheduler = IntervalScheduler(repository, clock, node_id)
         self.instance_id: str | None = None
+        self._retention_catchup_pending = True
 
     def start(self) -> str:
+        self._retention_catchup_pending = True
         now = self.clock.now()
         daemon = self.repository.start_daemon(self.node_id, now)
         try:
@@ -88,6 +90,7 @@ class DaemonRuntime:
     def tick(self) -> list[JobRun]:
         instance = self._instance()
         self.heartbeat()
+        self._catch_up_post_success_retention()
         self.scheduler.tick(instance)
         self._renew_owned_vm_leases()
         progressed: list[JobRun] = []
@@ -118,6 +121,56 @@ class DaemonRuntime:
                 continue
             progressed.append(self._advance_run(run))
         return progressed
+
+    def _catch_up_post_success_retention(
+        self,
+    ) -> None:
+        """Once per controller lifetime, reconcile missed SUCCESS maintenance."""
+
+        if not self._retention_catchup_pending:
+            return
+
+        catch_up = getattr(
+            self.executor,
+            "catch_up_retention",
+            None,
+        )
+
+        if catch_up is None:
+            self._retention_catchup_pending = False
+            return
+
+        runs = (
+            self.repository
+            .list_success_runs_pending_retention_for_node(
+                self.node_id
+            )
+        )
+
+        for run in runs:
+            try:
+                catch_up(
+                    run.id
+                )
+            except Exception as exc:
+                # A terminal backup is never rewritten because subordinate
+                # maintenance failed during controller catch-up.
+                try:
+                    self.repository.record_event(
+                        Event(
+                            job_run_id=run.id,
+                            event_type="RETENTION_RECLAIM_FAILED",
+                            message=(
+                                "startup retention catch-up raised "
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                            created_at=self.clock.now(),
+                        )
+                    )
+                except Exception:
+                    pass
+
+        self._retention_catchup_pending = False
 
     def _renew_owned_vm_leases(self) -> None:
         instance = self._instance()

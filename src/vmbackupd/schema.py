@@ -9,7 +9,7 @@ import sqlite3
 from collections.abc import Callable, Mapping
 
 
-CURRENT_SCHEMA_VERSION = 17
+CURRENT_SCHEMA_VERSION = 18
 
 
 class SchemaError(RuntimeError):
@@ -60,6 +60,9 @@ RECLAIM_SCHEMA_STATEMENTS = (
         job_id TEXT NOT NULL REFERENCES backup_jobs(id),
         vm_id TEXT NOT NULL REFERENCES vms(id),
         storage_destination_id TEXT NOT NULL REFERENCES storage_destinations(id),
+        purpose TEXT NOT NULL CHECK(purpose IN (
+            'CAPACITY', 'RETENTION'
+        )),
         state TEXT NOT NULL CHECK(state IN (
             'PLANNED', 'RETIRING', 'QUARANTINED', 'CATALOG_REMOVED',
             'PURGING', 'PURGED', 'COMPLETED', 'RECOVERY_REQUIRED', 'ABORTED'
@@ -80,7 +83,7 @@ RECLAIM_SCHEMA_STATEMENTS = (
         ),
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
-        UNIQUE(job_run_id)
+        UNIQUE(job_run_id, purpose)
     )""",
     """CREATE TABLE reclaim_chains (
         operation_id TEXT NOT NULL REFERENCES reclaim_operations(id),
@@ -867,7 +870,7 @@ CURRENT_COLUMNS = {
                                "heartbeat_at", "expires_at"},
     "reclaim_operations": {
         "id", "job_run_id", "job_id", "vm_id", "storage_destination_id",
-        "state", "required_backup_bytes", "free_bytes_before", "reserve_bytes",
+        "purpose", "state", "required_backup_bytes", "free_bytes_before", "reserve_bytes",
         "expected_reclaim_bytes", "free_bytes_after", "error",
         "recovery_from_state", "created_at", "updated_at",
     },
@@ -881,9 +884,17 @@ CURRENT_COLUMNS = {
     },
 }
 
-VERSION_16_COLUMNS = {
+VERSION_17_COLUMNS = {
     name: set(columns)
     for name, columns in CURRENT_COLUMNS.items()
+}
+VERSION_17_COLUMNS["reclaim_operations"].remove(
+    "purpose"
+)
+
+VERSION_16_COLUMNS = {
+    name: set(columns)
+    for name, columns in VERSION_17_COLUMNS.items()
 }
 VERSION_16_COLUMNS["restore_operations"].remove(
     "recovery_from_state"
@@ -1633,6 +1644,17 @@ def validate_current_schema(connection: sqlite3.Connection) -> None:
                 "backup job schedule timezone is invalid"
             ) from exc
 
+    invalid_reclaim_purpose = connection.execute(
+        """SELECT id
+           FROM reclaim_operations
+           WHERE purpose NOT IN ('CAPACITY', 'RETENTION')
+           LIMIT 1"""
+    ).fetchone()
+    if invalid_reclaim_purpose:
+        raise UnsupportedSchemaError(
+            "reclaim operation purpose is invalid"
+        )
+
     invalid_reclaim_lineage = connection.execute(
         """SELECT ro.id
            FROM reclaim_operations ro
@@ -2226,6 +2248,125 @@ def migrate_16_to_17(
     )
 
 
+def migrate_17_to_18(
+    connection: sqlite3.Connection,
+) -> None:
+    """Add reclaim purpose while preserving the durable reclaim journal."""
+
+    _validate_fingerprint(
+        connection,
+        VERSION_17_COLUMNS,
+    )
+
+    # SQLite cannot remove the historical UNIQUE(job_run_id) constraint
+    # with ALTER TABLE. Rebuild the three reclaim journal tables inside
+    # the migration transaction and preserve every durable row.
+    connection.execute(
+        "ALTER TABLE reclaim_bundles "
+        "RENAME TO reclaim_bundles_v17"
+    )
+    connection.execute(
+        "ALTER TABLE reclaim_chains "
+        "RENAME TO reclaim_chains_v17"
+    )
+    connection.execute(
+        "ALTER TABLE reclaim_operations "
+        "RENAME TO reclaim_operations_v17"
+    )
+
+    for statement in RECLAIM_SCHEMA_STATEMENTS:
+        connection.execute(statement)
+
+    connection.execute(
+        """INSERT INTO reclaim_operations (
+               id,
+               job_run_id,
+               job_id,
+               vm_id,
+               storage_destination_id,
+               purpose,
+               state,
+               required_backup_bytes,
+               free_bytes_before,
+               reserve_bytes,
+               expected_reclaim_bytes,
+               free_bytes_after,
+               error,
+               recovery_from_state,
+               created_at,
+               updated_at
+           )
+           SELECT
+               id,
+               job_run_id,
+               job_id,
+               vm_id,
+               storage_destination_id,
+               'CAPACITY',
+               state,
+               required_backup_bytes,
+               free_bytes_before,
+               reserve_bytes,
+               expected_reclaim_bytes,
+               free_bytes_after,
+               error,
+               recovery_from_state,
+               created_at,
+               updated_at
+           FROM reclaim_operations_v17"""
+    )
+
+    connection.execute(
+        """INSERT INTO reclaim_chains (
+               operation_id,
+               chain_id,
+               ordinal,
+               expected_physical_bytes
+           )
+           SELECT
+               operation_id,
+               chain_id,
+               ordinal,
+               expected_physical_bytes
+           FROM reclaim_chains_v17"""
+    )
+
+    connection.execute(
+        """INSERT INTO reclaim_bundles (
+               operation_id,
+               chain_id,
+               restore_point_id,
+               source_bundle_object_id,
+               quarantine_object_id,
+               expected_physical_bytes,
+               source_device,
+               source_inode,
+               state
+           )
+           SELECT
+               operation_id,
+               chain_id,
+               restore_point_id,
+               source_bundle_object_id,
+               quarantine_object_id,
+               expected_physical_bytes,
+               source_device,
+               source_inode,
+               state
+           FROM reclaim_bundles_v17"""
+    )
+
+    connection.execute(
+        "DROP TABLE reclaim_bundles_v17"
+    )
+    connection.execute(
+        "DROP TABLE reclaim_chains_v17"
+    )
+    connection.execute(
+        "DROP TABLE reclaim_operations_v17"
+    )
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: migrate_0_to_1,
     1: migrate_1_to_2,
@@ -2244,6 +2385,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     14: migrate_14_to_15,
     15: migrate_15_to_16,
     16: migrate_16_to_17,
+    17: migrate_17_to_18,
 }
 
 
