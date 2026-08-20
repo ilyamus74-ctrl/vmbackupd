@@ -27,6 +27,7 @@ def _parser():
               "vm": ["discover", "list", "show", "register"],
               "job": ["list", "show", "create", "update"], "backup": ["run"],
               "run": ["list", "show"], "restore-point": ["list", "show"],
+              "restore": ["list", "show", "create"],
               "recovery": ["list", "show", "resume", "fail"], "event": ["list"]}
     for group, commands in simple.items():
         group_parser = top.add_parser(group)
@@ -34,6 +35,23 @@ def _parser():
         for command in commands:
             item = subs.add_parser(command)
             if command == "show": item.add_argument("id")
+            if group == "restore" and command == "create":
+                item.add_argument("--point", required=True)
+                item.add_argument("--source", required=True)
+                item.add_argument("--name", required=True)
+                item.add_argument(
+                    "--target-root",
+                    required=True,
+                )
+                item.add_argument(
+                    "--network-mode",
+                    choices=("DISCONNECTED",),
+                    default="DISCONNECTED",
+                )
+                item.add_argument(
+                    "--start",
+                    action="store_true",
+                )
             if group == "recovery" and command in {"resume", "fail"}:
                 item.add_argument("id")
             if group == "storage" and command == "create":
@@ -267,6 +285,15 @@ def _request(args):
                   "schedule_timezone": args.schedule_timezone,
                   "enabled": True if args.enable else False if args.disable else None,
                   "schedule_enabled": True if args.schedule else False if args.manual else None}
+    elif args.group == "restore" and args.command == "create":
+        params = {
+            "restore_point_id": args.point,
+            "source_destination_id": args.source,
+            "target_vm_name": args.name,
+            "target_root": args.target_root,
+            "network_mode": args.network_mode,
+            "start_after_restore": args.start,
+        }
     elif args.group == "backup": params = {"job_id": args.job_id}
     elif args.group == "event" and args.run: params = {"run_id": args.run}
     return method, params

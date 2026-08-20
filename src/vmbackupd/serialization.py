@@ -71,6 +71,31 @@ def restore_point_location(value) -> dict:
     }
 
 
+def restore_operation(value) -> dict:
+    return {
+        "id": value.id,
+        "restore_point_id": value.restore_point_id,
+        "source_destination_id":
+            value.source_destination_id,
+        "target_node_id": value.target_node_id,
+        "source_role": value.source_role.value,
+        "source_bundle_object_id":
+            value.source_bundle_object_id,
+        "target_vm_name": value.target_vm_name,
+        "target_domain_uuid":
+            value.target_domain_uuid,
+        "target_root": value.target_root,
+        "network_mode": value.network_mode.value,
+        "start_after_restore":
+            value.start_after_restore,
+        "state": value.state.value,
+        "error": value.error,
+        "recovery_reason": value.recovery_reason,
+        "created_at": value.created_at.isoformat(),
+        "updated_at": value.updated_at.isoformat(),
+    }
+
+
 def event(value: Event) -> dict:
     return {"id": value.id, "job_run_id": value.job_run_id,
             "node_id": value.node_id,

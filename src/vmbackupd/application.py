@@ -86,6 +86,9 @@ class VmbackupApplication:
             "run.list": self.run_list, "run.show": self.run_show,
             "restore_point.list": self.restore_point_list,
             "restore_point.show": self.restore_point_show,
+            "restore.create": self.restore_create,
+            "restore.list": self.restore_list,
+            "restore.show": self.restore_show,
             "recovery.list": self.recovery_list, "recovery.show": self.recovery_show,
             "recovery.resume": self.recovery_resume,
             "recovery.fail": self.recovery_fail,
@@ -1639,6 +1642,93 @@ class VmbackupApplication:
         chain = self.repository.get_chain(value.chain_id)
         self._require_local_vm(self.repository.get_vm(chain.vm_id))
         return serialization.restore_point(value)
+
+    def restore_create(
+        self,
+        restore_point_id,
+        source_destination_id,
+        target_vm_name,
+        target_root,
+        network_mode="DISCONNECTED",
+        start_after_restore=False,
+    ):
+        for label, value in (
+            ("restore_point_id", restore_point_id),
+            ("source_destination_id", source_destination_id),
+            ("target_vm_name", target_vm_name),
+            ("target_root", target_root),
+        ):
+            if (
+                not isinstance(value, str)
+                or not value.strip()
+            ):
+                raise ApplicationError(
+                    "INVALID_PARAMS",
+                    f"{label} must be a non-empty string",
+                )
+
+        if network_mode != "DISCONNECTED":
+            raise ApplicationError(
+                "RESTORE_NETWORK_MODE_UNSUPPORTED",
+                "R3.5 supports DISCONNECTED restore only",
+            )
+
+        if not isinstance(start_after_restore, bool):
+            raise ApplicationError(
+                "INVALID_PARAMS",
+                "start_after_restore must be boolean",
+            )
+
+        if not self.config.libvirt.allow_mutation:
+            raise ApplicationError(
+                "MUTATION_DISABLED",
+                "restore mutation is disabled",
+            )
+
+        operation = (
+            self.repository
+            .create_restore_operation(
+                restore_point_id.strip(),
+                source_destination_id.strip(),
+                self.node.id,
+                target_vm_name.strip(),
+                target_root.strip(),
+                self.clock.now(),
+                network_mode=network_mode,
+                start_after_restore=start_after_restore,
+            )
+        )
+
+        return serialization.restore_operation(
+            operation
+        )
+
+    def restore_list(self):
+        return [
+            serialization.restore_operation(value)
+            for value
+            in self.repository
+            .list_restore_operations_for_node(
+                self.node.id
+            )
+        ]
+
+    def restore_show(self, id):
+        value = (
+            self.repository
+            .get_restore_operation(id)
+        )
+
+        if value.target_node_id != self.node.id:
+            raise ApplicationError(
+                "FOREIGN_NODE_OBJECT",
+                "restore operation belongs to another node",
+            )
+
+        return serialization.restore_operation(
+            value
+        )
+
     def recovery_list(self): return [serialization.run(x) for x in self.repository.list_runs_for_node(self.node.id, nonterminal_only=True) if x.recovery_required]
     def recovery_show(self, run_id):
         value = self.repository.get_run(run_id)

@@ -14,7 +14,8 @@ from .models import (
     LibvirtBackupOperation, LibvirtExternalState, Node, NodeControllerLease,
     OverlapPolicy, PersistedLibvirtPlan, ReclaimBundle, ReclaimBundleState,
     ReclaimChain, ReclaimOperation, ReclaimOperationState, ReplicaTask,
-    ReplicaTaskState, RestorePoint, RestorePointLocation,
+    ReplicaTaskState, RestoreOperation, RestoreOperationState,
+    RestoreNetworkMode, RestorePoint, RestorePointLocation,
     RestorePointLocationRole, RestorePointLocationState, RestorePointStatus,
     RetentionPolicy, RunDisk, RunState, SchedulePolicy, SpaceReclaimMode,
     StorageDestination, StorageType, VM, new_id, utcnow,
@@ -1766,6 +1767,314 @@ class SQLiteRepository:
         if row is None:
             raise KeyError(restore_point_id)
         return self._restore_point(row)
+
+    def create_restore_operation(
+        self,
+        restore_point_id: str,
+        source_destination_id: str,
+        target_node_id: str,
+        target_vm_name: str,
+        target_root: str,
+        now: datetime,
+        *,
+        network_mode: RestoreNetworkMode
+            = RestoreNetworkMode.DISCONNECTED,
+        start_after_restore: bool = False,
+    ) -> RestoreOperation:
+        """Freeze one safe restore plan from an AVAILABLE location."""
+
+        try:
+            network_mode = RestoreNetworkMode(network_mode)
+        except ValueError:
+            raise DomainInvariantError(
+                "RESTORE_NETWORK_MODE_UNSUPPORTED"
+            ) from None
+
+        if network_mode is not RestoreNetworkMode.DISCONNECTED:
+            raise DomainInvariantError(
+                "RESTORE_NETWORK_MODE_UNSUPPORTED"
+            )
+
+        if not isinstance(start_after_restore, bool):
+            raise DomainInvariantError(
+                "RESTORE_START_FLAG_INVALID"
+            )
+
+        if not isinstance(target_vm_name, str):
+            raise DomainInvariantError(
+                "RESTORE_TARGET_NAME_INVALID"
+            )
+
+        target_vm_name = target_vm_name.strip()
+
+        if not target_vm_name:
+            raise DomainInvariantError(
+                "RESTORE_TARGET_NAME_INVALID"
+            )
+
+        try:
+            target_path = lexical_storage_path(target_root)
+        except (TypeError, ValueError):
+            raise DomainInvariantError(
+                "RESTORE_TARGET_ROOT_INVALID"
+            ) from None
+
+        self.connection.execute("BEGIN IMMEDIATE")
+
+        try:
+            point = self.get_restore_point(
+                restore_point_id
+            )
+
+            # First R3.5 acceptance is deliberately FULL-only.
+            if point.kind is not BackupKind.FULL:
+                raise DomainInvariantError(
+                    "RESTORE_FULL_ONLY"
+                )
+
+            chain = self.get_chain(
+                point.chain_id
+            )
+            source_vm = self.get_vm(
+                chain.vm_id
+            )
+
+            # R3.5 restores only through the local node controller.
+            # Cross-node libvirt control is a separate future contract.
+            if source_vm.node_id != target_node_id:
+                raise DomainInvariantError(
+                    "RESTORE_TARGET_NODE_NOT_SUPPORTED"
+                )
+
+            try:
+                location = self.get_restore_point_location(
+                    restore_point_id,
+                    source_destination_id,
+                )
+            except KeyError:
+                raise DomainInvariantError(
+                    "RESTORE_SOURCE_LOCATION_NOT_FOUND"
+                ) from None
+
+            if (
+                location.state
+                is not RestorePointLocationState.AVAILABLE
+            ):
+                raise DomainInvariantError(
+                    "RESTORE_SOURCE_NOT_AVAILABLE"
+                )
+
+            if (
+                not isinstance(
+                    location.bundle_object_id,
+                    str,
+                )
+                or not location.bundle_object_id.strip()
+            ):
+                raise DomainInvariantError(
+                    "RESTORE_SOURCE_OBJECT_MISSING"
+                )
+
+            if location.verified_at is None:
+                raise DomainInvariantError(
+                    "RESTORE_SOURCE_NOT_VERIFIED"
+                )
+
+            # Also proves that the location destination is owned by
+            # this node's catalog.
+            try:
+                self.get_storage_destination(
+                    source_vm.node_id,
+                    source_destination_id,
+                )
+            except KeyError:
+                raise DomainInvariantError(
+                    "RESTORE_SOURCE_DESTINATION_NOT_LOCAL"
+                ) from None
+
+            # Restore workspace must never overlap any managed backup
+            # storage tree in either direction. Cleanup of a restore
+            # workspace must therefore be incapable of deleting a
+            # canonical backup namespace.
+            for destination in self.list_storage_destinations(
+                target_node_id
+            ):
+                try:
+                    storage_path = lexical_storage_path(
+                        destination.backup_data_root
+                    )
+                except (TypeError, ValueError):
+                    continue
+
+                overlaps = False
+
+                try:
+                    target_path.relative_to(storage_path)
+                except ValueError:
+                    pass
+                else:
+                    overlaps = True
+
+                try:
+                    storage_path.relative_to(target_path)
+                except ValueError:
+                    pass
+                else:
+                    overlaps = True
+
+                if overlaps:
+                    raise DomainInvariantError(
+                        "RESTORE_TARGET_OVERLAPS_BACKUP_STORAGE"
+                    )
+
+            # Do not plan a restored guest over an already catalogued
+            # VM identity.
+            collision = self.connection.execute(
+                """SELECT 1
+                   FROM vms
+                   WHERE node_id = ?
+                     AND (
+                         name = ?
+                         OR external_id = ?
+                     )
+                   LIMIT 1""",
+                (
+                    target_node_id,
+                    target_vm_name,
+                    target_vm_name,
+                ),
+            ).fetchone()
+
+            if collision is not None:
+                raise DomainInvariantError(
+                    "RESTORE_TARGET_VM_EXISTS"
+                )
+
+            # Prevent two simultaneously actionable restores from
+            # targeting the same VM identity or workspace.
+            active = self.connection.execute(
+                """SELECT 1
+                   FROM restore_operations
+                   WHERE target_node_id = ?
+                     AND state NOT IN ('SUCCESS', 'FAILED')
+                     AND (
+                         target_vm_name = ?
+                         OR target_root = ?
+                     )
+                   LIMIT 1""",
+                (
+                    target_node_id,
+                    target_vm_name,
+                    str(target_path),
+                ),
+            ).fetchone()
+
+            if active is not None:
+                raise DomainInvariantError(
+                    "RESTORE_TARGET_BUSY"
+                )
+
+            operation = RestoreOperation(
+                restore_point_id=point.id,
+                source_destination_id=source_destination_id,
+                target_node_id=target_node_id,
+                source_role=location.role,
+                source_bundle_object_id=(
+                    location.bundle_object_id
+                ),
+                target_vm_name=target_vm_name,
+                target_root=str(target_path),
+                network_mode=network_mode,
+                start_after_restore=start_after_restore,
+                created_at=now,
+                updated_at=now,
+            )
+
+            self.connection.execute(
+                """INSERT INTO restore_operations (
+                       id,
+                       restore_point_id,
+                       source_destination_id,
+                       target_node_id,
+                       source_role,
+                       source_bundle_object_id,
+                       target_vm_name,
+                       target_domain_uuid,
+                       target_root,
+                       network_mode,
+                       start_after_restore,
+                       state,
+                       error,
+                       recovery_reason,
+                       created_at,
+                       updated_at
+                   )
+                   VALUES (
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?, ?
+                   )""",
+                (
+                    operation.id,
+                    operation.restore_point_id,
+                    operation.source_destination_id,
+                    operation.target_node_id,
+                    operation.source_role.value,
+                    operation.source_bundle_object_id,
+                    operation.target_vm_name,
+                    operation.target_domain_uuid,
+                    operation.target_root,
+                    operation.network_mode.value,
+                    int(operation.start_after_restore),
+                    operation.state.value,
+                    operation.error,
+                    operation.recovery_reason,
+                    operation.created_at.isoformat(),
+                    operation.updated_at.isoformat(),
+                ),
+            )
+
+            self.connection.commit()
+
+        except Exception:
+            self.connection.rollback()
+            raise
+
+        return self.get_restore_operation(
+            operation.id
+        )
+
+    def get_restore_operation(
+        self,
+        operation_id: str,
+    ) -> RestoreOperation:
+        row = self.connection.execute(
+            """SELECT *
+               FROM restore_operations
+               WHERE id = ?""",
+            (operation_id,),
+        ).fetchone()
+
+        if row is None:
+            raise KeyError(operation_id)
+
+        return self._restore_operation(row)
+
+    def list_restore_operations_for_node(
+        self,
+        node_id: str,
+    ) -> list[RestoreOperation]:
+        rows = self.connection.execute(
+            """SELECT *
+               FROM restore_operations
+               WHERE target_node_id = ?
+               ORDER BY created_at DESC, id DESC""",
+            (node_id,),
+        )
+
+        return [
+            self._restore_operation(row)
+            for row in rows
+        ]
 
     def list_restore_point_locations(
         self,
@@ -6446,6 +6755,45 @@ class SQLiteRepository:
             run_id=row["run_id"],
             destination_id=row["destination_id"],
             ordinal=row["ordinal"],
+        )
+
+    @staticmethod
+    def _restore_operation(
+        row: sqlite3.Row,
+    ) -> RestoreOperation:
+        return RestoreOperation(
+            id=row["id"],
+            restore_point_id=row["restore_point_id"],
+            source_destination_id=(
+                row["source_destination_id"]
+            ),
+            target_node_id=row["target_node_id"],
+            source_role=RestorePointLocationRole(
+                row["source_role"]
+            ),
+            source_bundle_object_id=(
+                row["source_bundle_object_id"]
+            ),
+            target_vm_name=row["target_vm_name"],
+            target_domain_uuid=row["target_domain_uuid"],
+            target_root=row["target_root"],
+            network_mode=RestoreNetworkMode(
+                row["network_mode"]
+            ),
+            start_after_restore=bool(
+                row["start_after_restore"]
+            ),
+            state=RestoreOperationState(
+                row["state"]
+            ),
+            error=row["error"],
+            recovery_reason=row["recovery_reason"],
+            created_at=datetime.fromisoformat(
+                row["created_at"]
+            ),
+            updated_at=datetime.fromisoformat(
+                row["updated_at"]
+            ),
         )
 
     @staticmethod
