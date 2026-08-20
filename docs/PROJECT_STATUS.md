@@ -3366,6 +3366,270 @@ outstanding.
 
 ---
 
+## Forward plan — restore execution
+
+The next restore work deliberately prioritizes LOCAL restore execution before
+remote SSH data acquisition.
+
+The purpose of this ordering is to complete and validate the restore state
+machine, filesystem materialization, libvirt definition, recovery semantics,
+and end-to-end VM restoration independently of the remote byte transport.
+
+Planned sequence:
+
+### A3.5.1 local restore execution foundation
+
+Establish durable RestoreOperation execution semantics:
+
+    PLANNED
+        -> VERIFYING
+        -> MATERIALIZING
+        -> DEFINING
+        -> READY
+        -> SUCCESS
+
+with the optional start path:
+
+    READY
+        -> STARTING
+        -> SUCCESS
+
+Required foundation:
+
+- repository compare-and-set state transitions;
+- explicit legal transition graph;
+- terminal FAILED handling;
+- RECOVERY_REQUIRED handling for unsafe interrupted states;
+- daemon/runtime ownership of restore execution;
+- restart/takeover reconciliation;
+- no mutation of the source backup bundle.
+
+LOCAL sources do not require ACQUIRING because their backup data already
+exists on the controller node.
+
+### A3.5.2 local source verification and materialization
+
+Validate the exact frozen local source bundle before restoring:
+
+    source_bundle_object_id
+        -> immutable published source
+        -> structural and semantic verification
+
+The source bundle remains read-only.
+
+Materialization creates a separate operation-owned target workspace under the
+planned target_root.
+
+Restore execution must never modify, rename, delete, rebase, or otherwise
+mutate the successful backup bundle being used as the source.
+
+Materialization must preserve sparse disk behavior where applicable and use
+safe filesystem operations that reject symlinks, unsafe traversal, and
+unexpected existing objects.
+
+### A3.5.3 libvirt definition and disconnected restore
+
+After materialization:
+
+- generate/prepare the restored domain definition;
+- bind the frozen target_domain_uuid;
+- preserve the target VM name;
+- keep the initial restore network mode DISCONNECTED;
+- refuse collisions with existing domains/VM catalog objects;
+- define only the materialized target disks;
+- reach READY before any optional VM start.
+
+No source backup disk may be attached directly as the restored VM's writable
+disk.
+
+### A3.5.4 local end-to-end restore acceptance
+
+Acceptance must prove at minimum:
+
+    successful FULL backup
+        -> create RestoreOperation from LOCAL source
+        -> verify source
+        -> materialize independent target
+        -> define restored VM
+        -> optionally start
+        -> SUCCESS
+
+The restored VM must use independent target disk files and the original
+published Restore Point must remain unchanged and valid after restore.
+
+Recovery tests must cover daemon interruption in unsafe restore states.
+
+### Deferred remote restore acquisition
+
+The already completed remote-source work remains in place:
+
+    remote restore placement          YES
+    durable remote source snapshot    YES
+    remote manifest handshake         YES
+
+Actual remote bytes remain deferred.
+
+Until remote acquisition is implemented, attempting execution from an SSH
+REPLICA source must fail closed with an explicit boundary such as:
+
+    RESTORE_REMOTE_ACQUISITION_NOT_IMPLEMENTED
+
+Remote planning, inspection, and manifest identity verification remain valid;
+only data acquisition/execution is deferred.
+
+A later remote acquisition phase will add:
+
+    PLANNED
+        -> ACQUIRING
+        -> VERIFYING
+        -> MATERIALIZING
+        -> DEFINING
+        -> ...
+
+The purpose of remote acquisition will be to produce the same trusted local
+input expected by the already-tested restore pipeline rather than to introduce
+a second restore implementation.
+
+---
+
+## Forward plan — incremental execution
+
+Incremental execution remains a separate implementation track.
+
+Incremental scheduling/configuration remains subordinate to the FULL backup
+job policy. Incremental execution is not modeled as an independent unrelated
+backup job.
+
+The intended chain remains:
+
+    FULL
+        -> INCREMENTAL
+        -> INCREMENTAL
+        -> ...
+
+with explicit parent/sequence lineage and restore dependency.
+
+### I1 incremental execution eligibility
+
+Before producing incremental backup data, execution must determine a valid
+verified parent Restore Point.
+
+Required rules:
+
+- a new chain starts with FULL;
+- an incremental requires a valid parent in the same chain;
+- parent identity is frozen for the run;
+- missing, failed, reclaimed, unavailable, or otherwise unusable parent
+  causes fail-closed execution;
+- no silent fallback may reinterpret an intended incremental as another
+  incremental against an arbitrary base;
+- an explicit policy decision may start a new FULL chain when required.
+
+Scheduler configuration remains part of the parent FULL job rather than
+creating a separate user-visible incremental job.
+
+### I2 incremental backup data execution
+
+Implement the backend that actually produces incremental backup data according
+to the existing BackupKind/chain/run contracts.
+
+Execution must preserve:
+
+    chain_id
+    sequence
+    parent_restore_point_id
+    planned_kind
+
+across the complete run.
+
+The implementation must retain the same cooperative execution, fencing,
+preflight, cleanup, and failure guarantees used by FULL execution.
+
+### I3 incremental publication and catalog consistency
+
+An incremental Restore Point becomes usable only after its produced artifacts
+are verified and publication/catalog finalization succeeds.
+
+Publication must preserve exact chain lineage:
+
+    child.parent_restore_point_id
+        == exact verified parent
+
+and monotonically ordered sequence inside the chain.
+
+A failed incremental execution must not damage or invalidate previously
+successful Restore Points.
+
+### I4 retention and replica dependency safety
+
+Retention remains dependency-aware.
+
+A parent Restore Point required by a surviving incremental descendant must not
+be reclaimed independently.
+
+Existing replica dependency rules remain authoritative for remote copies.
+
+The fail-safe retention invariant remains:
+
+- existing successful backups are not deleted merely because new backups stop
+  being produced;
+- failed/disabled/unreachable/full-destination conditions do not cause
+  destructive retention advancement;
+- destructive deletion is allowed only when the retention/reclaim contract has
+  a newly verified restore point that makes the deletion safe.
+
+### I5 incremental restore-chain consumption
+
+Incremental execution is not considered operationally complete until restore
+can consume the resulting chain.
+
+Restore must prove and consume:
+
+    FULL base
+        + ordered incremental descendants
+        -> one materialized restore result
+
+Chain validation must reject:
+
+- missing parent;
+- wrong chain_id;
+- wrong sequence;
+- duplicated link;
+- substituted Restore Point;
+- unavailable/reclaimed dependency;
+- incomplete chain.
+
+The implementation should reuse the LOCAL restore materialization pipeline
+rather than build an unrelated restore path.
+
+### I6 incremental end-to-end acceptance
+
+Final acceptance must demonstrate at minimum:
+
+    FULL backup
+        -> data changes
+        -> INCREMENTAL backup
+        -> additional data changes
+        -> INCREMENTAL backup
+        -> restore selected point
+        -> restored VM contains the expected selected-point state
+
+Additional acceptance must cover:
+
+- daemon restart between chain members;
+- failed incremental run;
+- retention with dependent chain members;
+- replica dependency ordering;
+- scheduler-triggered incremental execution;
+- explicit new-FULL-chain behavior when an incremental base is no longer
+  eligible.
+
+Incremental execution is not CLOSED merely because scheduling or schema support
+exists. Closure requires actual execution, restore-chain usability, regression
+coverage, implementation commit, and PROJECT_STATUS documentation closure.
+
+---
+
 # Current position
 
 Current implementation milestone:
