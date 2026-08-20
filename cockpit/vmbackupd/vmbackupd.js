@@ -2364,7 +2364,11 @@
         populateJobOptions(job);
         document.getElementById("job-name").value = job ? job.name : "";
         document.getElementById("job-enabled").checked = job ? job.enabled : true;
-        document.getElementById("job-retain").value = job ? job.restore_points_to_retain : 7;
+        document.getElementById("job-retain").value =
+            job ? job.restore_points_to_retain : 7;
+        document.getElementById("job-retain-field").hidden = !(
+            job && Number(job.max_incrementals_per_chain || 0) > 0
+        );
         document.getElementById("job-full-chains").value =
             job ? job.full_chains_to_retain : 2;
         document.getElementById("job-minimum-chains").value =

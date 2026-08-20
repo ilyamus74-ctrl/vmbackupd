@@ -231,8 +231,30 @@ class RetentionPlanner:
                 if point.parent_restore_point_id != expected_parent:
                     raise ValueError("restore point dependency chain is invalid")
 
-        newest_points = sorted(restore_points, key=lambda point: point.created_at, reverse=True)
-        retained = {point.id for point in newest_points[: policy.restore_points_to_retain]}
+        newest_points = sorted(
+            restore_points,
+            key=lambda point: point.created_at,
+            reverse=True,
+        )
+
+        # Restore-point count is an incremental-chain policy. For a FULL-only
+        # catalog, full_chains_to_retain is the authoritative normal retention
+        # target; otherwise the default restore_points_to_retain=7 would
+        # silently override a user-selected FULL limit such as 2.
+        has_incremental_points = any(
+            point.kind is BackupKind.INCREMENTAL
+            for point in restore_points
+        )
+        retained = (
+            {
+                point.id
+                for point in newest_points[
+                    : policy.restore_points_to_retain
+                ]
+            }
+            if has_incremental_points
+            else set()
+        )
 
         # ACTIVE is always protected, including all of its members.
         for chain in chains:

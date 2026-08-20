@@ -293,3 +293,83 @@ def test_capacity_reclaim_rejects_invalid_facts():
             required_backup_bytes=2,
             policy=policy,
         )
+
+
+def test_full_only_retention_ignores_restore_point_limit_above_full_chain_limit():
+    first, a = make_chain(
+        "full-only-first",
+        1,
+        -30,
+        BackupChainStatus.CLOSED,
+    )
+    second, b = make_chain(
+        "full-only-second",
+        1,
+        -20,
+        BackupChainStatus.CLOSED,
+    )
+    third, c = make_chain(
+        "full-only-third",
+        1,
+        -10,
+        BackupChainStatus.CLOSED,
+    )
+
+    # The default restore-point limit of 7 must not turn a FULL-only
+    # full_chains_to_retain=2 policy into "keep seven FULL backups".
+    plan = RetentionPlanner().plan(
+        [first, second, third],
+        a + b + c,
+        RetentionPolicy(
+            restore_points_to_retain=7,
+            minimum_full_chains=1,
+            full_chains_to_retain=2,
+        ),
+    )
+
+    assert plan.expired_chain_ids == (first.id,)
+    assert plan.retained_restore_point_ids == {
+        b[0].id,
+        c[0].id,
+    }
+
+
+def test_restore_point_limit_remains_active_when_incrementals_exist():
+    incremental, a = make_chain(
+        "incremental-history",
+        3,
+        -30,
+        BackupChainStatus.CLOSED,
+    )
+    middle, b = make_chain(
+        "middle-full",
+        1,
+        -20,
+        BackupChainStatus.CLOSED,
+    )
+    newest, c = make_chain(
+        "newest-full",
+        1,
+        -10,
+        BackupChainStatus.CLOSED,
+    )
+
+    plan = RetentionPlanner().plan(
+        [incremental, middle, newest],
+        a + b + c,
+        RetentionPolicy(
+            restore_points_to_retain=3,
+            minimum_full_chains=1,
+            full_chains_to_retain=1,
+        ),
+    )
+
+    # Newest FULL is protected by the FULL-chain target. The restore-point
+    # policy also retains middle FULL and the newest incremental member,
+    # which necessarily retains that incremental's complete dependency prefix.
+    assert plan.expired_chain_ids == ()
+    assert plan.retained_restore_point_ids == {
+        *(point.id for point in a),
+        b[0].id,
+        c[0].id,
+    }

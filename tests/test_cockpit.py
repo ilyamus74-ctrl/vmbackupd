@@ -281,9 +281,9 @@ def test_cockpit_job_management_supports_replicas_incrementals_and_refreshes_aut
     assert 'value="Full" readonly' not in html
 
     assert "Schedule mode" in html
-    assert "Restore points to retain" in html
-    assert "Full chains to retain" in html
-    assert "Minimum full chains" in html
+    assert "Incremental restore points to retain" in html
+    assert "Full backups to retain" in html
+    assert "Minimum full backups" in html
     assert "Space reclaim mode" in html
     assert 'value="SAFE">SAFE</option>' in html
     assert 'value="SPACE_OPTIMIZED">SPACE_OPTIMIZED</option>' in html
@@ -674,3 +674,30 @@ def test_cockpit_history_uses_server_pagination_and_lazy_backup_details():
     # Active/live-refresh state is taken from the full server summary,
     # not from only the five visible history rows.
     assert "Number(currentModel.active) > 0" in javascript
+
+
+def test_full_only_retention_controls_are_unambiguous():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    html = (
+        root / "cockpit/vmbackupd/index.html"
+    ).read_text(encoding="utf-8")
+    javascript = (
+        root / "cockpit/vmbackupd/vmbackupd.js"
+    ).read_text(encoding="utf-8")
+
+    assert 'id="job-retain-field" hidden' in html
+    assert "Incremental restore points to retain" in html
+    assert "Full backups to retain" in html
+    assert "Minimum full backups" in html
+    assert (
+        "For FULL-only jobs, Full backups to retain "
+        "is the normal retention limit."
+    ) in html
+
+    assert (
+        'document.getElementById("job-retain-field").hidden'
+        in javascript
+    )
+    assert "job.max_incrementals_per_chain || 0" in javascript
