@@ -2309,8 +2309,14 @@ def migrate_17_to_18(
                reserve_bytes,
                expected_reclaim_bytes,
                free_bytes_after,
-               error,
-               recovery_from_state,
+               CASE
+                   WHEN state = 'COMPLETED' THEN NULL
+                   ELSE error
+               END,
+               CASE
+                   WHEN state = 'COMPLETED' THEN NULL
+                   ELSE recovery_from_state
+               END,
                created_at,
                updated_at
            FROM reclaim_operations_v17"""

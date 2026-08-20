@@ -2309,7 +2309,9 @@ def test_v17_to_v18_adds_reclaim_purpose_without_journal_loss(
            VALUES (
                ?, ?, ?, ?, ?, 'COMPLETED',
                1, 100, 1, 10,
-               110, NULL, NULL,
+               110,
+               'stale completed recovery error',
+               'QUARANTINED',
                ?, ?
            )""",
         (
@@ -2357,6 +2359,8 @@ def test_v17_to_v18_adds_reclaim_purpose_without_journal_loss(
     assert operation.job_run_id == run.id
     assert operation.expected_reclaim_bytes == 10
     assert operation.free_bytes_after == 110
+    assert operation.error is None
+    assert operation.recovery_from_state is None
 
     sql = migrated.connection.execute(
         """SELECT sql
