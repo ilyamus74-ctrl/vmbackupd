@@ -944,6 +944,63 @@ def test_reclaim_recovery_preserves_and_resumes_exact_state(tmp_path):
     assert repository.list_reclaim_operations_requiring_recovery() == []
 
 
+def test_completed_reclaim_clears_recovery_error(tmp_path):
+    repository, _, _, vm, job, target_run = catalog(
+        tmp_path / "completed-reclaim-clears-error.db"
+    )
+
+    operation, _, _ = make_quarantined_reclaim(
+        repository,
+        job,
+        vm,
+        target_run,
+    )
+
+    repository.require_reclaim_recovery(
+        operation.id,
+        "old recovery failure",
+    )
+
+    repository.resume_reclaim_recovery(
+        operation.id
+    )
+
+    repository.retire_reclaim_catalog(
+        operation.id
+    )
+
+    repository.begin_reclaim_purge(
+        operation.id
+    )
+
+    for bundle in repository.list_reclaim_bundles(
+        operation.id
+    ):
+        repository.begin_reclaim_bundle_purge(
+            operation.id,
+            bundle.restore_point_id,
+        )
+        repository.mark_reclaim_bundle_purged(
+            operation.id,
+            bundle.restore_point_id,
+        )
+
+    repository.mark_reclaim_purged(
+        operation.id
+    )
+
+    completed = repository.complete_reclaim(
+        operation.id,
+        free_bytes_after=123456789,
+    )
+
+    assert (
+        completed.state
+        is ReclaimOperationState.COMPLETED
+    )
+    assert completed.error is None
+    assert completed.recovery_from_state is None
+
 @pytest.mark.parametrize(
     "terminal_state",
     [
@@ -952,6 +1009,9 @@ def test_reclaim_recovery_preserves_and_resumes_exact_state(tmp_path):
         ReclaimOperationState.COMPLETED,
     ],
 )
+
+
+
 def test_reclaim_recovery_rejects_non_destructive_states(
     tmp_path,
     terminal_state,

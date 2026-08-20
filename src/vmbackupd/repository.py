@@ -6417,6 +6417,7 @@ class SQLiteRepository:
                    SET state = 'COMPLETED',
                        free_bytes_after = ?,
                        recovery_from_state = NULL,
+                       error = NULL,
                        updated_at = ?
                    WHERE id = ?
                      AND state = 'PURGED'""",
