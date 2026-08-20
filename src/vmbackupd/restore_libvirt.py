@@ -832,6 +832,46 @@ class VirshRestoreDriver:
 
         return result
 
+    def start(
+        self,
+        domain: str,
+    ):
+        result = self.runner.run(
+            (
+                "virsh",
+                "--connect",
+                self.connection_uri,
+                "start",
+                domain,
+            ),
+            timeout=self.timeout,
+        )
+
+        if result.returncode != 0:
+            detail = (
+                getattr(
+                    result,
+                    "stderr",
+                    "",
+                )
+                or getattr(
+                    result,
+                    "stdout",
+                    "",
+                )
+                or (
+                    "virsh start exited "
+                    f"{result.returncode}"
+                )
+            ).strip()
+
+            raise RestoreDomainDefinitionError(
+                "RESTORE_LIBVIRT_START_FAILED",
+                detail,
+            )
+
+        return result
+
 
 class LocalRestoreDefinitionExecutor:
     """Advance one materialized LOCAL restore from DEFINING to READY."""

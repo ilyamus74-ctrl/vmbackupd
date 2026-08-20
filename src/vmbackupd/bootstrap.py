@@ -19,6 +19,21 @@ from .local_api import ApiServer
 from .models import StorageDestination, StorageType
 from .repository import DomainInvariantError, SQLiteRepository
 from .replica_worker import ReplicaWorker
+from .restore_libvirt import (
+    LocalRestoreDefinitionExecutor,
+    LocalRestoreDomainBuilder,
+    VirshRestoreDriver,
+)
+from .restore_local import (
+    LocalRestoreExecutor,
+    LocalRestoreMaterializer,
+    LocalRestoreSourceInspector,
+)
+from .restore_runtime import (
+    LocalRestorePipeline,
+    LocalRestoreStartExecutor,
+    RestoreRuntimeController,
+)
 from .runtime import DaemonRuntime
 from .ssh_identity import SSHIdentityManager
 from .ssh_known_hosts import SSHKnownHostsManager
@@ -158,8 +173,20 @@ class RuntimeWorker:
             self.repository_thread_id = threading.get_ident()
             clock = SystemClock()
             runner = SubprocessCommandRunner()
-            read_driver = VirshLibvirtDriver(runner, self.config.libvirt.uri)
-            mutation_driver = VirshBackupDriver(runner, self.config.libvirt.uri)
+            read_driver = VirshLibvirtDriver(
+                runner,
+                self.config.libvirt.uri,
+            )
+
+            backup_mutation_driver = VirshBackupDriver(
+                runner,
+                self.config.libvirt.uri,
+            )
+
+            restore_mutation_driver = VirshRestoreDriver(
+                runner,
+                self.config.libvirt.uri,
+            )
 
             def executor_for(destination):
                 staging = StagingFilesystem(
@@ -170,7 +197,7 @@ class RuntimeWorker:
                 )
                 inspector = QemuImageInspector(runner)
                 return LibvirtBackupExecutor(
-                    repository, read_driver, mutation_driver, staging,
+                    repository, read_driver, backup_mutation_driver, staging,
                     inspector,
                     output_preparer=QemuOutputImagePreparer(runner, staging, inspector),
                     allow_libvirt_mutation=self.config.libvirt.allow_mutation,
@@ -185,6 +212,63 @@ class RuntimeWorker:
                 controller_lease_seconds=self.config.daemon.controller_lease_seconds,
             )
             self._instance_id = runtime.start()
+
+            # LOCAL restore is deliberately driven by the same controller
+            # thread/SQLite connection as backup execution. No independent
+            # restore worker may race the controller over restore state.
+            restore_source_executor = LocalRestoreExecutor(
+                repository=repository,
+                inspector=LocalRestoreSourceInspector(
+                    runner=(
+                        lambda argv, timeout:
+                            runner.run(
+                                tuple(argv),
+                                timeout=timeout,
+                            )
+                    ),
+                ),
+                materializer=LocalRestoreMaterializer(),
+                clock=clock,
+            )
+
+            restore_definition_executor = (
+                LocalRestoreDefinitionExecutor(
+                    repository=repository,
+                    builder=LocalRestoreDomainBuilder(),
+                    read_driver=read_driver,
+                    mutation_driver=restore_mutation_driver,
+                    clock=clock,
+                )
+            )
+
+            restore_start_executor = LocalRestoreStartExecutor(
+                repository=repository,
+                read_driver=read_driver,
+                mutation_driver=restore_mutation_driver,
+                clock=clock,
+            )
+
+            restore_pipeline = LocalRestorePipeline(
+                repository=repository,
+                source_executor=restore_source_executor,
+                definition_executor=restore_definition_executor,
+                start_executor=restore_start_executor,
+                clock=clock,
+            )
+
+            restore_runtime = RestoreRuntimeController(
+                repository=repository,
+                node_id=self.node_id,
+                pipeline=restore_pipeline,
+                clock=clock,
+                allow_mutation=(
+                    self.config.libvirt.allow_mutation
+                ),
+            )
+
+            # MATERIALIZING / DEFINING / STARTING left by a previous
+            # process are never automatically replayed.
+            restore_runtime.recover_startup()
 
             database_path = (
                 self.config.daemon.database_path
@@ -262,6 +346,7 @@ class RuntimeWorker:
                     self.before_tick()
 
                 runtime.tick()
+                restore_runtime.tick()
 
                 self._stop.wait(
                     self.config.daemon.tick_interval_seconds

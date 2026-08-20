@@ -1282,3 +1282,595 @@ def test_local_atomic_publish_never_replaces_existing_destination(
     assert target_marker.read_text(
         encoding="utf-8"
     ) == "must-survive"
+
+
+class _EndToEndRestoreRepository(
+    _RestoreRepositoryHarness
+):
+    def __init__(
+        self,
+        operation,
+        destination,
+        point,
+    ):
+        super().__init__(
+            operation,
+            destination,
+            point,
+        )
+
+        self.vms = []
+
+    def list_vms(
+        self,
+        node_id=None,
+    ):
+        if node_id is not None:
+            assert (
+                node_id
+                == self.operation.target_node_id
+            )
+
+        return list(
+            self.vms
+        )
+
+    def mark_restore_ready(
+        self,
+        operation_id,
+        now,
+    ):
+        assert (
+            self.operation.state
+            is RestoreOperationState.DEFINING
+        )
+
+        self.calls.append(
+            "ready"
+        )
+
+        self.operation = replace(
+            self.operation,
+            state=RestoreOperationState.READY,
+            updated_at=now,
+        )
+
+        return self.operation
+
+    def mark_restore_starting(
+        self,
+        operation_id,
+        now,
+    ):
+        assert (
+            self.operation.state
+            is RestoreOperationState.READY
+        )
+
+        assert (
+            self.operation.start_after_restore
+        )
+
+        self.calls.append(
+            "starting"
+        )
+
+        self.operation = replace(
+            self.operation,
+            state=RestoreOperationState.STARTING,
+            updated_at=now,
+        )
+
+        return self.operation
+
+    def finalize_restore_success(
+        self,
+        operation_id,
+        now,
+    ):
+        if (
+            self.operation.state
+            is RestoreOperationState.READY
+        ):
+            assert not (
+                self.operation.start_after_restore
+            )
+
+        else:
+            assert (
+                self.operation.state
+                is RestoreOperationState.STARTING
+            )
+
+        self.calls.append(
+            "success"
+        )
+
+        self.operation = replace(
+            self.operation,
+            state=RestoreOperationState.SUCCESS,
+            error=None,
+            recovery_reason=None,
+            recovery_from_state=None,
+            updated_at=now,
+        )
+
+        return self.operation
+
+
+class _EndToEndReadDriver:
+    def __init__(self):
+        self.domains = {}
+        self.states = {}
+
+    def list_domain_names(
+        self,
+    ):
+        return tuple(
+            sorted(
+                self.domains
+            )
+        )
+
+    def domain_uuid(
+        self,
+        name,
+    ):
+        import xml.etree.ElementTree as ET
+
+        return ET.fromstring(
+            self.domains[name]
+        ).findtext(
+            "uuid"
+        )
+
+    def domain_xml(
+        self,
+        name,
+    ):
+        return self.domains[
+            name
+        ]
+
+    def domain_state(
+        self,
+        name,
+    ):
+        return self.states[
+            name
+        ]
+
+
+class _EndToEndMutationDriver:
+    def __init__(
+        self,
+        read_driver,
+    ):
+        self.read_driver = read_driver
+        self.define_calls = []
+        self.start_calls = []
+
+    def define(
+        self,
+        xml_path,
+    ):
+        import xml.etree.ElementTree as ET
+
+        root = ET.parse(
+            xml_path
+        ).getroot()
+
+        name = root.findtext(
+            "name"
+        )
+
+        assert name is not None
+
+        self.define_calls.append(
+            xml_path
+        )
+
+        self.read_driver.domains[
+            name
+        ] = ET.tostring(
+            root,
+            encoding="unicode",
+        )
+
+        self.read_driver.states[
+            name
+        ] = "shut off"
+
+    def start(
+        self,
+        domain,
+    ):
+        self.start_calls.append(
+            domain
+        )
+
+        self.read_driver.states[
+            domain
+        ] = "running"
+
+
+def _immutable_bundle_snapshot(
+    root: Path,
+):
+    result = {}
+
+    for path in sorted(
+        root.rglob("*")
+    ):
+        relative = str(
+            path.relative_to(
+                root
+            )
+        )
+
+        info = path.lstat()
+
+        if path.is_file():
+            result[
+                relative
+            ] = (
+                "file",
+                info.st_dev,
+                info.st_ino,
+                info.st_size,
+                info.st_mtime_ns,
+                _hash(path),
+            )
+
+        elif path.is_dir():
+            result[
+                relative
+            ] = (
+                "dir",
+                info.st_dev,
+                info.st_ino,
+            )
+
+        else:
+            result[
+                relative
+            ] = (
+                "other",
+                info.st_mode,
+            )
+
+    return result
+
+
+@pytest.mark.parametrize(
+    "start_after_restore",
+    [
+        False,
+        True,
+    ],
+)
+def test_local_restore_real_pipeline_end_to_end_preserves_source_and_uses_independent_target(
+    tmp_path,
+    start_after_restore,
+):
+    from vmbackupd.restore_libvirt import (
+        LocalRestoreDefinitionExecutor,
+        LocalRestoreDomainBuilder,
+    )
+    from vmbackupd.restore_runtime import (
+        LocalRestorePipeline,
+        LocalRestoreStartExecutor,
+    )
+
+    value = _fixture(
+        tmp_path
+    )
+
+    operation = replace(
+        value["operation"],
+        start_after_restore=(
+            start_after_restore
+        ),
+    )
+
+    source_root = Path(
+        operation.source_bundle_object_id
+    )
+
+    source_disk = value[
+        "disk"
+    ]
+
+    # The original A3.5.2 fixture intentionally needed only enough
+    # domain XML to prove bundle identity/UUID.  End-to-end A3.5.4 must
+    # exercise the stronger A3.5.3 definition contract, so give this
+    # specific acceptance case a real writable qcow2 disk mapping and
+    # a network interface which must remain disconnected.
+    disk_target = source_disk.stem
+
+    (
+        source_root
+        / "metadata"
+        / "domain.xml"
+    ).write_text(
+        f"""<domain type='kvm'>
+  <name>source-vm</name>
+  <uuid>{DOMAIN_UUID}</uuid>
+  <memory unit='KiB'>1048576</memory>
+  <devices>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='/original/{disk_target}.qcow2'/>
+      <target dev='{disk_target}' bus='virtio'/>
+    </disk>
+    <interface type='network'>
+      <mac address='52:54:00:12:34:56'/>
+      <source network='default'/>
+      <model type='virtio'/>
+    </interface>
+  </devices>
+</domain>
+""",
+        encoding="utf-8",
+    )
+
+    source_before = (
+        _immutable_bundle_snapshot(
+            source_root
+        )
+    )
+
+    source_disk_before = (
+        source_disk.lstat()
+    )
+
+    repository = (
+        _EndToEndRestoreRepository(
+            operation,
+            value["destination"],
+            value["point"],
+        )
+    )
+
+    source_executor = (
+        LocalRestoreExecutor(
+            repository=repository,
+            inspector=(
+                LocalRestoreSourceInspector(
+                    runner=QemuRunner(),
+                )
+            ),
+            materializer=(
+                LocalRestoreMaterializer()
+            ),
+            clock=_Clock(),
+        )
+    )
+
+    read_driver = (
+        _EndToEndReadDriver()
+    )
+
+    mutation_driver = (
+        _EndToEndMutationDriver(
+            read_driver
+        )
+    )
+
+    definition_executor = (
+        LocalRestoreDefinitionExecutor(
+            repository=repository,
+            builder=(
+                LocalRestoreDomainBuilder()
+            ),
+            read_driver=read_driver,
+            mutation_driver=(
+                mutation_driver
+            ),
+            clock=_Clock(),
+        )
+    )
+
+    start_executor = (
+        LocalRestoreStartExecutor(
+            repository=repository,
+            read_driver=read_driver,
+            mutation_driver=(
+                mutation_driver
+            ),
+            clock=_Clock(),
+        )
+    )
+
+    pipeline = LocalRestorePipeline(
+        repository=repository,
+        source_executor=source_executor,
+        definition_executor=(
+            definition_executor
+        ),
+        start_executor=start_executor,
+        clock=_Clock(),
+    )
+
+    # A3.5.2:
+    # PLANNED -> VERIFYING -> MATERIALIZING -> DEFINING
+    first = pipeline.advance(
+        operation.id
+    )
+
+    assert (
+        first.state
+        is RestoreOperationState.DEFINING
+    )
+
+    # A3.5.3:
+    # DEFINING -> READY after define + read-back verification.
+    second = pipeline.advance(
+        operation.id
+    )
+
+    assert (
+        second.state
+        is RestoreOperationState.READY
+    )
+
+    # A3.5.4:
+    # READY -> SUCCESS
+    # or READY -> STARTING -> SUCCESS.
+    third = pipeline.advance(
+        operation.id
+    )
+
+    assert (
+        third.state
+        is RestoreOperationState.SUCCESS
+    )
+
+    target_root = Path(
+        operation.target_root
+    )
+
+    target_disk = (
+        target_root
+        / "disks"
+        / source_disk.name
+    )
+
+    assert target_disk.is_file()
+
+    source_disk_after = (
+        source_disk.lstat()
+    )
+
+    target_disk_info = (
+        target_disk.lstat()
+    )
+
+    # Restore target must be an independent object, never hardlinked
+    # to the published backup.
+    assert (
+        source_disk_after.st_dev,
+        source_disk_after.st_ino,
+    ) != (
+        target_disk_info.st_dev,
+        target_disk_info.st_ino,
+    )
+
+    # Exact qcow2 bytes were materialized.
+    assert _hash(
+        source_disk
+    ) == _hash(
+        target_disk
+    )
+
+    # The original published source remains byte-for-byte and
+    # identity-for-identity unchanged after complete restore.
+    assert (
+        source_disk_before.st_dev,
+        source_disk_before.st_ino,
+        source_disk_before.st_size,
+        source_disk_before.st_mtime_ns,
+    ) == (
+        source_disk_after.st_dev,
+        source_disk_after.st_ino,
+        source_disk_after.st_size,
+        source_disk_after.st_mtime_ns,
+    )
+
+    assert (
+        _immutable_bundle_snapshot(
+            source_root
+        )
+        == source_before
+    )
+
+    # Libvirt definition points only to the independent restored disk.
+    defined_xml = (
+        read_driver.domain_xml(
+            operation.target_vm_name
+        )
+    )
+
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(
+        defined_xml
+    )
+
+    assert root.findtext(
+        "name"
+    ) == operation.target_vm_name
+
+    assert root.findtext(
+        "uuid"
+    ) == operation.target_domain_uuid
+
+    disk_source = root.find(
+        "./devices/disk[@device='disk']/source"
+    )
+
+    assert disk_source is not None
+
+    assert disk_source.get(
+        "file"
+    ) == str(
+        target_disk
+    )
+
+    assert (
+        operation.source_bundle_object_id
+        not in defined_xml
+    )
+
+    for interface in root.findall(
+        "./devices/interface"
+    ):
+        link = interface.find(
+            "link"
+        )
+
+        assert link is not None
+        assert link.get(
+            "state"
+        ) == "down"
+
+    assert len(
+        mutation_driver.define_calls
+    ) == 1
+
+    if start_after_restore:
+        assert (
+            mutation_driver.start_calls
+            == [
+                operation.target_vm_name,
+            ]
+        )
+
+        assert (
+            read_driver.domain_state(
+                operation.target_vm_name
+            )
+            == "running"
+        )
+
+    else:
+        assert (
+            mutation_driver.start_calls
+            == []
+        )
+
+        assert (
+            read_driver.domain_state(
+                operation.target_vm_name
+            )
+            == "shut off"
+        )
+
+    # Source remains independently valid after the entire restore.
+    LocalRestoreSourceInspector(
+        runner=QemuRunner(),
+    ).inspect(
+        operation,
+        value["destination"],
+        value["point"],
+    )
