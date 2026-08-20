@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from pathlib import Path, PurePosixPath
 
 from .bundle import BundlePathPlanner
@@ -5213,42 +5213,32 @@ class SQLiteRepository:
         return self.get_reclaim_operation(operation.id)
 
 
-    def _assert_reclaim_has_no_replica_dependencies(
+    def _validate_reclaim_replica_dependencies(
         self,
         operation_id: str,
-    ) -> None:
-        """Fail closed while any replica metadata depends on reclaim."""
+    ) -> list[sqlite3.Row]:
+        """
+        Collect replica locations participating in reclaim.
 
-        replica_location = self.connection.execute(
-            """SELECT 1
-               FROM reclaim_bundles rb
-               JOIN restore_point_locations rpl
-                 ON rpl.restore_point_id = rb.restore_point_id
-               WHERE rb.operation_id = ?
-                 AND rpl.role = 'REPLICA'
-               LIMIT 1""",
+        Replica presence is not a reason to block retention anymore.
+        Cleanup failures are tracked separately from local catalog retirement.
+        """
+        return self.connection.execute(
+            """
+            SELECT
+                rpl.*
+            FROM reclaim_bundles rb
+            JOIN restore_point_locations rpl
+              ON rpl.restore_point_id = rb.restore_point_id
+            WHERE rb.operation_id = ?
+              AND rpl.role = 'REPLICA'
+            ORDER BY
+                rpl.restore_point_id,
+                rpl.destination_id
+            """,
             (operation_id,),
-        ).fetchone()
+        ).fetchall()
 
-        if replica_location is not None:
-            raise DomainInvariantError(
-                "reclaim is blocked by replica location"
-            )
-
-        replica_task = self.connection.execute(
-            """SELECT 1
-               FROM reclaim_bundles rb
-               JOIN replica_tasks rt
-                 ON rt.restore_point_id = rb.restore_point_id
-               WHERE rb.operation_id = ?
-               LIMIT 1""",
-            (operation_id,),
-        ).fetchone()
-
-        if replica_task is not None:
-            raise DomainInvariantError(
-                "reclaim is blocked by replica task"
-            )
 
     def create_retention_reclaim_operation(
         self,
@@ -5639,9 +5629,12 @@ class SQLiteRepository:
                         ),
                     )
 
-            self._assert_reclaim_has_no_replica_dependencies(
+            replica_dependencies = self._validate_reclaim_replica_dependencies(
                 operation.id
             )
+
+            # Replica locations are cleanup targets, not reclaim blockers.
+            # They are handled separately from local catalog retirement.
 
             self.connection.commit()
 
@@ -5788,9 +5781,12 @@ class SQLiteRepository:
                 "retention reclaim chain journal is invalid"
             )
 
-        self._assert_reclaim_has_no_replica_dependencies(
+        replica_dependencies = self._validate_reclaim_replica_dependencies(
             operation["id"]
         )
+
+        # Replica locations do not prevent local reclaim retirement.
+        # Cleanup status is tracked independently.
 
         all_chains = self.connection.execute(
             """SELECT *
@@ -5974,9 +5970,28 @@ class SQLiteRepository:
             self._validate_capacity_reclaim_retirement_snapshot(
                 operation
             )
-            self._assert_reclaim_has_no_replica_dependencies(
+            replica_dependencies = self._validate_reclaim_replica_dependencies(
                 operation["id"]
             )
+
+            if replica_dependencies:
+                self.connection.execute(
+                    """
+                    UPDATE reclaim_operations
+                    SET error = COALESCE(
+                        error || '; ',
+                        ''
+                    ) || 'replica cleanup pending: '
+                      || ?,
+                    updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        str(len(replica_dependencies)),
+                        datetime.now(timezone.utc).isoformat(),
+                        operation["id"],
+                    ),
+                )
             return
 
         if purpose is ReclaimPurpose.RETENTION:
@@ -6483,9 +6498,28 @@ class SQLiteRepository:
             # Serialize the final replica dependency check with catalog
             # retirement. No replica task/location may appear between this
             # check and deletion of the selected Restore Points.
-            self._assert_reclaim_has_no_replica_dependencies(
+            replica_dependencies = self._validate_reclaim_replica_dependencies(
                 operation_id
             )
+
+            if replica_dependencies:
+                self.connection.execute(
+                    """
+                    UPDATE reclaim_operations
+                    SET error = COALESCE(
+                        error || '; ',
+                        ''
+                    ) || 'replica cleanup pending: '
+                      || ?,
+                    updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        str(len(replica_dependencies)),
+                        datetime.now(timezone.utc).isoformat(),
+                        operation_id,
+                    ),
+                )
 
             reclaim_chains = self.connection.execute(
                 """SELECT *

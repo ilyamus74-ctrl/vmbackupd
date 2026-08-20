@@ -2252,7 +2252,8 @@ def test_retention_reclaim_revalidates_mutable_policy_before_retiring(
     )
 
 
-def test_retention_reclaim_creation_refuses_replica_task_atomically(
+
+def test_retention_reclaim_creation_allows_replica_task_cleanup_pending(
     tmp_path,
 ):
     (
@@ -2308,26 +2309,24 @@ def test_retention_reclaim_creation_refuses_replica_task_atomically(
     )
     repository.connection.commit()
 
-    with pytest.raises(
-        DomainInvariantError,
-        match="replica task",
-    ):
-        repository.create_retention_reclaim_operation(
-            target_run.id,
-            [(old_chain.id, 100)],
-            free_bytes_before=1000,
-        )
+    operation = repository.create_retention_reclaim_operation(
+        target_run.id,
+        [(old_chain.id, 100)],
+        free_bytes_before=1000,
+    )
+
+    assert operation.id
 
     assert (
         repository.get_reclaim_operation_for_run(
             target_run.id,
             purpose=ReclaimPurpose.RETENTION,
         )
-        is None
+        is not None
     )
 
 
-def test_retention_reclaim_refuses_replica_location_before_destructive_stage(
+def test_retention_reclaim_allows_replica_location_before_destructive_stage(
     tmp_path,
 ):
     (
@@ -2345,12 +2344,10 @@ def test_retention_reclaim_refuses_replica_location_before_destructive_stage(
         tmp_path / "retention-replica-location.db"
     )
 
-    operation = (
-        repository.create_retention_reclaim_operation(
-            target_run.id,
-            [(old_chain.id, 100)],
-            free_bytes_before=1000,
-        )
+    operation = repository.create_retention_reclaim_operation(
+        target_run.id,
+        [(old_chain.id, 100)],
+        free_bytes_before=1000,
     )
 
     replica = StorageDestination(
@@ -2389,23 +2386,14 @@ def test_retention_reclaim_refuses_replica_location_before_destructive_stage(
     )
     repository.connection.commit()
 
-    with pytest.raises(
-        DomainInvariantError,
-        match="replica location",
-    ):
-        repository.begin_reclaim_retirement(
-            operation.id
-        )
-
-    assert (
-        repository.get_reclaim_operation(
-            operation.id
-        ).state
-        is ReclaimOperationState.PLANNED
+    result = repository.begin_reclaim_retirement(
+        operation.id
     )
 
+    assert result.state is ReclaimOperationState.RETIRING
 
-def test_catalog_retirement_refuses_late_replica_location_atomically(
+
+def test_catalog_retirement_allows_late_replica_location(
     tmp_path,
 ):
     repository, node, _, vm, job, target_run = catalog(
@@ -2455,19 +2443,8 @@ def test_catalog_retirement_refuses_late_replica_location_atomically(
     )
     repository.connection.commit()
 
-    with pytest.raises(
-        DomainInvariantError,
-        match="replica location",
-    ):
-        repository.retire_reclaim_catalog(
-            operation.id
-        )
-
-    assert (
-        repository.get_reclaim_operation(
-            operation.id
-        ).state
-        is ReclaimOperationState.QUARANTINED
+    repository.retire_reclaim_catalog(
+        operation.id
     )
 
     assert (
@@ -2477,7 +2454,7 @@ def test_catalog_retirement_refuses_late_replica_location_atomically(
                WHERE id = ?""",
             (points[0].id,),
         ).fetchone()[0]
-        == 1
+        == 0
     )
 
     assert (
@@ -2487,5 +2464,6 @@ def test_catalog_retirement_refuses_late_replica_location_atomically(
                WHERE id = ?""",
             (chain.id,),
         ).fetchone()[0]
-        == 1
+        == 0
     )
+
