@@ -81,6 +81,10 @@ def restore_operation(value) -> dict:
         "source_role": value.source_role.value,
         "source_bundle_object_id":
             value.source_bundle_object_id,
+        "source_remote_node_id":
+            value.source_remote_node_id,
+        "source_remote_storage_id":
+            value.source_remote_storage_id,
         "target_vm_name": value.target_vm_name,
         "target_domain_uuid":
             value.target_domain_uuid,

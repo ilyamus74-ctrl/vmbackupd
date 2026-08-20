@@ -657,6 +657,8 @@ class RestoreOperation:
     id: str = field(default_factory=new_id)
     created_at: datetime = field(default_factory=utcnow)
     updated_at: datetime = field(default_factory=utcnow)
+    source_remote_node_id: str | None = None
+    source_remote_storage_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -674,6 +676,25 @@ class RestoreOperation:
             "state",
             RestoreOperationState(self.state),
         )
+
+        if (
+            (self.source_remote_node_id is None)
+            != (self.source_remote_storage_id is None)
+        ):
+            raise ValueError(
+                "remote restore source identity must be complete"
+            )
+
+        if self.source_remote_node_id is not None:
+            if (
+                not isinstance(self.source_remote_node_id, str)
+                or not self.source_remote_node_id.strip()
+                or not isinstance(self.source_remote_storage_id, str)
+                or not self.source_remote_storage_id.strip()
+            ):
+                raise ValueError(
+                    "remote restore source identity must be valid"
+                )
 
         if not self.restore_point_id:
             raise ValueError("restore_point_id must not be empty")

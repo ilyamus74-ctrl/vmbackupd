@@ -9,7 +9,7 @@ import sqlite3
 from collections.abc import Callable, Mapping
 
 
-CURRENT_SCHEMA_VERSION = 15
+CURRENT_SCHEMA_VERSION = 16
 
 
 class SchemaError(RuntimeError):
@@ -282,6 +282,105 @@ RESTORE_OPERATION_TABLE_SQL = """CREATE TABLE restore_operations (
     )"""
 
 
+CURRENT_RESTORE_OPERATION_TABLE_SQL = (
+    RESTORE_OPERATION_TABLE_SQL.replace(
+        """        source_bundle_object_id TEXT NOT NULL
+            CHECK(length(trim(source_bundle_object_id)) > 0),
+        target_vm_name TEXT NOT NULL
+""",
+        """        source_bundle_object_id TEXT NOT NULL
+            CHECK(length(trim(source_bundle_object_id)) > 0),
+        source_remote_node_id TEXT
+            REFERENCES nodes(id)
+            CHECK(
+                source_remote_node_id IS NULL
+                OR length(trim(source_remote_node_id)) > 0
+            ),
+        source_remote_storage_id TEXT
+            CHECK(
+                source_remote_storage_id IS NULL
+                OR length(trim(source_remote_storage_id)) > 0
+            ),
+        target_vm_name TEXT NOT NULL
+""",
+    )
+)
+
+
+RESTORE_SOURCE_IDENTITY_TRIGGER_SQL = """CREATE TRIGGER
+        restore_operation_source_identity_immutable
+        BEFORE UPDATE OF
+            source_destination_id,
+            source_role,
+            source_bundle_object_id,
+            source_remote_node_id,
+            source_remote_storage_id
+        ON restore_operations
+        WHEN
+            NEW.source_destination_id
+                IS NOT OLD.source_destination_id
+            OR NEW.source_role
+                IS NOT OLD.source_role
+            OR NEW.source_bundle_object_id
+                IS NOT OLD.source_bundle_object_id
+            OR NEW.source_remote_node_id
+                IS NOT OLD.source_remote_node_id
+            OR NEW.source_remote_storage_id
+                IS NOT OLD.source_remote_storage_id
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'restore operation source identity is immutable'
+            );
+        END"""
+
+
+RESTORE_SOURCE_IDENTITY_CONTRACT_INSERT_SQL = """CREATE TRIGGER
+        restore_operation_source_identity_contract_insert
+        BEFORE INSERT
+        ON restore_operations
+        WHEN
+            (
+                NEW.source_remote_node_id IS NULL
+                AND NEW.source_remote_storage_id IS NOT NULL
+            )
+            OR (
+                NEW.source_remote_node_id IS NOT NULL
+                AND NEW.source_remote_storage_id IS NULL
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM storage_destinations sd
+                WHERE sd.id = NEW.source_destination_id
+                  AND (
+                      (
+                          sd.storage_type = 'LOCAL'
+                          AND (
+                              NEW.source_remote_node_id IS NOT NULL
+                              OR NEW.source_remote_storage_id IS NOT NULL
+                          )
+                      )
+                      OR (
+                          sd.storage_type = 'SSH'
+                          AND (
+                              sd.remote_node_id IS NULL
+                              OR sd.remote_storage_id IS NULL
+                              OR NEW.source_remote_node_id
+                                  IS NOT sd.remote_node_id
+                              OR NEW.source_remote_storage_id
+                                  IS NOT sd.remote_storage_id
+                          )
+                      )
+                  )
+            )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'restore operation source identity is invalid'
+            );
+        END"""
+
+
 CURRENT_SCHEMA_STATEMENTS = (
     """CREATE TABLE nodes (
         id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
@@ -386,7 +485,9 @@ CURRENT_SCHEMA_STATEMENTS = (
         UNIQUE(chain_id, sequence)
     )""",
     *REPLICA_SCHEMA_STATEMENTS,
-    RESTORE_OPERATION_TABLE_SQL,
+    CURRENT_RESTORE_OPERATION_TABLE_SQL,
+    RESTORE_SOURCE_IDENTITY_TRIGGER_SQL,
+    RESTORE_SOURCE_IDENTITY_CONTRACT_INSERT_SQL,
     """CREATE TABLE backup_artifacts (
         id TEXT PRIMARY KEY, job_run_id TEXT NOT NULL REFERENCES job_runs(id),
         restore_point_id TEXT REFERENCES restore_points(id),
@@ -644,7 +745,10 @@ CURRENT_COLUMNS = {
     "restore_operations": {
         "id", "restore_point_id", "source_destination_id",
         "target_node_id", "source_role",
-        "source_bundle_object_id", "target_vm_name",
+        "source_bundle_object_id",
+        "source_remote_node_id",
+        "source_remote_storage_id",
+        "target_vm_name",
         "target_domain_uuid", "target_root",
         "network_mode", "start_after_restore",
         "state", "error", "recovery_reason",
@@ -686,9 +790,18 @@ CURRENT_COLUMNS = {
     },
 }
 
-VERSION_14_COLUMNS = {
+VERSION_15_COLUMNS = {
     name: set(columns)
     for name, columns in CURRENT_COLUMNS.items()
+}
+VERSION_15_COLUMNS["restore_operations"] -= {
+    "source_remote_node_id",
+    "source_remote_storage_id",
+}
+
+VERSION_14_COLUMNS = {
+    name: set(columns)
+    for name, columns in VERSION_15_COLUMNS.items()
 }
 VERSION_14_COLUMNS["storage_destinations"].remove(
     "remote_node_id"
@@ -812,6 +925,7 @@ REQUIRED_FOREIGN_KEYS = {
         ("restore_point_id", "restore_points", "id"),
         ("source_destination_id", "storage_destinations", "id"),
         ("target_node_id", "nodes", "id"),
+        ("source_remote_node_id", "nodes", "id"),
     },
     "backup_artifacts": {("job_run_id", "job_runs", "id"),
                          ("restore_point_id", "restore_points", "id")},
@@ -860,6 +974,8 @@ REQUIRED_TRIGGERS = {
     "storage_destination_transport_contract_update",
     "storage_destination_identity_immutable_after_run",
     "storage_destination_remote_node_immutable_after_run",
+    "restore_operation_source_identity_immutable",
+    "restore_operation_source_identity_contract_insert",
 }
 
 VERSION_2_TRIGGERS = {
@@ -1923,6 +2039,44 @@ def migrate_14_to_15(
         STORAGE_REMOTE_NODE_TRIGGER_SQL
     )
 
+def migrate_15_to_16(
+    connection: sqlite3.Connection,
+) -> None:
+    """Freeze durable remote source placement in restore plans."""
+
+    _validate_fingerprint(
+        connection,
+        VERSION_15_COLUMNS,
+    )
+
+    connection.execute(
+        """ALTER TABLE restore_operations
+           ADD COLUMN source_remote_node_id TEXT
+           REFERENCES nodes(id)
+           CHECK(
+               source_remote_node_id IS NULL
+               OR length(trim(source_remote_node_id)) > 0
+           )"""
+    )
+
+    connection.execute(
+        """ALTER TABLE restore_operations
+           ADD COLUMN source_remote_storage_id TEXT
+           CHECK(
+               source_remote_storage_id IS NULL
+               OR length(trim(source_remote_storage_id)) > 0
+           )"""
+    )
+
+    connection.execute(
+        RESTORE_SOURCE_IDENTITY_TRIGGER_SQL
+    )
+
+    connection.execute(
+        RESTORE_SOURCE_IDENTITY_CONTRACT_INSERT_SQL
+    )
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: migrate_0_to_1,
     1: migrate_1_to_2,
@@ -1939,6 +2093,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     12: migrate_12_to_13,
     13: migrate_13_to_14,
     14: migrate_14_to_15,
+    15: migrate_15_to_16,
 }
 
 

@@ -56,10 +56,44 @@ VERSION_9_STORAGE_IDENTITY_TRIGGER_SQL = """CREATE TRIGGER
         END"""
 
 
+def drop_v16_restore_remote_source_snapshot(
+    connection,
+):
+    """Remove v16-only durable remote restore source fields."""
+
+    for trigger in (
+        "restore_operation_source_identity_immutable",
+        "restore_operation_source_identity_contract_insert",
+    ):
+        connection.execute(
+            "DROP TRIGGER IF EXISTS "
+            + trigger
+        )
+
+    columns = {
+        row[1]
+        for row in connection.execute(
+            "PRAGMA table_info(restore_operations)"
+        )
+    }
+
+    for column in (
+        "source_remote_node_id",
+        "source_remote_storage_id",
+    ):
+        if column in columns:
+            connection.execute(
+                "ALTER TABLE restore_operations "
+                f"DROP COLUMN {column}"
+            )
+
 def drop_v15_remote_node_binding(
     connection,
 ):
     """Remove the v15-only remote-node placement contract."""
+    drop_v16_restore_remote_source_snapshot(
+        connection
+    )
 
     connection.execute(
         "DROP TRIGGER IF EXISTS "
@@ -1487,8 +1521,8 @@ def test_v13_to_v14_adds_durable_restore_operations_without_data_loss(
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 15
-    assert migrated.get_database_schema_version() == 15
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 16
+    assert migrated.get_database_schema_version() == 16
 
     columns = {
         row[1]
@@ -1504,6 +1538,8 @@ def test_v13_to_v14_adds_durable_restore_operations_without_data_loss(
         "target_node_id",
         "source_role",
         "source_bundle_object_id",
+        "source_remote_node_id",
+        "source_remote_storage_id",
         "target_vm_name",
         "target_domain_uuid",
         "target_root",
@@ -1578,6 +1614,10 @@ def test_v14_to_v15_adds_remote_node_binding_without_data_loss(
         "PRAGMA foreign_keys = OFF"
     )
 
+    drop_v16_restore_remote_source_snapshot(
+        connection
+    )
+
     connection.execute(
         "DROP TRIGGER "
         "storage_destination_remote_node_immutable_after_run"
@@ -1598,10 +1638,10 @@ def test_v14_to_v15_adds_remote_node_binding_without_data_loss(
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == 15
+    assert migrated.schema_version == 16
     assert (
         migrated.get_database_schema_version()
-        == 15
+        == 16
     )
 
     columns = {
@@ -1650,6 +1690,106 @@ def test_v14_to_v15_adds_remote_node_binding_without_data_loss(
         "nodes",
         "id",
     ) in foreign_keys
+
+    assert list(
+        migrated.connection.execute(
+            "PRAGMA foreign_key_check"
+        )
+    ) == []
+
+    assert (
+        migrated.connection
+        .execute("PRAGMA integrity_check")
+        .fetchone()[0]
+        == "ok"
+    )
+
+    migrated.close()
+
+
+def test_v15_to_v16_adds_durable_remote_restore_source_snapshot(
+    tmp_path,
+):
+    path = tmp_path / "v15-to-v16.db"
+
+    repository = SQLiteRepository(path)
+
+    node = Node(name="v15-local")
+    repository.add_node(node)
+
+    destination = StorageDestination(
+        node_id=node.id,
+        name="local-root",
+        backup_data_root=str(tmp_path / "local"),
+        is_default=True,
+    )
+    repository.add_storage_destination(
+        destination
+    )
+
+    repository.close()
+
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "PRAGMA foreign_keys = OFF"
+    )
+
+    drop_v16_restore_remote_source_snapshot(
+        connection
+    )
+
+    connection.execute(
+        "UPDATE schema_version SET version = 15 "
+        "WHERE id = 1"
+    )
+
+    connection.commit()
+    connection.close()
+
+    migrated = SQLiteRepository(path)
+
+    assert (
+        migrated.schema_version
+        == CURRENT_SCHEMA_VERSION
+        == 16
+    )
+
+    columns = {
+        row[1]
+        for row in migrated.connection.execute(
+            "PRAGMA table_info(restore_operations)"
+        )
+    }
+
+    assert "source_remote_node_id" in columns
+    assert "source_remote_storage_id" in columns
+
+    foreign_keys = {
+        (row[3], row[2], row[4])
+        for row in migrated.connection.execute(
+            "PRAGMA foreign_key_list(restore_operations)"
+        )
+    }
+
+    assert (
+        "source_remote_node_id",
+        "nodes",
+        "id",
+    ) in foreign_keys
+
+    triggers = {
+        row[0]
+        for row in migrated.connection.execute(
+            """SELECT name
+               FROM sqlite_master
+               WHERE type = 'trigger'"""
+        )
+    }
+
+    assert {
+        "restore_operation_source_identity_immutable",
+        "restore_operation_source_identity_contract_insert",
+    } <= triggers
 
     assert list(
         migrated.connection.execute(

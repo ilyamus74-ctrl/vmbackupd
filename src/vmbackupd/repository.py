@@ -1963,14 +1963,46 @@ class SQLiteRepository:
             # Also proves that the location destination is owned by
             # this node's catalog.
             try:
-                self.get_storage_destination(
-                    source_vm.node_id,
-                    source_destination_id,
+                source_destination = (
+                    self.get_storage_destination(
+                        source_vm.node_id,
+                        source_destination_id,
+                    )
                 )
             except KeyError:
                 raise DomainInvariantError(
                     "RESTORE_SOURCE_DESTINATION_NOT_LOCAL"
                 ) from None
+
+            source_remote_node_id = None
+            source_remote_storage_id = None
+
+            if (
+                source_destination.storage_type
+                is StorageType.SSH
+            ):
+                if (
+                    not isinstance(
+                        source_destination.remote_node_id,
+                        str,
+                    )
+                    or not source_destination.remote_node_id.strip()
+                    or not isinstance(
+                        source_destination.remote_storage_id,
+                        str,
+                    )
+                    or not source_destination.remote_storage_id.strip()
+                ):
+                    raise DomainInvariantError(
+                        "RESTORE_REMOTE_SOURCE_PLACEMENT_REQUIRED"
+                    )
+
+                source_remote_node_id = (
+                    source_destination.remote_node_id
+                )
+                source_remote_storage_id = (
+                    source_destination.remote_storage_id
+                )
 
             # Restore workspace must never overlap any managed backup
             # storage tree in either direction. Cleanup of a restore
@@ -2062,6 +2094,12 @@ class SQLiteRepository:
                 source_bundle_object_id=(
                     location.bundle_object_id
                 ),
+                source_remote_node_id=(
+                    source_remote_node_id
+                ),
+                source_remote_storage_id=(
+                    source_remote_storage_id
+                ),
                 target_vm_name=target_vm_name,
                 target_root=str(target_path),
                 network_mode=network_mode,
@@ -2078,6 +2116,8 @@ class SQLiteRepository:
                        target_node_id,
                        source_role,
                        source_bundle_object_id,
+                       source_remote_node_id,
+                       source_remote_storage_id,
                        target_vm_name,
                        target_domain_uuid,
                        target_root,
@@ -2091,7 +2131,7 @@ class SQLiteRepository:
                    )
                    VALUES (
                        ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?, ?, ?
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?
                    )""",
                 (
                     operation.id,
@@ -2100,6 +2140,8 @@ class SQLiteRepository:
                     operation.target_node_id,
                     operation.source_role.value,
                     operation.source_bundle_object_id,
+                    operation.source_remote_node_id,
+                    operation.source_remote_storage_id,
                     operation.target_vm_name,
                     operation.target_domain_uuid,
                     operation.target_root,
@@ -6853,6 +6895,12 @@ class SQLiteRepository:
             ),
             source_bundle_object_id=(
                 row["source_bundle_object_id"]
+            ),
+            source_remote_node_id=(
+                row["source_remote_node_id"]
+            ),
+            source_remote_storage_id=(
+                row["source_remote_storage_id"]
             ),
             target_vm_name=row["target_vm_name"],
             target_domain_uuid=row["target_domain_uuid"],

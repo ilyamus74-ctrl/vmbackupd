@@ -77,10 +77,56 @@ def drop_v12_replica_tables(connection):
     connection.execute("DROP TABLE backup_job_replicas")
 
 
+def drop_v16_restore_remote_source_snapshot(
+    connection,
+):
+    """Remove v16-only restore source snapshot contract."""
+
+    for trigger in (
+        "restore_operation_source_identity_immutable",
+        "restore_operation_source_identity_contract_insert",
+    ):
+        connection.execute(
+            "DROP TRIGGER IF EXISTS "
+            + trigger
+        )
+
+    tables = {
+        row[0]
+        for row in connection.execute(
+            """SELECT name
+               FROM sqlite_master
+               WHERE type = 'table'"""
+        )
+    }
+
+    if "restore_operations" not in tables:
+        return
+
+    columns = {
+        row[1]
+        for row in connection.execute(
+            "PRAGMA table_info(restore_operations)"
+        )
+    }
+
+    for column in (
+        "source_remote_node_id",
+        "source_remote_storage_id",
+    ):
+        if column in columns:
+            connection.execute(
+                "ALTER TABLE restore_operations "
+                f"DROP COLUMN {column}"
+            )
+
 def drop_v15_remote_node_binding(
     connection,
 ):
     """Remove CURRENT-v15 remote-node placement before historical downgrade."""
+    drop_v16_restore_remote_source_snapshot(
+        connection
+    )
 
     connection.execute(
         "DROP TRIGGER IF EXISTS "
