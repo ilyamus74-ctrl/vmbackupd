@@ -2165,6 +2165,353 @@ class SQLiteRepository:
             operation.id
         )
 
+    def _transition_restore_state(
+        self,
+        operation_id: str,
+        source: RestoreOperationState,
+        target: RestoreOperationState,
+        now: datetime,
+    ) -> RestoreOperation:
+        """Compare-and-set one normal RestoreOperation transition."""
+
+        cursor = self.connection.execute(
+            """UPDATE restore_operations
+               SET state = ?,
+                   error = NULL,
+                   recovery_reason = NULL,
+                   recovery_from_state = NULL,
+                   updated_at = ?
+               WHERE id = ?
+                 AND state = ?""",
+            (
+                target.value,
+                now.isoformat(),
+                operation_id,
+                source.value,
+            ),
+        )
+
+        if cursor.rowcount != 1:
+            raise DomainInvariantError(
+                "RESTORE_STATE_TRANSITION_INVALID"
+            )
+
+        return self.get_restore_operation(
+            operation_id
+        )
+
+    def begin_restore_verification(
+        self,
+        operation_id: str,
+        now: datetime,
+    ) -> RestoreOperation:
+        """Start read-only verification for one LOCAL restore."""
+
+        operation = self.get_restore_operation(
+            operation_id
+        )
+
+        if (
+            operation.state
+            is not RestoreOperationState.PLANNED
+        ):
+            raise DomainInvariantError(
+                "RESTORE_STATE_TRANSITION_INVALID"
+            )
+
+        # Remote source planning and authenticated manifest inspection
+        # already exist, but byte acquisition is deliberately deferred.
+        if (
+            operation.source_role
+            is RestorePointLocationRole.REPLICA
+            or operation.source_remote_node_id is not None
+            or operation.source_remote_storage_id is not None
+        ):
+            raise DomainInvariantError(
+                "RESTORE_REMOTE_ACQUISITION_NOT_IMPLEMENTED"
+            )
+
+        with self.connection:
+            return self._transition_restore_state(
+                operation_id,
+                RestoreOperationState.PLANNED,
+                RestoreOperationState.VERIFYING,
+                now,
+            )
+
+    def mark_restore_materializing(
+        self,
+        operation_id: str,
+        now: datetime,
+    ) -> RestoreOperation:
+        with self.connection:
+            return self._transition_restore_state(
+                operation_id,
+                RestoreOperationState.VERIFYING,
+                RestoreOperationState.MATERIALIZING,
+                now,
+            )
+
+    def mark_restore_defining(
+        self,
+        operation_id: str,
+        now: datetime,
+    ) -> RestoreOperation:
+        with self.connection:
+            return self._transition_restore_state(
+                operation_id,
+                RestoreOperationState.MATERIALIZING,
+                RestoreOperationState.DEFINING,
+                now,
+            )
+
+    def mark_restore_ready(
+        self,
+        operation_id: str,
+        now: datetime,
+    ) -> RestoreOperation:
+        with self.connection:
+            return self._transition_restore_state(
+                operation_id,
+                RestoreOperationState.DEFINING,
+                RestoreOperationState.READY,
+                now,
+            )
+
+    def mark_restore_starting(
+        self,
+        operation_id: str,
+        now: datetime,
+    ) -> RestoreOperation:
+        operation = self.get_restore_operation(
+            operation_id
+        )
+
+        if (
+            operation.state
+            is not RestoreOperationState.READY
+        ):
+            raise DomainInvariantError(
+                "RESTORE_STATE_TRANSITION_INVALID"
+            )
+
+        if not operation.start_after_restore:
+            raise DomainInvariantError(
+                "RESTORE_START_NOT_REQUESTED"
+            )
+
+        with self.connection:
+            cursor = self.connection.execute(
+                """UPDATE restore_operations
+                   SET state = 'STARTING',
+                       error = NULL,
+                       recovery_reason = NULL,
+                       recovery_from_state = NULL,
+                       updated_at = ?
+                   WHERE id = ?
+                     AND state = 'READY'
+                     AND start_after_restore = 1""",
+                (
+                    now.isoformat(),
+                    operation_id,
+                ),
+            )
+
+            if cursor.rowcount != 1:
+                raise DomainInvariantError(
+                    "RESTORE_STATE_TRANSITION_INVALID"
+                )
+
+        return self.get_restore_operation(
+            operation_id
+        )
+
+    def finalize_restore_success(
+        self,
+        operation_id: str,
+        now: datetime,
+    ) -> RestoreOperation:
+        operation = self.get_restore_operation(
+            operation_id
+        )
+
+        if (
+            operation.state
+            is RestoreOperationState.READY
+        ):
+            if operation.start_after_restore:
+                raise DomainInvariantError(
+                    "RESTORE_START_REQUIRED"
+                )
+
+            with self.connection:
+                cursor = self.connection.execute(
+                    """UPDATE restore_operations
+                       SET state = 'SUCCESS',
+                           error = NULL,
+                           recovery_reason = NULL,
+                           recovery_from_state = NULL,
+                           updated_at = ?
+                       WHERE id = ?
+                         AND state = 'READY'
+                         AND start_after_restore = 0""",
+                    (
+                        now.isoformat(),
+                        operation_id,
+                    ),
+                )
+
+                if cursor.rowcount != 1:
+                    raise DomainInvariantError(
+                        "RESTORE_STATE_TRANSITION_INVALID"
+                    )
+
+            return self.get_restore_operation(
+                operation_id
+            )
+
+        if (
+            operation.state
+            is RestoreOperationState.STARTING
+        ):
+            with self.connection:
+                return self._transition_restore_state(
+                    operation_id,
+                    RestoreOperationState.STARTING,
+                    RestoreOperationState.SUCCESS,
+                    now,
+                )
+
+        raise DomainInvariantError(
+            "RESTORE_STATE_TRANSITION_INVALID"
+        )
+
+    def fail_restore(
+        self,
+        operation_id: str,
+        error: str,
+        now: datetime,
+    ) -> RestoreOperation:
+        if (
+            not isinstance(error, str)
+            or not error.strip()
+        ):
+            raise ValueError(
+                "restore failure error must not be empty"
+            )
+
+        operation = self.get_restore_operation(
+            operation_id
+        )
+
+        unsafe = {
+            RestoreOperationState.ACQUIRING,
+            RestoreOperationState.MATERIALIZING,
+            RestoreOperationState.DEFINING,
+            RestoreOperationState.STARTING,
+        }
+
+        if operation.state in unsafe:
+            raise DomainInvariantError(
+                "RESTORE_UNSAFE_STATE_REQUIRES_RECOVERY"
+            )
+
+        if operation.state not in {
+            RestoreOperationState.PLANNED,
+            RestoreOperationState.VERIFYING,
+        }:
+            raise DomainInvariantError(
+                "RESTORE_STATE_TRANSITION_INVALID"
+            )
+
+        with self.connection:
+            cursor = self.connection.execute(
+                """UPDATE restore_operations
+                   SET state = 'FAILED',
+                       error = ?,
+                       recovery_reason = NULL,
+                       recovery_from_state = NULL,
+                       updated_at = ?
+                   WHERE id = ?
+                     AND state = ?""",
+                (
+                    error.strip(),
+                    now.isoformat(),
+                    operation_id,
+                    operation.state.value,
+                ),
+            )
+
+            if cursor.rowcount != 1:
+                raise DomainInvariantError(
+                    "RESTORE_STATE_TRANSITION_INVALID"
+                )
+
+        return self.get_restore_operation(
+            operation_id
+        )
+
+    def require_restore_recovery(
+        self,
+        operation_id: str,
+        reason: str,
+        now: datetime,
+    ) -> RestoreOperation:
+        if (
+            not isinstance(reason, str)
+            or not reason.strip()
+        ):
+            raise ValueError(
+                "restore recovery reason must not be empty"
+            )
+
+        operation = self.get_restore_operation(
+            operation_id
+        )
+
+        unsafe = {
+            RestoreOperationState.ACQUIRING,
+            RestoreOperationState.MATERIALIZING,
+            RestoreOperationState.DEFINING,
+            RestoreOperationState.STARTING,
+        }
+
+        if operation.state not in unsafe:
+            raise DomainInvariantError(
+                "RESTORE_RECOVERY_STATE_NOT_UNSAFE"
+            )
+
+        source = operation.state
+
+        with self.connection:
+            cursor = self.connection.execute(
+                """UPDATE restore_operations
+                   SET state = 'RECOVERY_REQUIRED',
+                       recovery_from_state = ?,
+                       recovery_reason = ?,
+                       updated_at = ?
+                   WHERE id = ?
+                     AND state = ?
+                     AND recovery_from_state IS NULL
+                     AND recovery_reason IS NULL""",
+                (
+                    source.value,
+                    reason.strip(),
+                    now.isoformat(),
+                    operation_id,
+                    source.value,
+                ),
+            )
+
+            if cursor.rowcount != 1:
+                raise DomainInvariantError(
+                    "RESTORE_STATE_TRANSITION_INVALID"
+                )
+
+        return self.get_restore_operation(
+            operation_id
+        )
+
     def get_restore_operation(
         self,
         operation_id: str,
@@ -6916,6 +7263,13 @@ class SQLiteRepository:
             ),
             error=row["error"],
             recovery_reason=row["recovery_reason"],
+            recovery_from_state=(
+                RestoreOperationState(
+                    row["recovery_from_state"]
+                )
+                if row["recovery_from_state"] is not None
+                else None
+            ),
             created_at=datetime.fromisoformat(
                 row["created_at"]
             ),

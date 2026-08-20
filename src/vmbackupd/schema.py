@@ -9,7 +9,7 @@ import sqlite3
 from collections.abc import Callable, Mapping
 
 
-CURRENT_SCHEMA_VERSION = 16
+CURRENT_SCHEMA_VERSION = 17
 
 
 class SchemaError(RuntimeError):
@@ -303,6 +303,23 @@ CURRENT_RESTORE_OPERATION_TABLE_SQL = (
             ),
         target_vm_name TEXT NOT NULL
 """,
+    ).replace(
+        """        recovery_reason TEXT,
+        created_at TEXT NOT NULL,
+""",
+        """        recovery_reason TEXT,
+        recovery_from_state TEXT
+            CHECK(
+                recovery_from_state IS NULL
+                OR recovery_from_state IN (
+                    'ACQUIRING',
+                    'MATERIALIZING',
+                    'DEFINING',
+                    'STARTING'
+                )
+            ),
+        created_at TEXT NOT NULL,
+""",
     )
 )
 
@@ -377,6 +394,77 @@ RESTORE_SOURCE_IDENTITY_CONTRACT_INSERT_SQL = """CREATE TRIGGER
             SELECT RAISE(
                 ABORT,
                 'restore operation source identity is invalid'
+            );
+        END"""
+
+
+RESTORE_RECOVERY_CONTRACT_INSERT_SQL = """CREATE TRIGGER
+        restore_operation_recovery_contract_insert
+        BEFORE INSERT
+        ON restore_operations
+        WHEN
+            (
+                NEW.state = 'RECOVERY_REQUIRED'
+                AND (
+                    NEW.recovery_from_state IS NULL
+                    OR NEW.recovery_from_state NOT IN (
+                        'ACQUIRING',
+                        'MATERIALIZING',
+                        'DEFINING',
+                        'STARTING'
+                    )
+                    OR NEW.recovery_reason IS NULL
+                    OR length(trim(NEW.recovery_reason)) = 0
+                )
+            )
+            OR (
+                NEW.state != 'RECOVERY_REQUIRED'
+                AND (
+                    NEW.recovery_from_state IS NOT NULL
+                    OR NEW.recovery_reason IS NOT NULL
+                )
+            )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'restore recovery contract invalid'
+            );
+        END"""
+
+
+RESTORE_RECOVERY_CONTRACT_UPDATE_SQL = """CREATE TRIGGER
+        restore_operation_recovery_contract_update
+        BEFORE UPDATE OF
+            state,
+            recovery_reason,
+            recovery_from_state
+        ON restore_operations
+        WHEN
+            (
+                NEW.state = 'RECOVERY_REQUIRED'
+                AND (
+                    NEW.recovery_from_state IS NULL
+                    OR NEW.recovery_from_state NOT IN (
+                        'ACQUIRING',
+                        'MATERIALIZING',
+                        'DEFINING',
+                        'STARTING'
+                    )
+                    OR NEW.recovery_reason IS NULL
+                    OR length(trim(NEW.recovery_reason)) = 0
+                )
+            )
+            OR (
+                NEW.state != 'RECOVERY_REQUIRED'
+                AND (
+                    NEW.recovery_from_state IS NOT NULL
+                    OR NEW.recovery_reason IS NOT NULL
+                )
+            )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'restore recovery contract invalid'
             );
         END"""
 
@@ -488,6 +576,8 @@ CURRENT_SCHEMA_STATEMENTS = (
     CURRENT_RESTORE_OPERATION_TABLE_SQL,
     RESTORE_SOURCE_IDENTITY_TRIGGER_SQL,
     RESTORE_SOURCE_IDENTITY_CONTRACT_INSERT_SQL,
+    RESTORE_RECOVERY_CONTRACT_INSERT_SQL,
+    RESTORE_RECOVERY_CONTRACT_UPDATE_SQL,
     """CREATE TABLE backup_artifacts (
         id TEXT PRIMARY KEY, job_run_id TEXT NOT NULL REFERENCES job_runs(id),
         restore_point_id TEXT REFERENCES restore_points(id),
@@ -752,6 +842,7 @@ CURRENT_COLUMNS = {
         "target_domain_uuid", "target_root",
         "network_mode", "start_after_restore",
         "state", "error", "recovery_reason",
+        "recovery_from_state",
         "created_at", "updated_at",
     },
     "backup_artifacts": {"id", "job_run_id", "restore_point_id", "kind", "disk_target",
@@ -790,9 +881,17 @@ CURRENT_COLUMNS = {
     },
 }
 
-VERSION_15_COLUMNS = {
+VERSION_16_COLUMNS = {
     name: set(columns)
     for name, columns in CURRENT_COLUMNS.items()
+}
+VERSION_16_COLUMNS["restore_operations"].remove(
+    "recovery_from_state"
+)
+
+VERSION_15_COLUMNS = {
+    name: set(columns)
+    for name, columns in VERSION_16_COLUMNS.items()
 }
 VERSION_15_COLUMNS["restore_operations"] -= {
     "source_remote_node_id",
@@ -976,6 +1075,8 @@ REQUIRED_TRIGGERS = {
     "storage_destination_remote_node_immutable_after_run",
     "restore_operation_source_identity_immutable",
     "restore_operation_source_identity_contract_insert",
+    "restore_operation_recovery_contract_insert",
+    "restore_operation_recovery_contract_update",
 }
 
 VERSION_2_TRIGGERS = {
@@ -2077,6 +2178,54 @@ def migrate_15_to_16(
     )
 
 
+def migrate_16_to_17(
+    connection: sqlite3.Connection,
+) -> None:
+    """Add durable restore recovery provenance."""
+
+    _validate_fingerprint(
+        connection,
+        VERSION_16_COLUMNS,
+    )
+
+    # v16 had no supported restore executor and therefore could not
+    # legitimately create durable recovery provenance. Do not guess
+    # historical provenance from mutable/free-form fields.
+    invalid = connection.execute(
+        """SELECT 1
+           FROM restore_operations
+           WHERE state = 'RECOVERY_REQUIRED'
+              OR recovery_reason IS NOT NULL
+           LIMIT 1"""
+    ).fetchone()
+
+    if invalid is not None:
+        raise UnsupportedSchemaError(
+            "v16 restore recovery provenance cannot be inferred"
+        )
+
+    connection.execute(
+        """ALTER TABLE restore_operations
+           ADD COLUMN recovery_from_state TEXT
+           CHECK(
+               recovery_from_state IS NULL
+               OR recovery_from_state IN (
+                   'ACQUIRING',
+                   'MATERIALIZING',
+                   'DEFINING',
+                   'STARTING'
+               )
+           )"""
+    )
+
+    connection.execute(
+        RESTORE_RECOVERY_CONTRACT_INSERT_SQL
+    )
+    connection.execute(
+        RESTORE_RECOVERY_CONTRACT_UPDATE_SQL
+    )
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     0: migrate_0_to_1,
     1: migrate_1_to_2,
@@ -2094,6 +2243,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     13: migrate_13_to_14,
     14: migrate_14_to_15,
     15: migrate_15_to_16,
+    16: migrate_16_to_17,
 }
 
 

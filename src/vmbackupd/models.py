@@ -654,6 +654,7 @@ class RestoreOperation:
     state: RestoreOperationState = RestoreOperationState.PLANNED
     error: str | None = None
     recovery_reason: str | None = None
+    recovery_from_state: RestoreOperationState | None = None
     id: str = field(default_factory=new_id)
     created_at: datetime = field(default_factory=utcnow)
     updated_at: datetime = field(default_factory=utcnow)
@@ -676,6 +677,46 @@ class RestoreOperation:
             "state",
             RestoreOperationState(self.state),
         )
+
+        if self.recovery_from_state is not None:
+            object.__setattr__(
+                self,
+                "recovery_from_state",
+                RestoreOperationState(
+                    self.recovery_from_state
+                ),
+            )
+
+        recovery_sources = {
+            RestoreOperationState.ACQUIRING,
+            RestoreOperationState.MATERIALIZING,
+            RestoreOperationState.DEFINING,
+            RestoreOperationState.STARTING,
+        }
+
+        if (
+            self.state
+            is RestoreOperationState.RECOVERY_REQUIRED
+        ):
+            if (
+                self.recovery_from_state
+                not in recovery_sources
+                or not isinstance(
+                    self.recovery_reason,
+                    str,
+                )
+                or not self.recovery_reason.strip()
+            ):
+                raise ValueError(
+                    "restore recovery contract is invalid"
+                )
+        elif (
+            self.recovery_from_state is not None
+            or self.recovery_reason is not None
+        ):
+            raise ValueError(
+                "restore recovery contract is invalid"
+            )
 
         if (
             (self.source_remote_node_id is None)

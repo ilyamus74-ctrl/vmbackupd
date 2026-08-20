@@ -56,10 +56,42 @@ VERSION_9_STORAGE_IDENTITY_TRIGGER_SQL = """CREATE TRIGGER
         END"""
 
 
+def drop_v17_restore_recovery_provenance(
+    connection,
+):
+    """Remove v17-only restore recovery provenance."""
+
+    for trigger in (
+        "restore_operation_recovery_contract_insert",
+        "restore_operation_recovery_contract_update",
+    ):
+        connection.execute(
+            "DROP TRIGGER IF EXISTS "
+            + trigger
+        )
+
+    columns = {
+        row[1]
+        for row in connection.execute(
+            "PRAGMA table_info(restore_operations)"
+        )
+    }
+
+    if "recovery_from_state" in columns:
+        connection.execute(
+            "ALTER TABLE restore_operations "
+            "DROP COLUMN recovery_from_state"
+        )
+
+
 def drop_v16_restore_remote_source_snapshot(
     connection,
 ):
     """Remove v16-only durable remote restore source fields."""
+
+    drop_v17_restore_recovery_provenance(
+        connection
+    )
 
     for trigger in (
         "restore_operation_source_identity_immutable",
@@ -1521,8 +1553,8 @@ def test_v13_to_v14_adds_durable_restore_operations_without_data_loss(
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 16
-    assert migrated.get_database_schema_version() == 16
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 17
+    assert migrated.get_database_schema_version() == 17
 
     columns = {
         row[1]
@@ -1548,6 +1580,7 @@ def test_v13_to_v14_adds_durable_restore_operations_without_data_loss(
         "state",
         "error",
         "recovery_reason",
+        "recovery_from_state",
         "created_at",
         "updated_at",
     }
@@ -1638,10 +1671,10 @@ def test_v14_to_v15_adds_remote_node_binding_without_data_loss(
 
     migrated = SQLiteRepository(path)
 
-    assert migrated.schema_version == 16
+    assert migrated.schema_version == 17
     assert (
         migrated.get_database_schema_version()
-        == 16
+        == 17
     )
 
     columns = {
@@ -1751,7 +1784,7 @@ def test_v15_to_v16_adds_durable_remote_restore_source_snapshot(
     assert (
         migrated.schema_version
         == CURRENT_SCHEMA_VERSION
-        == 16
+        == 17
     )
 
     columns = {
@@ -1801,6 +1834,144 @@ def test_v15_to_v16_adds_durable_remote_restore_source_snapshot(
         migrated.connection
         .execute("PRAGMA integrity_check")
         .fetchone()[0]
+        == "ok"
+    )
+
+    migrated.close()
+
+
+def test_v16_to_v17_adds_restore_recovery_provenance_without_data_loss(
+    tmp_path,
+):
+    path = tmp_path / "v16-to-v17.db"
+
+    (
+        node,
+        destination,
+        vm,
+        job,
+        run,
+        point,
+        artifact_ids,
+    ) = populated_database(path)
+
+    operation_id = (
+        "11111111-3333-4777-8999-aaaaaaaaaaaa"
+    )
+    target_uuid = (
+        "22222222-4444-4888-8aaa-bbbbbbbbbbbb"
+    )
+
+    connection = sqlite3.connect(path)
+
+    connection.execute(
+        """INSERT INTO restore_operations (
+               id,
+               restore_point_id,
+               source_destination_id,
+               target_node_id,
+               source_role,
+               source_bundle_object_id,
+               source_remote_node_id,
+               source_remote_storage_id,
+               target_vm_name,
+               target_domain_uuid,
+               target_root,
+               network_mode,
+               start_after_restore,
+               state,
+               error,
+               recovery_reason,
+               created_at,
+               updated_at
+           )
+           VALUES (
+               ?, ?, ?, ?, 'PRIMARY', ?,
+               NULL, NULL, ?, ?, ?,
+               'DISCONNECTED', 0,
+               'PLANNED', NULL, NULL, ?, ?
+           )""",
+        (
+            operation_id,
+            point.id,
+            destination.id,
+            node.id,
+            "/data/vms/source/full",
+            "v16-preserved-restore",
+            target_uuid,
+            "/restore/v16-preserved",
+            "2026-08-20T10:00:00+00:00",
+            "2026-08-20T10:00:00+00:00",
+        ),
+    )
+
+    connection.commit()
+
+    drop_v17_restore_recovery_provenance(
+        connection
+    )
+
+    connection.execute(
+        "UPDATE schema_version SET version = 16 "
+        "WHERE id = 1"
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = SQLiteRepository(path)
+
+    assert (
+        migrated.schema_version
+        == CURRENT_SCHEMA_VERSION
+        == 17
+    )
+    assert migrated.get_database_schema_version() == 17
+
+    columns = {
+        row[1]
+        for row in migrated.connection.execute(
+            "PRAGMA table_info(restore_operations)"
+        )
+    }
+
+    assert "recovery_from_state" in columns
+
+    restored = migrated.get_restore_operation(
+        operation_id
+    )
+
+    assert restored.id == operation_id
+    assert restored.restore_point_id == point.id
+    assert restored.source_destination_id == destination.id
+    assert restored.source_bundle_object_id == "/data/vms/source/full"
+    assert restored.state.value == "PLANNED"
+    assert restored.recovery_from_state is None
+    assert restored.recovery_reason is None
+
+    triggers = {
+        row[0]
+        for row in migrated.connection.execute(
+            """SELECT name
+               FROM sqlite_master
+               WHERE type = 'trigger'"""
+        )
+    }
+
+    assert {
+        "restore_operation_recovery_contract_insert",
+        "restore_operation_recovery_contract_update",
+    } <= triggers
+
+    assert list(
+        migrated.connection.execute(
+            "PRAGMA foreign_key_check"
+        )
+    ) == []
+
+    assert (
+        migrated.connection.execute(
+            "PRAGMA integrity_check"
+        ).fetchone()[0]
         == "ok"
     )
 

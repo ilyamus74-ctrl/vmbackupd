@@ -95,6 +95,10 @@ def restore_operation(value) -> dict:
         "state": value.state.value,
         "error": value.error,
         "recovery_reason": value.recovery_reason,
+        "recovery_from_state":
+            value.recovery_from_state.value
+            if value.recovery_from_state
+            else None,
         "created_at": value.created_at.isoformat(),
         "updated_at": value.updated_at.isoformat(),
     }

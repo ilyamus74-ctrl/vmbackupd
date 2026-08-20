@@ -18,6 +18,7 @@ from vmbackupd.models import (
     RestorePointLocation,
     RestorePointLocationRole,
     RestorePointLocationState,
+    RestoreOperationState,
     RetentionPolicy,
     StorageDestination,
     StorageType,
@@ -704,3 +705,606 @@ def test_cli_maps_restore_contract():
         "network_mode": "DISCONNECTED",
         "start_after_restore": False,
     }
+
+
+def _local_restore_operation(
+    repository,
+    node,
+    primary,
+    point,
+    *,
+    suffix,
+    start_after_restore=False,
+):
+    return repository.create_restore_operation(
+        point.id,
+        primary.id,
+        node.id,
+        f"restore-{suffix}",
+        f"/restore/{suffix}",
+        NOW,
+        start_after_restore=start_after_restore,
+    )
+
+
+def test_a351_local_restore_begins_with_read_only_verification():
+    (
+        repository,
+        node,
+        primary,
+        replica,
+        vm,
+        job,
+        run,
+        point,
+        primary_bundle,
+        replica_bundle,
+    ) = _domain()
+
+    operation = _local_restore_operation(
+        repository,
+        node,
+        primary,
+        point,
+        suffix="verify",
+    )
+
+    assert operation.state is RestoreOperationState.PLANNED
+
+    verifying = repository.begin_restore_verification(
+        operation.id,
+        NOW,
+    )
+
+    assert verifying.state is RestoreOperationState.VERIFYING
+    assert verifying.error is None
+    assert verifying.recovery_reason is None
+    assert verifying.recovery_from_state is None
+
+    # Source identity remains the frozen LOCAL source.
+    assert verifying.source_destination_id == primary.id
+    assert verifying.source_bundle_object_id == primary_bundle
+    assert verifying.source_remote_node_id is None
+    assert verifying.source_remote_storage_id is None
+
+
+def test_a351_remote_restore_execution_remains_explicitly_deferred():
+    (
+        repository,
+        node,
+        primary,
+        replica,
+        vm,
+        job,
+        run,
+        point,
+        primary_bundle,
+        replica_bundle,
+    ) = _domain()
+
+    operation = repository.create_restore_operation(
+        point.id,
+        replica.id,
+        node.id,
+        "remote-deferred",
+        "/restore/remote-deferred",
+        NOW,
+    )
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="RESTORE_REMOTE_ACQUISITION_NOT_IMPLEMENTED",
+    ):
+        repository.begin_restore_verification(
+            operation.id,
+            NOW,
+        )
+
+    persisted = repository.get_restore_operation(
+        operation.id
+    )
+
+    assert persisted.state is RestoreOperationState.PLANNED
+    assert persisted.recovery_from_state is None
+
+
+def test_a351_local_restore_state_machine_reaches_success_without_start():
+    (
+        repository,
+        node,
+        primary,
+        replica,
+        vm,
+        job,
+        run,
+        point,
+        primary_bundle,
+        replica_bundle,
+    ) = _domain()
+
+    operation = _local_restore_operation(
+        repository,
+        node,
+        primary,
+        point,
+        suffix="nostart",
+    )
+
+    operation = repository.begin_restore_verification(
+        operation.id,
+        NOW,
+    )
+    assert operation.state is RestoreOperationState.VERIFYING
+
+    operation = repository.mark_restore_materializing(
+        operation.id,
+        NOW,
+    )
+    assert operation.state is RestoreOperationState.MATERIALIZING
+
+    operation = repository.mark_restore_defining(
+        operation.id,
+        NOW,
+    )
+    assert operation.state is RestoreOperationState.DEFINING
+
+    operation = repository.mark_restore_ready(
+        operation.id,
+        NOW,
+    )
+    assert operation.state is RestoreOperationState.READY
+
+    operation = repository.finalize_restore_success(
+        operation.id,
+        NOW,
+    )
+    assert operation.state is RestoreOperationState.SUCCESS
+    assert operation.error is None
+    assert operation.recovery_reason is None
+    assert operation.recovery_from_state is None
+
+
+def test_a351_local_restore_start_path_is_explicit():
+    (
+        repository,
+        node,
+        primary,
+        replica,
+        vm,
+        job,
+        run,
+        point,
+        primary_bundle,
+        replica_bundle,
+    ) = _domain()
+
+    operation = _local_restore_operation(
+        repository,
+        node,
+        primary,
+        point,
+        suffix="start",
+        start_after_restore=True,
+    )
+
+    operation = repository.begin_restore_verification(
+        operation.id,
+        NOW,
+    )
+    operation = repository.mark_restore_materializing(
+        operation.id,
+        NOW,
+    )
+    operation = repository.mark_restore_defining(
+        operation.id,
+        NOW,
+    )
+    operation = repository.mark_restore_ready(
+        operation.id,
+        NOW,
+    )
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="RESTORE_START_REQUIRED",
+    ):
+        repository.finalize_restore_success(
+            operation.id,
+            NOW,
+        )
+
+    starting = repository.mark_restore_starting(
+        operation.id,
+        NOW,
+    )
+
+    assert starting.state is RestoreOperationState.STARTING
+
+    success = repository.finalize_restore_success(
+        operation.id,
+        NOW,
+    )
+
+    assert success.state is RestoreOperationState.SUCCESS
+
+
+def test_a351_restore_starting_requires_start_after_restore():
+    (
+        repository,
+        node,
+        primary,
+        replica,
+        vm,
+        job,
+        run,
+        point,
+        primary_bundle,
+        replica_bundle,
+    ) = _domain()
+
+    operation = _local_restore_operation(
+        repository,
+        node,
+        primary,
+        point,
+        suffix="invalid-start",
+    )
+
+    operation = repository.begin_restore_verification(
+        operation.id,
+        NOW,
+    )
+    operation = repository.mark_restore_materializing(
+        operation.id,
+        NOW,
+    )
+    operation = repository.mark_restore_defining(
+        operation.id,
+        NOW,
+    )
+    operation = repository.mark_restore_ready(
+        operation.id,
+        NOW,
+    )
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="RESTORE_START_NOT_REQUESTED",
+    ):
+        repository.mark_restore_starting(
+            operation.id,
+            NOW,
+        )
+
+    assert (
+        repository.get_restore_operation(operation.id).state
+        is RestoreOperationState.READY
+    )
+
+
+def test_a351_restore_transitions_are_compare_and_set():
+    (
+        repository,
+        node,
+        primary,
+        replica,
+        vm,
+        job,
+        run,
+        point,
+        primary_bundle,
+        replica_bundle,
+    ) = _domain()
+
+    operation = _local_restore_operation(
+        repository,
+        node,
+        primary,
+        point,
+        suffix="cas",
+    )
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="RESTORE_STATE_TRANSITION_INVALID",
+    ):
+        repository.mark_restore_materializing(
+            operation.id,
+            NOW,
+        )
+
+    operation = repository.begin_restore_verification(
+        operation.id,
+        NOW,
+    )
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="RESTORE_STATE_TRANSITION_INVALID",
+    ):
+        repository.mark_restore_defining(
+            operation.id,
+            NOW,
+        )
+
+    assert (
+        repository.get_restore_operation(operation.id).state
+        is RestoreOperationState.VERIFYING
+    )
+
+
+@pytest.mark.parametrize(
+    "unsafe_state",
+    [
+        RestoreOperationState.MATERIALIZING,
+        RestoreOperationState.DEFINING,
+        RestoreOperationState.STARTING,
+    ],
+)
+def test_a351_unsafe_restore_states_require_recovery_with_provenance(
+    unsafe_state,
+):
+    (
+        repository,
+        node,
+        primary,
+        replica,
+        vm,
+        job,
+        run,
+        point,
+        primary_bundle,
+        replica_bundle,
+    ) = _domain()
+
+    operation = _local_restore_operation(
+        repository,
+        node,
+        primary,
+        point,
+        suffix=f"recovery-{unsafe_state.value.lower()}",
+        start_after_restore=(
+            unsafe_state is RestoreOperationState.STARTING
+        ),
+    )
+
+    operation = repository.begin_restore_verification(
+        operation.id,
+        NOW,
+    )
+    operation = repository.mark_restore_materializing(
+        operation.id,
+        NOW,
+    )
+
+    if unsafe_state in {
+        RestoreOperationState.DEFINING,
+        RestoreOperationState.STARTING,
+    }:
+        operation = repository.mark_restore_defining(
+            operation.id,
+            NOW,
+        )
+
+    if unsafe_state is RestoreOperationState.STARTING:
+        operation = repository.mark_restore_ready(
+            operation.id,
+            NOW,
+        )
+        operation = repository.mark_restore_starting(
+            operation.id,
+            NOW,
+        )
+
+    assert operation.state is unsafe_state
+
+    recovered = repository.require_restore_recovery(
+        operation.id,
+        "daemon interrupted unsafe restore state",
+        NOW,
+    )
+
+    assert (
+        recovered.state
+        is RestoreOperationState.RECOVERY_REQUIRED
+    )
+    assert recovered.recovery_from_state is unsafe_state
+    assert (
+        recovered.recovery_reason
+        == "daemon interrupted unsafe restore state"
+    )
+
+
+def test_a351_verification_is_retry_safe_not_recovery_state():
+    (
+        repository,
+        node,
+        primary,
+        replica,
+        vm,
+        job,
+        run,
+        point,
+        primary_bundle,
+        replica_bundle,
+    ) = _domain()
+
+    operation = _local_restore_operation(
+        repository,
+        node,
+        primary,
+        point,
+        suffix="verify-safe",
+    )
+
+    operation = repository.begin_restore_verification(
+        operation.id,
+        NOW,
+    )
+
+    assert operation.state is RestoreOperationState.VERIFYING
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="RESTORE_RECOVERY_STATE_NOT_UNSAFE",
+    ):
+        repository.require_restore_recovery(
+            operation.id,
+            "verification was interrupted",
+            NOW,
+        )
+
+    persisted = repository.get_restore_operation(
+        operation.id
+    )
+
+    assert persisted.state is RestoreOperationState.VERIFYING
+    assert persisted.recovery_from_state is None
+    assert persisted.recovery_reason is None
+
+
+def test_a351_safe_restore_failure_is_terminal():
+    (
+        repository,
+        node,
+        primary,
+        replica,
+        vm,
+        job,
+        run,
+        point,
+        primary_bundle,
+        replica_bundle,
+    ) = _domain()
+
+    operation = _local_restore_operation(
+        repository,
+        node,
+        primary,
+        point,
+        suffix="safe-failure",
+    )
+
+    operation = repository.begin_restore_verification(
+        operation.id,
+        NOW,
+    )
+
+    failed = repository.fail_restore(
+        operation.id,
+        "source verification failed",
+        NOW,
+    )
+
+    assert failed.state is RestoreOperationState.FAILED
+    assert failed.error == "source verification failed"
+    assert failed.recovery_reason is None
+    assert failed.recovery_from_state is None
+
+
+def test_a351_unsafe_restore_cannot_be_failed_without_recovery():
+    (
+        repository,
+        node,
+        primary,
+        replica,
+        vm,
+        job,
+        run,
+        point,
+        primary_bundle,
+        replica_bundle,
+    ) = _domain()
+
+    operation = _local_restore_operation(
+        repository,
+        node,
+        primary,
+        point,
+        suffix="unsafe-failure",
+    )
+
+    operation = repository.begin_restore_verification(
+        operation.id,
+        NOW,
+    )
+    operation = repository.mark_restore_materializing(
+        operation.id,
+        NOW,
+    )
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="RESTORE_UNSAFE_STATE_REQUIRES_RECOVERY",
+    ):
+        repository.fail_restore(
+            operation.id,
+            "materialization failed",
+            NOW,
+        )
+
+    assert (
+        repository.get_restore_operation(operation.id).state
+        is RestoreOperationState.MATERIALIZING
+    )
+
+
+def test_a351_database_enforces_restore_recovery_contract():
+    (
+        repository,
+        node,
+        primary,
+        replica,
+        vm,
+        job,
+        run,
+        point,
+        primary_bundle,
+        replica_bundle,
+    ) = _domain()
+
+    operation = _local_restore_operation(
+        repository,
+        node,
+        primary,
+        point,
+        suffix="db-recovery-contract",
+    )
+
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="restore recovery contract invalid",
+    ):
+        repository.connection.execute(
+            """UPDATE restore_operations
+               SET state = 'RECOVERY_REQUIRED',
+                   recovery_reason = ?
+               WHERE id = ?""",
+            (
+                "missing provenance",
+                operation.id,
+            ),
+        )
+
+    repository.connection.rollback()
+
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="restore recovery contract invalid",
+    ):
+        repository.connection.execute(
+            """UPDATE restore_operations
+               SET recovery_from_state = 'MATERIALIZING'
+               WHERE id = ?""",
+            (operation.id,),
+        )
+
+    repository.connection.rollback()
+
+    persisted = repository.get_restore_operation(
+        operation.id
+    )
+
+    assert persisted.state is RestoreOperationState.PLANNED
+    assert persisted.recovery_from_state is None
+    assert persisted.recovery_reason is None
