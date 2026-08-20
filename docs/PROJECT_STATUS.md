@@ -3225,6 +3225,147 @@ R3.5 therefore remains in progress.
 
 ---
 
+## R3.5 / A3.4.1 remote restore manifest handshake
+
+Status:
+
+    CLOSED
+
+Closing implementation commit:
+
+    6148764 — Add remote restore manifest handshake
+    6148764162b1b574c979f4fcc0786ac16978b317
+
+A3.4.1 establishes the authenticated read-only handshake between a controller
+RestoreOperation and the published remote REPLICA selected as its frozen
+restore source.
+
+The receiver now exposes one dedicated restricted SSH command:
+
+    vmbackupd-restore-manifest-v1
+
+The command accepts exactly one public operation:
+
+    FETCH_MANIFEST
+
+It does not expose the general internal receiver resolver over SSH and does not
+permit resolve, publish, transfer, deletion, filesystem mutation, or restore
+execution operations.
+
+The public request contains only stable logical identifiers:
+
+    source_remote_storage_id
+        -> storage_id
+
+    restore_point_id
+        -> restore_point_id
+
+Receiver filesystem paths do not cross the SSH protocol boundary.
+
+The restricted receiver wrapper delegates only the internal read-only
+`fetch_manifest` operation to the receiver resolver. The existing published
+replica inspection boundary remains authoritative and requires a valid
+PUBLISHED marker and a structurally valid published bundle.
+
+The controller-side remote restore source inspector uses the current
+`source_destination_id` only as the live SSH route:
+
+    ssh_host
+    ssh_port
+    ssh_user
+
+Before trusting the remote manifest, it performs receiver discovery and proves:
+
+    live node.node_id
+        == restore_operation.source_remote_node_id
+
+and requires the frozen remote storage identity to remain advertised:
+
+    restore_operation.source_remote_storage_id
+        in live receiver storage catalog
+
+The manifest is then fetched using the frozen storage identity and Restore
+Point identity.
+
+The returned manifest is accepted only when all frozen identities still match:
+
+    status
+        == PUBLISHED
+
+    storage_id
+        == restore_operation.source_remote_storage_id
+
+    restore_point_id
+        == restore_operation.restore_point_id
+
+    bundle_object_id
+        == restore_operation.source_bundle_object_id
+
+Any node, storage, Restore Point, bundle, protocol, host-key, SSH identity, or
+response mismatch fails closed.
+
+Remote storage `ready` state is not used as a restore-read authorization
+signal. Receiver libvirt `restore_capable` is also not required for this
+source-read handshake because the remote receiver is acting as the backup data
+source, not as the target libvirt restore node.
+
+The managed SSH client uses the system-managed shared SSH identity, explicit
+known_hosts trust, strict host-key checking, BatchMode, disabled password and
+interactive authentication, and the configured non-standard SSH port.
+
+The existing receiver `fetch_manifest` result was explicitly regression-tested
+for wire compatibility with the new restricted SSH manifest contract.
+
+A3.4.1 deliberately does not change the restore execution state machine.
+
+A successful manifest handshake does not transition:
+
+    PLANNED -> ACQUIRING
+
+The RestoreOperation remains PLANNED because no restore data has yet been
+acquired or materialized.
+
+Schema remains:
+
+    v16
+
+No restore schema migration, repository state transition, qcow2 acquisition,
+restore workspace materialization, domain definition, or VM startup is part of
+A3.4.1.
+
+Acceptance passed:
+
+- RED-first restricted remote restore manifest protocol regression;
+- exact forced-SSH command dispatch regression;
+- rejection of unsupported/mutating SSH operations;
+- controller managed-SSH command construction regression;
+- shared SSH identity and strict known_hosts regression;
+- receiver ERROR propagation regression;
+- malformed and unsafe manifest fail-closed regressions;
+- remote receiver node substitution regression;
+- missing frozen remote storage regression;
+- remote storage identity mismatch regression;
+- Restore Point identity mismatch regression;
+- published bundle identity mismatch regression;
+- non-remote restore source rejection regression;
+- remote source inspection remains PLANNED regression;
+- existing published replica manifest compatibility regression;
+- receiver publication/preflight/node capability compatibility regressions;
+- focused A3.4.1 regression suite;
+- full project pytest regression;
+- Python compileall;
+- `git diff --check`;
+- forbidden restore state/mutation boundary check.
+
+A3.4.1 therefore closes the authenticated remote restore source identity and
+manifest handshake boundary.
+
+R3.5 remains in progress. Actual remote backup data acquisition,
+materialization, restore execution, and end-to-end restore acceptance remain
+outstanding.
+
+---
+
 # Current position
 
 Current implementation milestone:
@@ -3233,13 +3374,21 @@ Current implementation milestone:
 
 Completed R3.5 sub-milestone:
 
+    A3.4.1 remote restore manifest handshake — CLOSED
+
+A3.4.1 closing implementation commit:
+
+    6148764 — Add remote restore manifest handshake
+
+Previous completed R3.5 sub-milestone:
+
     A3.3 durable remote restore source snapshot — CLOSED
 
 A3.3 closing implementation commit:
 
     a118ab8 — Freeze remote restore source identity
 
-Previous completed R3.5 sub-milestone:
+Earlier completed R3.5 sub-milestone:
 
     A3.2 remote restore placement binding — CLOSED
 
@@ -3261,7 +3410,8 @@ Supporting receiver publication commit:
 
 Next R3.5 work:
 
-    remote replica acquisition/execution and end-to-end restore acceptance
+    remote replica data acquisition, materialization, execution, and
+    end-to-end restore acceptance
 
 Current safety boundary:
 
@@ -3313,5 +3463,7 @@ Current safety boundary:
     remote verification/publish   YES
     remote restore placement      YES
     durable remote restore source YES
+    remote manifest handshake     YES
+    remote restore acquisition    NO
     remote restore execution      NO
     remote restore acceptance     NO
