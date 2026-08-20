@@ -3111,6 +3111,120 @@ restore acceptance are not completed by A3.2.
 
 ---
 
+## R3.5 / A3.3 durable remote restore source snapshot
+
+Status:
+
+    CLOSED
+
+Closing implementation commit:
+
+    a118ab8 — Freeze remote restore source identity
+    a118ab8526587f5b3f9b22e01e36baf36331f878
+
+A3.3 freezes the logical identity of a remote restore source into the durable
+RestoreOperation before any remote restore execution is attempted.
+
+The restore plan now records:
+
+    source_destination_id
+        controller-side live transport route
+
+    source_bundle_object_id
+        immutable published replica object identity
+
+    source_remote_node_id
+        stable receiver node identity
+
+    source_remote_storage_id
+        stable receiver storage identity
+
+For LOCAL restore sources the remote placement snapshot remains:
+
+    source_remote_node_id = NULL
+    source_remote_storage_id = NULL
+
+For an SSH REPLICA source, restore planning now requires the A3.2 stable
+placement binding and freezes both receiver identities from the selected
+StorageDestination:
+
+    storage_destinations.remote_node_id
+        -> restore_operations.source_remote_node_id
+
+    storage_destinations.remote_storage_id
+        -> restore_operations.source_remote_storage_id
+
+An SSH restore source that has not been bound to a discovered receiver node is
+rejected fail-closed with:
+
+    RESTORE_REMOTE_SOURCE_PLACEMENT_REQUIRED
+
+Schema version advanced:
+
+    v15 -> v16
+
+The v16 restore operation contract adds:
+
+    source_remote_node_id
+        nullable foreign key to nodes(id)
+
+    source_remote_storage_id
+        nullable stable receiver storage ID
+
+Existing v15 restore operations migrate without attempting to infer historical
+remote placement:
+
+    source_remote_node_id = NULL
+    source_remote_storage_id = NULL
+
+This is intentional. Historical receiver identity cannot be reconstructed
+safely from mutable live transport configuration and therefore is not guessed
+during migration.
+
+The durable source identity is additionally protected at the SQLite boundary.
+
+Direct writes cannot create a half-populated or destination-mismatched remote
+source snapshot. Once a RestoreOperation exists, its source identity cannot be
+changed:
+
+    source_destination_id
+    source_role
+    source_bundle_object_id
+    source_remote_node_id
+    source_remote_storage_id
+
+The current live SSH endpoint remains referenced through
+`source_destination_id`. A3.3 therefore separates immutable logical source
+identity from mutable transport routing.
+
+Acceptance passed:
+
+- RED-first restore source snapshot contract regression;
+- LOCAL source NULL/NULL remote snapshot regression;
+- SSH REPLICA stable node/storage snapshot regression;
+- fail-closed unbound receiver placement regression;
+- restore plan snapshot independence from later location/catalog mutation;
+- direct SQLite source-identity contract regression;
+- direct SQLite source-identity immutability regression;
+- v15 -> v16 schema migration regression;
+- foreign-key and integrity validation;
+- historical migration fixture regressions;
+- Phase 3E.5 historical schema fixture regression;
+- focused A3.3 regression;
+- full project pytest regression;
+- Python compileall;
+- `git diff --check`.
+
+A3.3 does not execute remote restore data acquisition.
+
+The existing receiver `fetch_manifest` read boundary is not yet wired into the
+restore state machine, remote qcow2 data is not yet acquired, and
+RestoreOperation does not yet advance through ACQUIRING for remote execution.
+
+R3.5 therefore remains in progress.
+
+---
+
 # Current position
 
 Current implementation milestone:
@@ -3118,6 +3232,14 @@ Current implementation milestone:
     R3.5 remote replica restore acceptance — IN PROGRESS
 
 Completed R3.5 sub-milestone:
+
+    A3.3 durable remote restore source snapshot — CLOSED
+
+A3.3 closing implementation commit:
+
+    a118ab8 — Freeze remote restore source identity
+
+Previous completed R3.5 sub-milestone:
 
     A3.2 remote restore placement binding — CLOSED
 
@@ -3139,7 +3261,7 @@ Supporting receiver publication commit:
 
 Next R3.5 work:
 
-    remote replica restore execution and end-to-end restore acceptance
+    remote replica acquisition/execution and end-to-end restore acceptance
 
 Current safety boundary:
 
@@ -3190,5 +3312,6 @@ Current safety boundary:
     replica transfer execution    YES
     remote verification/publish   YES
     remote restore placement      YES
+    durable remote restore source YES
     remote restore execution      NO
     remote restore acceptance     NO
