@@ -3602,18 +3602,100 @@ and disconnected restore.
 
 ### A3.5.3 libvirt definition and disconnected restore
 
-After materialization:
+**Status: CLOSED**
 
-- generate/prepare the restored domain definition;
-- bind the frozen target_domain_uuid;
-- preserve the target VM name;
-- keep the initial restore network mode DISCONNECTED;
-- refuse collisions with existing domains/VM catalog objects;
-- define only the materialized target disks;
-- reach READY before any optional VM start.
+Implementation commit:
 
-No source backup disk may be attached directly as the restored VM's writable
-disk.
+    3488256da7a288ff1fbcc6e07b2401d77a868a09
+    3488256 feat: add disconnected local restore definition
+
+Delivered definition boundary:
+
+    DEFINING
+        -> validate materialized restore evidence
+        -> recheck VM catalog collisions
+        -> recheck live libvirt collisions
+        -> generate restored-domain.xml
+        -> virsh define --validate
+        -> read back persistent libvirt definition
+        -> READY
+
+Failure boundary:
+
+    DEFINING
+        -> RECOVERY_REQUIRED
+
+with durable:
+
+    recovery_from_state = DEFINING
+
+Domain-definition guarantees:
+
+- definition executes only from `DEFINING`;
+- `.vmbackupd-restore.json` must match the frozen RestoreOperation;
+- the original materialized `metadata/domain.xml` remains unchanged;
+- a separate `metadata/restored-domain.xml` is generated;
+- restored domain name is replaced with the frozen
+  `target_vm_name`;
+- restored domain UUID is replaced with the frozen
+  `target_domain_uuid`;
+- restored writable VM disks are bound only to independent files
+  under `target_root/disks`;
+- original backup/source disk paths cannot survive into the
+  restored writable domain definition;
+- only supported file-backed qcow2 VM disks are accepted;
+- the materialized disk set must exactly match the VM disk set;
+- removable media sources are not reproduced automatically;
+- host passthrough devices are rejected fail-closed;
+- DISCONNECTED is the only supported restore network policy;
+- restored interfaces are explicitly defined with link state down;
+- existing libvirt domain name collisions are rejected;
+- existing libvirt UUID collisions are rejected;
+- VM catalog name collisions are rechecked immediately before
+  mutation;
+- VM catalog external_id collisions are rechecked immediately
+  before mutation;
+- VM catalog libvirt UUID collisions are rechecked immediately
+  before mutation;
+- the mutating libvirt surface is limited to persistent
+  `virsh define --validate`;
+- successful `virsh define` alone is insufficient for READY;
+- the persistent libvirt definition is read back after define;
+- read-back name, UUID, disk mapping, and disconnected interfaces
+  must match the restore plan;
+- ambiguous or incorrect read-back results require recovery;
+- no VM start, createXML, destroy, or undefine operation is part of
+  A3.5.3.
+
+State guarantees:
+
+- no external libvirt mutation occurs before catalog and live
+  libvirt collision preflight;
+- any failure while the operation is in `DEFINING` becomes
+  `RECOVERY_REQUIRED`;
+- READY is reached only after successful define and verified
+  persistent read-back;
+- an unsafe definition state is never converted directly to
+  FAILED.
+
+Acceptance evidence:
+
+- dedicated A3.5.3 suite: 15 tests passed;
+- catalog collision RED tests initially failed before the
+  implementation hardening and passed after it;
+- existing LOCAL restore regression passed;
+- combined restore/bundle/receiver regression passed;
+- full project pytest regression: 100% passed;
+- Python compileall: rc=0;
+- `git diff --check`: clean;
+- no VM start operation introduced;
+- no undefine or destroy operation introduced;
+- no SSH restore acquisition introduced.
+
+A3.5.3 deliberately stops at `READY`.
+
+Optional VM start and complete LOCAL end-to-end restore acceptance
+belong to A3.5.4.
 
 ### A3.5.4 local end-to-end restore acceptance
 
