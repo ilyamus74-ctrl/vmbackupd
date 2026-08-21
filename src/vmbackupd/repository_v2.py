@@ -89,6 +89,191 @@ class RepositoryV2:
             name=name,
         )
 
+    def bootstrap_storage_destinations(
+        self,
+        node_id,
+        destinations,
+        default_destination=None,
+    ):
+
+        for item in destinations:
+
+            existing = self.get_storage_destination_by_name(
+                node_id,
+                item.name,
+            )
+
+            if existing is None:
+                self.create_storage_destination(
+                    item
+                )
+
+        self.connection.commit()
+
+
+
+    def get_storage_destination_by_name(
+        self,
+        node_id,
+        name,
+    ):
+
+        row = self.connection.execute(
+            """
+            SELECT
+                id,
+                node_id,
+                name,
+                storage_type,
+                config_json
+            FROM storage_destinations
+            WHERE node_id=? AND name=?
+            """,
+            (
+                node_id,
+                name,
+            ),
+        ).fetchone()
+
+
+        if row is None:
+            return None
+
+
+        config = json.loads(
+            row[4] or "{}"
+        )
+
+
+        return type(
+            "StorageDestinationRecord",
+            (),
+            {
+                "id": row[0],
+                "node_id": row[1],
+                "name": row[2],
+                "storage_type": row[3],
+                "backup_data_root":
+                    config.get(
+                        "backup_data_root",
+                        "",
+                    ),
+                "backup_data_mode":
+                    config.get(
+                        "backup_data_mode",
+                        0o750,
+                    ),
+                "backup_data_uid":
+                    config.get(
+                        "backup_data_uid",
+                        None,
+                    ),
+                "backup_data_gid":
+                    config.get(
+                        "backup_data_gid",
+                        None,
+                    ),
+            },
+        )()
+
+
+
+    def get_default_storage_destination(
+        self,
+        node_id,
+    ):
+
+        row = self.connection.execute(
+            """
+            SELECT
+                id,
+                node_id,
+                name,
+                storage_type,
+                config_json
+            FROM storage_destinations
+            WHERE node_id=?
+            ORDER BY created_at
+            LIMIT 1
+            """,
+            (
+                node_id,
+            ),
+        ).fetchone()
+
+
+        if row is None:
+            return None
+
+
+        return self.get_storage_destination_by_name(
+            node_id,
+            row[2],
+        )
+
+
+
+    def create_storage_destination(
+        self,
+        destination,
+    ):
+
+        ident = (
+            destination.id
+            if getattr(destination, "id", None)
+            else str(uuid.uuid4())
+        )
+
+
+        config = {
+            "backup_data_root":
+                str(destination.backup_data_root),
+            "backup_data_mode":
+                destination.backup_data_mode,
+            "backup_data_uid":
+                destination.backup_data_uid,
+            "backup_data_gid":
+                destination.backup_data_gid,
+            "minimum_free_bytes":
+                destination.minimum_free_bytes,
+            "minimum_free_percent":
+                destination.minimum_free_percent,
+        }
+
+
+        self.connection.execute(
+            """
+            INSERT INTO storage_destinations(
+                id,
+                node_id,
+                name,
+                storage_type,
+                config_json,
+                created_at
+            )
+            VALUES(?,?,?,?,?,?)
+            """,
+            (
+                ident,
+                destination.node_id,
+                destination.name,
+                str(destination.storage_type),
+                json.dumps(config),
+                now(),
+            ),
+        )
+
+
+        self.connection.commit()
+
+
+        return self.get_storage_destination_by_name(
+            destination.node_id,
+            destination.name,
+        )
+
+
+
     def add_vm(self, node_id, name):
         ident = str(uuid.uuid4())
         self.connection.execute(
