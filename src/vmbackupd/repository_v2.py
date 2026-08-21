@@ -31,6 +31,28 @@ class RepositoryV2:
             (ident, name, now()),
         )
         return ident
+    def get_or_create_node(
+        self,
+        name,
+        ):
+        row = self.connection.execute(
+            """
+            SELECT
+                id
+            FROM nodes
+            WHERE name=?
+            """,
+            (
+                name,
+            ),
+        ).fetchone()
+
+        if row is not None:
+            return row[0]
+
+        return self.add_node(
+            name
+        )
 
     def add_vm(self, node_id, name):
         ident = str(uuid.uuid4())
