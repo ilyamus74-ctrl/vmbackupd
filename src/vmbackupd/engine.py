@@ -73,8 +73,16 @@ class MockBackupEngine:
 
     def advance_run(self, run_id: str) -> JobRun:
         run = self.repository.get_run(run_id)
+
+        if run.state is RunState.RECOVERING:
+            raise DomainInvariantError(
+                "transaction-recovering run cannot be executed"
+            )
+
         if run.recovery_required:
-            raise DomainInvariantError("recovery-required run cannot be executed")
+            raise DomainInvariantError(
+                "recovery-required run cannot be executed"
+            )
         if run.state in (RunState.SUCCESS, RunState.FAILED, RunState.CLEANUP):
             return run
         if self._fail_at.get(run_id) is run.state:

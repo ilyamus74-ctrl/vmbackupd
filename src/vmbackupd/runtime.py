@@ -116,11 +116,8 @@ class DaemonRuntime:
                 if recovered is not None:
                     progressed.append(recovered)
 
-                continue
-
                 # Recovery consumes the current daemon tick.
                 # Do not continue into normal backup execution in the same tick.
-                progressed.append(run)
                 continue
             if run.state is RunState.CLEANUP:
                 progressed.append(self._advance_cleanup(run))

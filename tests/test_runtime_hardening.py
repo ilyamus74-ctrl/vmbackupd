@@ -314,3 +314,54 @@ def test_transaction_recovery_uses_recovering_state():
 
     assert result.state is RunState.RECOVERING
     assert result.recovery_required is True
+
+
+
+def test_mark_recovery_required_keeps_existing_state():
+    repository, node, _, first, _, clock = setup_repository()
+
+    run = add_run(repository, first, RunState.BACKING_UP)
+
+    result = repository.mark_recovery_required(
+        run.id,
+        "legacy safety recovery",
+        clock.now(),
+    )
+
+    assert result.state is RunState.BACKING_UP
+    assert result.recovery_required is True
+    assert result.recovery_reason == "legacy safety recovery"
+
+
+
+def test_enter_transaction_recovery_changes_state():
+    repository, node, _, first, _, clock = setup_repository()
+
+    run = add_run(repository, first, RunState.BACKING_UP)
+
+    result = repository.enter_transaction_recovery(
+        run.id,
+        "transaction interrupted",
+        clock.now(),
+    )
+
+    assert result.state is RunState.RECOVERING
+    assert result.recovery_required is True
+    assert result.recovery_reason == "transaction interrupted"
+
+
+def test_engine_rejects_transaction_recovering_run():
+    repository, node, _, first, _, clock = setup_repository()
+
+    run = add_run(repository, first, RunState.BACKING_UP)
+
+    repository.enter_transaction_recovery(
+        run.id,
+        "transaction interrupted",
+        clock.now(),
+    )
+
+    engine = MockBackupEngine(repository)
+
+    with pytest.raises(DomainInvariantError, match="transaction-recovering"):
+        engine.advance_run(run.id)
