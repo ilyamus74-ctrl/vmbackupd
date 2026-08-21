@@ -255,3 +255,47 @@ def test_node_ownership_scopes_scheduling_execution_and_leases():
     run_until_terminal(ua_runtime, repository, ua_runs[0].id)
     assert repository.get_run(ua_runs[0].id).state is RunState.SUCCESS
     assert len(repository.list_restore_points(ua_vm.id)) == 1
+
+
+def test_capacity_reclaim_recovery_is_resumed_by_daemon_tick():
+    repository, node, _, first, _, clock = setup_repository()
+
+    run = add_run(repository, first, RunState.BACKING_UP)
+
+    repository.connection.execute(
+        """
+        UPDATE job_runs
+        SET recovery_required = 1,
+            recovery_reason = ?
+        WHERE id = ?
+        """,
+        (
+            "capacity reclaim requires recovery",
+            run.id,
+        ),
+    )
+    repository.connection.commit()
+
+    class RecoveryExecutor:
+        def resume_recovery(self, run_id):
+            return repository.clear_recovery_required(
+                run_id,
+                "capacity reclaim recovered automatically",
+                clock.now(),
+            )
+
+    runtime = DaemonRuntime(
+        repository,
+        node.id,
+        clock,
+        RecoveryExecutor(),
+    )
+
+    runtime.start()
+    runtime.tick()
+
+    recovered = repository.get_run(run.id)
+
+    assert recovered.recovery_required is False
+
+    repository.close()

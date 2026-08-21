@@ -97,6 +97,9 @@ class DaemonRuntime:
         for run in self.repository.list_runs_for_node(self.node_id, nonterminal_only=True):
             run = self.repository.get_run(run.id)
             if run.recovery_required:
+                recovered = self._advance_recovery(run)
+                if recovered is not None:
+                    progressed.append(recovered)
                 continue
             if run.state is RunState.CLEANUP:
                 progressed.append(self._advance_cleanup(run))
@@ -121,6 +124,23 @@ class DaemonRuntime:
                 continue
             progressed.append(self._advance_run(run))
         return progressed
+
+    def _advance_recovery(self, run: JobRun) -> JobRun:
+        resume = getattr(self.executor, "resume_recovery", None)
+        if resume is None:
+            return run
+        try:
+            return resume(run.id)
+        except Exception as exc:
+            self.repository.record_event(
+                Event(
+                    job_run_id=run.id,
+                    event_type="RECOVERY_RETRY_FAILED",
+                    message=f"automatic recovery retry failed: {type(exc).__name__}: {exc}",
+                    created_at=self.clock.now(),
+                )
+            )
+            return None
 
     def _catch_up_post_success_retention(
         self,

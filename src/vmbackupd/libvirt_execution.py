@@ -1187,6 +1187,34 @@ class LibvirtBackupExecutor:
             inspection_issue_count=0,
         )
 
+    def resume_recovery(self, run_id: str) -> JobRun:
+        run = self.repository.get_run(run_id)
+        operation = self.repository.get_reclaim_operation_for_run(run_id)
+        if operation is None:
+            return run
+
+        if operation.state is not ReclaimOperationState.RECOVERY_REQUIRED:
+            return run
+
+        operation = self.repository.get_reclaim_operation(operation.id)
+
+        if operation.state is not ReclaimOperationState.RECOVERY_REQUIRED:
+            return run
+
+        executor = self._reclaim_executor(operation.storage_destination_id)
+        executor.recover(operation.id)
+
+        operation = self.repository.get_reclaim_operation(operation.id)
+        if operation.state is not ReclaimOperationState.COMPLETED:
+            return run
+
+        return self.repository.clear_recovery_required(
+            run.id,
+            "capacity reclaim recovered automatically",
+            self.clock.now(),
+        )
+
+
     def _ensure_start_capacity(
         self,
         run: JobRun,
