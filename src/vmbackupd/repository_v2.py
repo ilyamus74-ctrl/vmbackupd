@@ -352,6 +352,32 @@ class RepositoryV2:
 
 
 
+    def update_recovery_details(
+        self,
+        task_id,
+        details,
+    ):
+        import json
+        from datetime import datetime, timezone
+
+        self.connection.execute(
+            """
+            UPDATE recovery_tasks
+            SET details_json=?,
+                updated_at=?
+            WHERE id=?
+            """,
+            (
+                json.dumps(details),
+                datetime.now(timezone.utc).isoformat(),
+                task_id,
+            ),
+        )
+
+        self.connection.commit()
+
+
+
     def update_recovery_task(
         self,
         task_id,

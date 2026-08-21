@@ -1,3 +1,5 @@
+from vmbackupd.reclaim_executor_v2 import ReclaimRecoveryExecutor
+
 
 class RecoveryExecutorRegistry:
 
@@ -23,17 +25,6 @@ class RecoveryExecutorRegistry:
         return executor.execute(task)
 
 
-
-class ReclaimRecoveryExecutor:
-
-
-    def execute(self, task):
-
-        return {
-            "task": task["id"],
-            "type": "RECLAIM",
-            "status": "RESUMED",
-        }
 
 
 
