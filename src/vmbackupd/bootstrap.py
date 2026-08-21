@@ -597,7 +597,7 @@ def compose(
         operation = repository.get_reclaim_operation(operation_id)
         destination = repository.get_storage_destination(
             node.id,
-            operation.destination_id,
+            operation.storage_destination_id,
         )
         executor = ReclaimExecutor(
             repository,
