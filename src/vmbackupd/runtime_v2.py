@@ -17,10 +17,12 @@ class DaemonRuntimeV2:
         repository,
         executor=None,
         capacity_adapter=None,
+        purge_adapter=None,
     ):
         self.repository = repository
         self.executor = executor
         self.capacity_adapter = capacity_adapter
+        self.purge_adapter = purge_adapter
 
         from vmbackupd.recovery_policy_v2 import (
             RecoveryPolicyV2,
@@ -164,6 +166,10 @@ class DaemonRuntimeV2:
 
                 task["capacity_adapter"] = (
                     self.capacity_adapter
+                )
+
+                task["purge_adapter"] = (
+                    self.purge_adapter
                 )
 
 

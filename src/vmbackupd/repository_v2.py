@@ -65,6 +65,34 @@ class RepositoryV2:
         )
         return ident
 
+    def get_storage_config(
+        self,
+        storage_id,
+    ):
+
+        row = self.connection.execute(
+            """
+            SELECT
+                config_json
+            FROM storage_destinations
+            WHERE id=?
+            """,
+            (
+                storage_id,
+            ),
+        ).fetchone()
+
+
+        if row is None:
+            return {}
+
+
+        return json.loads(
+            row[0]
+        ) if row[0] else {}
+
+
+
     def add_job(self, vm_id, storage_id, name):
         ident = str(uuid.uuid4())
         self.connection.execute(
@@ -109,6 +137,176 @@ class RepositoryV2:
             ),
         )
         return ident
+
+    def get_restore_point(
+        self,
+        restore_point_id,
+    ):
+
+        row = self.connection.execute(
+            """
+            SELECT
+                restore_points.id,
+                restore_points.job_run_id,
+                restore_points.status,
+                job_runs.storage_destination_id
+            FROM restore_points
+            JOIN job_runs
+                ON job_runs.id = restore_points.job_run_id
+            WHERE restore_points.id=?
+            """,
+            (
+                restore_point_id,
+            ),
+        ).fetchone()
+
+
+        if row is None:
+            return None
+
+
+        return {
+            "id": row[0],
+            "job_run_id": row[1],
+            "status": row[2],
+            "storage_destination_id": row[3],
+        }
+
+
+    def list_successful_restore_points(
+        self,
+        storage_id=None,
+    ):
+
+        if storage_id is None:
+
+            rows = self.connection.execute(
+                """
+                SELECT
+                    id
+                FROM restore_points
+                WHERE status='SUCCESS'
+                """
+            ).fetchall()
+
+        else:
+
+            rows = self.connection.execute(
+                """
+                SELECT
+                    id
+                FROM restore_points
+                WHERE
+                    storage_destination_id=?
+                    AND state='SUCCESS'
+                """,
+                (
+                    storage_id,
+                ),
+            ).fetchall()
+
+
+        return [
+            row[0]
+            for row in rows
+        ]
+
+
+
+
+
+
+    def get_storage_root(
+        self,
+        storage_id,
+    ):
+
+        config = (
+            self.get_storage_config(
+                storage_id
+            )
+        )
+
+
+        return config.get(
+            "backup_data_root"
+        )
+
+
+
+    def delete_backup_artifact(
+        self,
+        artifact_id,
+    ):
+
+        self.connection.execute(
+            """
+            DELETE FROM backup_artifacts
+            WHERE id=?
+            """,
+            (
+                artifact_id,
+            ),
+        )
+
+        self.connection.commit()
+
+
+
+    def mark_restore_point_deleted(
+        self,
+        restore_point_id,
+    ):
+
+        self.connection.execute(
+            """
+            UPDATE restore_points
+            SET status=?
+            WHERE id=?
+            """,
+            (
+                "DELETED",
+                restore_point_id,
+            ),
+        )
+
+        self.connection.commit()
+
+
+
+    def list_backup_artifacts(
+        self,
+        job_run_id,
+    ):
+
+        rows = self.connection.execute(
+            """
+            SELECT
+                id,
+                kind,
+                metadata_json
+            FROM backup_artifacts
+            WHERE job_run_id=?
+            """,
+            (
+                job_run_id,
+            ),
+        ).fetchall()
+
+
+        return [
+            {
+                "id": row[0],
+                "kind": row[1],
+                "metadata": (
+                    json.loads(row[2])
+                    if row[2]
+                    else {}
+                ),
+            }
+            for row in rows
+        ]
+
 
     def resume_run_after_recovery(
         self,

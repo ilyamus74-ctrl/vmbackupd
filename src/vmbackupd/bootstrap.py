@@ -38,6 +38,8 @@ from .restore_runtime import (
     RestoreRuntimeController,
 )
 from .runtime import DaemonRuntime
+from .capacity_adapter_v2 import CapacityAdapter
+from .purge_adapter_v2 import PurgeAdapter
 from .ssh_identity import SSHIdentityManager
 from .ssh_known_hosts import SSHKnownHostsManager
 from .ssh_receiver import SSHReceiverRegistry
@@ -272,11 +274,20 @@ class RuntimeWorker:
                     ),
                 )
 
+            capacity_adapter = CapacityAdapter(
+                repository
+            )
+            purge_adapter = PurgeAdapter(
+                repository
+            )
+
             runtime = DaemonRuntime(
                 repository, self.node_id, clock,
                 StorageRoutingExecutor(repository, executor_for),
                 lease_seconds=self.config.daemon.execution_lease_seconds,
                 controller_lease_seconds=self.config.daemon.controller_lease_seconds,
+                capacity_adapter=capacity_adapter,
+                purge_adapter=purge_adapter,
             )
             self._instance_id = runtime.start()
 

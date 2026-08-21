@@ -21,12 +21,16 @@ class DaemonRuntime(DaemonRuntimeV2):
         executor=None,
         lease_seconds=None,
         controller_lease_seconds=None,
+        capacity_adapter=None,
+        purge_adapter=None,
         **kwargs,
     ):
 
         super().__init__(
             repository,
             executor=executor,
+            capacity_adapter=capacity_adapter,
+            purge_adapter=purge_adapter,
         )
 
         self.node_id = node_id
