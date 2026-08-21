@@ -87,6 +87,35 @@ class DaemonRuntimeV2:
         return progressed
 
 
+    def request_reclaim_for_run(
+        self,
+        run_id,
+        storage_id,
+        required_bytes,
+    ):
+
+        from vmbackupd.recovery_queue_v2 import (
+            RecoveryQueueV2,
+        )
+
+
+        queue = RecoveryQueueV2(
+            self.repository
+        )
+
+
+        return queue.enqueue(
+            run_id,
+            "RECLAIM",
+            {
+                "phase": "START",
+                "storage_id": storage_id,
+                "required_bytes": required_bytes,
+            },
+        )
+
+
+
     def process_recovery_tasks(self):
 
         tasks = self.repository.list_recovery_tasks(
