@@ -9,12 +9,17 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 
 def now():
     return datetime.now(timezone.utc).isoformat()
 
+@dataclass
+class RepositoryNode:
+    id: str
+    name: str
 
 class RepositoryV2:
 
@@ -31,14 +36,17 @@ class RepositoryV2:
             (ident, name, now()),
         )
         return ident
+
     def get_or_create_node(
         self,
         name,
-        ):
+    ):
+
         row = self.connection.execute(
             """
             SELECT
-                id
+                id,
+                name
             FROM nodes
             WHERE name=?
             """,
@@ -47,11 +55,38 @@ class RepositoryV2:
             ),
         ).fetchone()
 
-        if row is not None:
-            return row[0]
 
-        return self.add_node(
-            name
+        if row is not None:
+            return RepositoryNode(
+                id=row[0],
+                name=row[1],
+            )
+
+
+        ident = str(uuid.uuid4())
+
+        self.connection.execute(
+            """
+            INSERT INTO nodes(
+                id,
+                name,
+                created_at
+            )
+            VALUES(?,?,?)
+            """,
+            (
+                ident,
+                name,
+                now(),
+            ),
+        )
+
+        self.connection.commit()
+
+
+        return RepositoryNode(
+            id=ident,
+            name=name,
         )
 
     def add_vm(self, node_id, name):
