@@ -150,34 +150,15 @@ class DaemonRuntime:
     def _advance_recovery(self, run: JobRun) -> JobRun:
         resume = getattr(self.executor, "resume_recovery", None)
 
-        print(
-            "DEBUG recovery",
-            run.id,
-            run.state,
-            run.recovery_required,
-            resume,
-        )
-
         if resume is None:
             return run
 
         try:
             result = resume(run.id)
 
-            print(
-                "DEBUG recovery result",
-                result.state,
-                result.recovery_required,
-            )
-
             return result
 
         except Exception as exc:
-            print(
-                "DEBUG recovery exception",
-                type(exc).__name__,
-                str(exc),
-            )
 
             self.repository.record_event(
                 Event(
