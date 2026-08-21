@@ -7,3 +7,8 @@
 
 .aider*
 dist/
+patch*.py
+pytest_full.log
+vmbackupd_debug.tar.gz
+dump_v1_schema.py
+SPACE_AVAILABLE
