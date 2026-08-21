@@ -383,6 +383,70 @@ class RepositoryV2:
 
 
 
+
+    def list_reclaim_candidates(
+        self,
+        storage_id,
+    ):
+
+        rows = self.connection.execute(
+            """
+            SELECT
+                id,
+                metadata_json,
+                created_at
+            FROM restore_points
+            WHERE status='COMPLETED'
+              AND job_run_id IN (
+                  SELECT id
+                  FROM job_runs
+                  WHERE storage_destination_id=?
+              )
+            ORDER BY created_at ASC
+            """,
+            (
+                storage_id,
+            ),
+        ).fetchall()
+
+
+        if len(rows) <= 1:
+            return []
+
+
+        return [
+            {
+                "restore_point_id": row[0],
+                "metadata_json": row[1],
+                "created_at": row[2],
+            }
+            for row in rows[:-1]
+        ]
+
+
+    def get_recovery_details(
+        self,
+        task_id,
+    ):
+
+        row = self.connection.execute(
+            """
+            SELECT details_json
+            FROM recovery_tasks
+            WHERE id=?
+            """,
+            (task_id,),
+        ).fetchone()
+
+        if row is None:
+            return {}
+
+        import json
+
+        return json.loads(row[0])
+
+
+
     def update_recovery_details(
         self,
         task_id,

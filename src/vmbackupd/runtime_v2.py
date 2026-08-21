@@ -115,6 +115,9 @@ class DaemonRuntimeV2:
 
             try:
 
+                task["repository"] = self.repository
+
+
                 result = self.resume_recovery_task(
                     task
                 )
