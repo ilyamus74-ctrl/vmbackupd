@@ -1490,6 +1490,61 @@ class RepositoryV2:
         return None
 
 
+
+    def register_discovered_node(
+        self,
+        name,
+        **kwargs,
+    ):
+        return self.get_or_create_node(
+            name
+        )
+
+
+    def list_job_replicas(
+        self,
+        job_id=None,
+        **kwargs,
+    ):
+        if job_id is None:
+            return self.connection.execute(
+                """
+                SELECT *
+                FROM replica_tasks
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+
+        return self.connection.execute(
+            """
+            SELECT *
+            FROM replica_tasks
+            WHERE job_id=?
+            ORDER BY created_at DESC
+            """,
+            (
+                job_id,
+            ),
+        ).fetchall()
+
+
+    def get_replica_task(
+        self,
+        task_id,
+        **kwargs,
+    ):
+        return self.connection.execute(
+            """
+            SELECT *
+            FROM replica_tasks
+            WHERE id=?
+            """,
+            (
+                task_id,
+            ),
+        ).fetchone()
+
+
     def add_vm(self, node_id, name):
         ident = str(uuid.uuid4())
         self.connection.execute(
