@@ -483,6 +483,250 @@ class RepositoryV2:
 
 
 
+
+    def add_run(
+        self,
+        job_id,
+        storage_id,
+        **kwargs,
+    ):
+        return self.create_run(
+            job_id,
+            storage_id,
+        )
+
+
+    def create_manual_run(
+        self,
+        job_id,
+        storage_id,
+        **kwargs,
+    ):
+        return self.create_run(
+            job_id,
+            storage_id,
+        )
+
+
+    def get_run(self, run_id):
+        row = self.connection.execute(
+            """
+            SELECT *
+            FROM job_runs
+            WHERE id=?
+            """,
+            (
+                run_id,
+            ),
+        ).fetchone()
+
+        return row
+
+
+    def list_runs_for_node(
+        self,
+        node_id,
+    ):
+        return self.connection.execute(
+            """
+            SELECT
+                r.*
+            FROM job_runs r
+            JOIN backup_jobs j
+              ON j.id=r.job_id
+            JOIN vms v
+              ON v.id=j.vm_id
+            WHERE v.node_id=?
+            ORDER BY r.created_at DESC
+            """,
+            (
+                node_id,
+            ),
+        ).fetchall()
+
+
+    def list_runs_page_for_node(
+        self,
+        node_id,
+        limit=50,
+        offset=0,
+        **kwargs,
+    ):
+        return self.connection.execute(
+            """
+            SELECT
+                r.*
+            FROM job_runs r
+            JOIN backup_jobs j
+              ON j.id=r.job_id
+            JOIN vms v
+              ON v.id=j.vm_id
+            WHERE v.node_id=?
+            ORDER BY r.created_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (
+                node_id,
+                limit,
+                offset,
+            ),
+        ).fetchall()
+
+
+    def plan_run(
+        self,
+        run_id,
+        **kwargs,
+    ):
+        self.connection.execute(
+            """
+            UPDATE job_runs
+            SET state=?
+            WHERE id=?
+            """,
+            (
+                "PLANNED",
+                run_id,
+            ),
+        )
+        self.connection.commit()
+
+
+    def transition_run(
+        self,
+        run_id,
+        state,
+        **kwargs,
+    ):
+        self.connection.execute(
+            """
+            UPDATE job_runs
+            SET state=?
+            WHERE id=?
+            """,
+            (
+                state,
+                run_id,
+            ),
+        )
+        self.connection.commit()
+
+
+    def finalize_success(
+        self,
+        run_id,
+        **kwargs,
+    ):
+        return self.transition_run(
+            run_id,
+            "SUCCESS",
+        )
+
+
+    def finish_cleanup(
+        self,
+        run_id,
+        **kwargs,
+    ):
+        return self.transition_run(
+            run_id,
+            "CLEANUP",
+        )
+
+
+    def record_event(
+        self,
+        run_id,
+        event_type,
+        data=None,
+        **kwargs,
+    ):
+        return self.append_event(
+            run_id,
+            event_type,
+            data,
+        )
+
+
+    def list_events_for_node(
+        self,
+        node_id,
+    ):
+        return self.connection.execute(
+            """
+            SELECT e.*
+            FROM events e
+            JOIN job_runs r
+              ON r.id=e.run_id
+            JOIN backup_jobs j
+              ON j.id=r.job_id
+            JOIN vms v
+              ON v.id=j.vm_id
+            WHERE v.node_id=?
+            ORDER BY e.created_at DESC
+            """,
+            (
+                node_id,
+            ),
+        ).fetchall()
+
+
+    def mark_recovery_required(
+        self,
+        run_id,
+        details=None,
+        **kwargs,
+    ):
+        self.connection.execute(
+            """
+            UPDATE job_runs
+            SET recovery_required=1
+            WHERE id=?
+            """,
+            (
+                run_id,
+            ),
+        )
+        self.connection.commit()
+
+
+    def enter_transaction_recovery(
+        self,
+        run_id,
+        **kwargs,
+    ):
+        return self.mark_recovery_required(
+            run_id,
+        )
+
+
+    def adopt_recovery_run(
+        self,
+        run_id,
+        **kwargs,
+    ):
+        return True
+
+
+    def resume_reclaim_recovery(
+        self,
+        run_id,
+        **kwargs,
+    ):
+        return True
+
+
+    def require_reclaim_recovery(
+        self,
+        run_id,
+        **kwargs,
+    ):
+        return self.mark_recovery_required(
+            run_id,
+        )
+
+
+
     def add_vm(self, node_id, name):
         ident = str(uuid.uuid4())
         self.connection.execute(
