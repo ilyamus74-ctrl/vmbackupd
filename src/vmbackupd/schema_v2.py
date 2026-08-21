@@ -237,4 +237,8 @@ def ensure_schema(connection: sqlite3.Connection) -> int:
                 f"unsupported schema version {row[0]}"
             )
 
+        else:
+            for statement in TABLES:
+                connection.execute(statement)
+
     return SCHEMA_VERSION
