@@ -5183,32 +5183,39 @@ class SQLiteRepository:
                 )
 
                 for point in valid_full_chain_members[chain_id]:
-                    self.connection.execute(
-                        """INSERT INTO reclaim_bundles (
-                               operation_id,
-                               chain_id,
-                               restore_point_id,
-                               destination_id,
-                               source_bundle_object_id,
-                               quarantine_object_id,
-                               expected_physical_bytes,
-                               source_device,
-                               source_inode,
-                               state
-                           ) VALUES (
-                               ?, ?, ?, ?, ?,
-                               NULL, NULL,
-                               NULL, NULL, ?
-                           )""",
-                        (
-                            operation.id,
-                            chain_id,
-                            point["id"],
-                            operation.storage_destination_id,
-                            point["bundle_object_id"],
-                            ReclaimBundleState.PLANNED,
-                        ),
+                    locations = self._list_reclaim_locations_for_restore_point(
+                        point["id"],
+                        point["bundle_object_id"],
+                        operation.storage_destination_id,
                     )
+
+                    for destination_id, object_id in locations:
+                        self.connection.execute(
+                            """INSERT INTO reclaim_bundles (
+                                   operation_id,
+                                   chain_id,
+                                   restore_point_id,
+                                   destination_id,
+                                   source_bundle_object_id,
+                                   quarantine_object_id,
+                                   expected_physical_bytes,
+                                   source_device,
+                                   source_inode,
+                                   state
+                               ) VALUES (
+                                   ?, ?, ?, ?, ?,
+                                   NULL, NULL,
+                                   NULL, NULL, ?
+                               )""",
+                            (
+                                operation.id,
+                                chain_id,
+                                point["id"],
+                                destination_id,
+                                object_id,
+                                ReclaimBundleState.PLANNED,
+                            ),
+                        )
 
             self.connection.commit()
         except sqlite3.IntegrityError as exc:
@@ -7319,6 +7326,66 @@ class SQLiteRepository:
             )
 
         return bundles[0]
+
+    def mark_remote_reclaim_bundle_purged(
+        self,
+        operation_id: str,
+        destination_id: str,
+        source_bundle_object_id: str,
+    ) -> ReclaimBundle:
+        """Mark SSH reclaim object removed after remote deletion."""
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._require_reclaim_operation_state(
+                operation_id,
+                ReclaimOperationState.RETIRING,
+            )
+
+            cursor = self.connection.execute(
+                """
+                UPDATE reclaim_bundles
+                   SET state = 'PURGED'
+                 WHERE operation_id = ?
+                   AND destination_id = ?
+                   AND source_bundle_object_id = ?
+                   AND state = 'PLANNED'
+                """,
+                (
+                    operation_id,
+                    destination_id,
+                    source_bundle_object_id,
+                ),
+            )
+
+            if cursor.rowcount != 1:
+                raise DomainInvariantError(
+                    "remote reclaim bundle state transition failed"
+                )
+
+            self.connection.commit()
+
+        except Exception:
+            self.connection.rollback()
+            raise
+
+        row = self.connection.execute(
+            """
+            SELECT *
+            FROM reclaim_bundles
+            WHERE operation_id = ?
+              AND destination_id = ?
+              AND source_bundle_object_id = ?
+            """,
+            (
+                operation_id,
+                destination_id,
+                source_bundle_object_id,
+            ),
+        ).fetchone()
+
+        return self._row_to_reclaim_bundle(row)
+
 
     def mark_reclaim_bundle_purged(
         self,

@@ -2,7 +2,7 @@
 
 Name:           vmbackupd
 Version:        %{upstream_version}
-Release:        7%{?dist}
+Release:        8%{?dist}
 Summary:        Local KVM/libvirt backup management daemon
 License:        LicenseRef-Proprietary
 Source0:        %{name}-%{version}.tar.gz

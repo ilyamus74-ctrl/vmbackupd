@@ -57,6 +57,7 @@ _REQUIRED_METADATA = (
 )
 
 _MAX_RESPONSE_LINE = 64 * 1024
+RECLAIM_DELETE_COMMAND = "vmbackupd-reclaim-delete-v1"
 
 
 class ReplicaSenderError(RuntimeError):
@@ -1192,6 +1193,37 @@ class SSHReplicaTransferClient:
             )
 
         return value
+
+    def delete(
+        self,
+        destination,
+        *,
+        storage_id: str,
+        restore_point_id: str,
+        bundle_object_id: str,
+    ) -> None:
+        argv = self._ssh_argv(
+            destination,
+            RECLAIM_DELETE_COMMAND,
+        )
+        process = self.process_factory(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                **os.environ,
+                "VMBACKUPD_RECLAIM_DELETE": json.dumps({
+                    "storage_id": storage_id,
+                    "restore_point_id": restore_point_id,
+                    "bundle_object_id": bundle_object_id,
+                }),
+            },
+        )
+        _, stderr = process.communicate()
+        if process.returncode != 0:
+            raise ReplicaSenderError(
+                stderr.decode(errors="replace")
+            )
 
     def publish(
         self,

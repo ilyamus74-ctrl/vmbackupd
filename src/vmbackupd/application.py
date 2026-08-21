@@ -94,6 +94,7 @@ class VmbackupApplication:
             "recovery.list": self.recovery_list, "recovery.show": self.recovery_show,
             "recovery.resume": self.recovery_resume,
             "recovery.fail": self.recovery_fail,
+            "reclaim.recover": self.reclaim_recover,
             "event.list": self.event_list,
         }
         handler = handlers.get(method)
@@ -1864,6 +1865,27 @@ class VmbackupApplication:
             self.config.daemon.execution_lease_seconds,
         )
         return serialization.run(value)
+
+
+    def reclaim_recover(self, operation_id):
+        if not hasattr(self, "reclaim_executor"):
+            raise ApplicationError(
+                "RECLAIM_RECOVERY_UNAVAILABLE",
+                "reclaim executor is not available",
+            )
+
+        value = self.reclaim_executor.recover(operation_id)
+
+        return {
+            "id": value.id,
+            "state": value.state.value,
+            "error": value.error,
+            "recovery_from_state": (
+                value.recovery_from_state.value
+                if value.recovery_from_state
+                else None
+            ),
+        }
 
     def recovery_fail(self, run_id):
         value = self.repository.get_run(run_id)

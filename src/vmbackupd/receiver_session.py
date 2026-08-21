@@ -33,6 +33,10 @@ from .receiver_transfer import (
     TRANSFER_COMMAND,
     run_receiver_transfer,
 )
+from .receiver_reclaim_delete import (
+    RECLAIM_DELETE_COMMAND,
+    run_receiver_reclaim_delete,
+)
 
 
 PROTOCOL_VERSION = 1
@@ -189,6 +193,9 @@ def main(
             else publish_runner
         )
         return runner()
+
+    if original == RECLAIM_DELETE_COMMAND:
+        return run_receiver_reclaim_delete()
 
     if original == RESTORE_MANIFEST_COMMAND:
         runner = (
