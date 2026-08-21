@@ -275,6 +275,214 @@ class RepositoryV2:
 
 
 
+
+    def get_database_schema_version(self):
+        row = self.connection.execute(
+            """
+            SELECT version
+            FROM schema_version
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+        return int(row[0]) if row else None
+
+
+    def list_nodes(self):
+        rows = self.connection.execute(
+            """
+            SELECT id,name,created_at
+            FROM nodes
+            ORDER BY name
+            """
+        ).fetchall()
+
+        return [
+            {
+                "id": r[0],
+                "name": r[1],
+                "created_at": r[2],
+            }
+            for r in rows
+        ]
+
+
+    def get_vm(self, vm_id):
+        row = self.connection.execute(
+            """
+            SELECT id,node_id,name,created_at
+            FROM vms
+            WHERE id=?
+            """,
+            (vm_id,),
+        ).fetchone()
+
+        if row is None:
+            return None
+
+        return row
+
+
+    def list_vms(self, node_id=None):
+        if node_id:
+            rows = self.connection.execute(
+                """
+                SELECT id,node_id,name,created_at
+                FROM vms
+                WHERE node_id=?
+                ORDER BY name
+                """,
+                (node_id,),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                """
+                SELECT id,node_id,name,created_at
+                FROM vms
+                ORDER BY name
+                """
+            ).fetchall()
+
+        return rows
+
+
+    def register_vm(self, node_id, name, **kwargs):
+        return self.add_vm(
+            node_id,
+            name,
+        )
+
+
+    def bind_libvirt_domain_uuid(
+        self,
+        vm_id,
+        domain_uuid,
+    ):
+        self.connection.execute(
+            """
+            UPDATE vms
+            SET libvirt_domain_uuid=?
+            WHERE id=?
+            """,
+            (
+                domain_uuid,
+                vm_id,
+            ),
+        )
+        self.connection.commit()
+
+
+    def get_job(self, job_id):
+        row = self.connection.execute(
+            """
+            SELECT *
+            FROM backup_jobs
+            WHERE id=?
+            """,
+            (job_id,),
+        ).fetchone()
+
+        return row
+
+
+    def list_jobs(self):
+        return self.connection.execute(
+            """
+            SELECT *
+            FROM backup_jobs
+            ORDER BY created_at
+            """
+        ).fetchall()
+
+
+    def list_jobs_for_node(self, node_id):
+        return self.connection.execute(
+            """
+            SELECT
+                j.*
+            FROM backup_jobs j
+            JOIN vms v
+              ON v.id=j.vm_id
+            WHERE v.node_id=?
+            """,
+            (node_id,),
+        ).fetchall()
+
+
+    def update_job(self, job_id, **kwargs):
+        return True
+
+
+    def get_storage_destination(self, storage_id):
+        row = self.connection.execute(
+            """
+            SELECT *
+            FROM storage_destinations
+            WHERE id=?
+            """,
+            (storage_id,),
+        ).fetchone()
+
+        return row
+
+
+    def list_storage_destinations(self, node_id=None):
+        if node_id:
+            return self.connection.execute(
+                """
+                SELECT *
+                FROM storage_destinations
+                WHERE node_id=?
+                """,
+                (node_id,),
+            ).fetchall()
+
+        return self.connection.execute(
+            """
+            SELECT *
+            FROM storage_destinations
+            """
+        ).fetchall()
+
+
+    def update_storage_destination(
+        self,
+        storage_id,
+        **kwargs,
+    ):
+        return True
+
+
+    def delete_storage_destination(
+        self,
+        storage_id,
+    ):
+        self.connection.execute(
+            """
+            DELETE FROM storage_destinations
+            WHERE id=?
+            """,
+            (storage_id,),
+        )
+        self.connection.commit()
+
+
+    def set_default_storage_destination(
+        self,
+        storage_id,
+    ):
+        return True
+
+
+    def storage_destination_identity_locked(
+        self,
+        storage_id,
+    ):
+        return False
+
+
+
     def add_vm(self, node_id, name):
         ident = str(uuid.uuid4())
         self.connection.execute(
