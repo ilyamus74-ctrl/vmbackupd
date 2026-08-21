@@ -30,6 +30,7 @@ class RunState(StrEnum):
     TRANSFERRING = "TRANSFERRING"
     VERIFYING = "VERIFYING"
     FINALIZING = "FINALIZING"
+    RECOVERING = "RECOVERING"
     SUCCESS = "SUCCESS"
     CLEANUP = "CLEANUP"
     FAILED = "FAILED"
@@ -541,6 +542,14 @@ class StorageDestination:
     remote_node_id: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class RecoveryContext:
+    type: str
+    operation_id: str | None = None
+    reason: str | None = None
+    created_at: datetime = field(default_factory=utcnow)
+
+
 @dataclass(slots=True)
 class JobRun:
     job_id: str
@@ -559,6 +568,7 @@ class JobRun:
     missed_schedule_slots: int = 0
     recovery_required: bool = False
     recovery_reason: str | None = None
+    recovery_context: RecoveryContext | None = None
     cleanup_authorized: bool = False
     created_at: datetime = field(default_factory=utcnow)
     updated_at: datetime = field(default_factory=utcnow)

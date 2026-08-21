@@ -4202,6 +4202,56 @@ class SQLiteRepository:
             "recovery_required": int(row["recovery_required"]),
         }
 
+
+    def enter_transaction_recovery(
+        self,
+        run_id: str,
+        reason: str,
+        now: datetime,
+        context=None,
+    ) -> JobRun:
+        from .models import RunState
+
+        run = self.get_run(run_id)
+
+        if run.state in (
+            RunState.SUCCESS,
+            RunState.FAILED,
+        ):
+            raise DomainInvariantError(
+                "terminal run cannot enter recovery"
+            )
+
+        with self.connection:
+            self.connection.execute(
+                """
+                UPDATE job_runs
+                SET state = ?,
+                    recovery_required = 1,
+                    recovery_reason = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    RunState.RECOVERING.value,
+                    reason,
+                    now.isoformat(),
+                    run_id,
+                ),
+            )
+
+            self._insert_event(
+                Event(
+                    job_run_id=run_id,
+                    event_type="RUN_ENTER_RECOVERY",
+                    message=reason,
+                    created_at=now,
+                )
+            )
+
+        return self.get_run(run_id)
+
+
     def mark_recovery_required(self, run_id: str, reason: str, now: datetime) -> JobRun:
         run = self.get_run(run_id)
         if run.state in (RunState.SUCCESS, RunState.FAILED):
@@ -4222,8 +4272,18 @@ class SQLiteRepository:
             return run
         with self.connection:
             self.connection.execute(
-                """UPDATE job_runs SET recovery_required = 0, recovery_reason = NULL,
-                   updated_at = ? WHERE id = ?""", (now.isoformat(), run_id),
+                """
+                UPDATE job_runs
+                SET recovery_required = 0,
+                    recovery_reason = NULL,
+                    state = CASE
+                        WHEN state = 'RECOVERING' THEN 'BACKING_UP'
+                        ELSE state
+                    END,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now.isoformat(), run_id),
             )
             self._insert_event(Event(job_run_id=run_id, event_type="RUN_RECOVERY_RESOLVED",
                                      message=reason, created_at=now))
@@ -8184,6 +8244,7 @@ class SQLiteRepository:
         row = self.connection.execute("SELECT * FROM job_runs WHERE id = ?", (run_id,)).fetchone()
         if row is None:
             raise KeyError(run_id)
+
         return JobRun(
             id=row["id"], job_id=row["job_id"],
             storage_destination_id=row["storage_destination_id"], state=RunState(row["state"]),

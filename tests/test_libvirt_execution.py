@@ -682,7 +682,8 @@ def test_reclaim_recovery_blocks_libvirt_start_and_marks_run_recovery(
 
     result = value.advance_run(run.id)
 
-    assert result.state is RunState.BACKING_UP
+    assert result.state is RunState.RECOVERING
+    assert result.recovery_required is True
     assert result.recovery_required is True
     assert "capacity reclaim requires recovery" in (
         result.recovery_reason or ""

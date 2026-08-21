@@ -96,10 +96,31 @@ class DaemonRuntime:
         progressed: list[JobRun] = []
         for run in self.repository.list_runs_for_node(self.node_id, nonterminal_only=True):
             run = self.repository.get_run(run.id)
-            if run.recovery_required:
+            if run.state is RunState.RECOVERING:
                 recovered = self._advance_recovery(run)
+
                 if recovered is not None:
                     progressed.append(recovered)
+
+                run = self.repository.get_run(run.id)
+
+                if run.state is RunState.RECOVERING:
+                    continue
+
+            elif run.recovery_required:
+                # Legacy recovery flag:
+                # keep original unsafe state.
+                # Only transactional recovery uses RECOVERING.
+                recovered = self._advance_recovery(run)
+
+                if recovered is not None:
+                    progressed.append(recovered)
+
+                continue
+
+                # Recovery consumes the current daemon tick.
+                # Do not continue into normal backup execution in the same tick.
+                progressed.append(run)
                 continue
             if run.state is RunState.CLEANUP:
                 progressed.append(self._advance_cleanup(run))
@@ -125,13 +146,39 @@ class DaemonRuntime:
             progressed.append(self._advance_run(run))
         return progressed
 
+
     def _advance_recovery(self, run: JobRun) -> JobRun:
         resume = getattr(self.executor, "resume_recovery", None)
+
+        print(
+            "DEBUG recovery",
+            run.id,
+            run.state,
+            run.recovery_required,
+            resume,
+        )
+
         if resume is None:
             return run
+
         try:
-            return resume(run.id)
+            result = resume(run.id)
+
+            print(
+                "DEBUG recovery result",
+                result.state,
+                result.recovery_required,
+            )
+
+            return result
+
         except Exception as exc:
+            print(
+                "DEBUG recovery exception",
+                type(exc).__name__,
+                str(exc),
+            )
+
             self.repository.record_event(
                 Event(
                     job_run_id=run.id,
@@ -141,6 +188,7 @@ class DaemonRuntime:
                 )
             )
             return None
+
 
     def _catch_up_post_success_retention(
         self,

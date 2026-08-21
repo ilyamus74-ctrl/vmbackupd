@@ -27,6 +27,11 @@ _TRANSITIONS: dict[RunState, frozenset[RunState]] = {
 }
 _TRANSITIONS[RunState.CLEANUP] = frozenset({RunState.FAILED})
 _TRANSITIONS[RunState.SUCCESS] = frozenset()
+_TRANSITIONS[RunState.RECOVERING] = frozenset({
+    RunState.BACKING_UP,
+    RunState.CLEANUP,
+})
+
 _TRANSITIONS[RunState.FAILED] = frozenset()
 
 

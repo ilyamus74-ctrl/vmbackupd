@@ -1114,13 +1114,12 @@ class LibvirtBackupExecutor:
             )
 
         if state is ReclaimOperationState.RECOVERY_REQUIRED:
-            self.repository.mark_recovery_required(
+            return self.repository.enter_transaction_recovery(
                 run.id,
                 "capacity reclaim requires recovery: "
                 f"{operation.error or 'reclaim operation requires recovery'}",
                 self.clock.now(),
             )
-            return None
 
         if state is ReclaimOperationState.COMPLETED:
             if not enough_now:
@@ -1164,7 +1163,7 @@ class LibvirtBackupExecutor:
                 operation.storage_destination_id
             ).execute(operation.id)
         except ReclaimRecoveryRequiredError as exc:
-            self.repository.mark_recovery_required(
+            self.repository.enter_transaction_recovery(
                 run.id,
                 f"capacity reclaim requires recovery: {exc}",
                 self.clock.now(),
@@ -1208,10 +1207,9 @@ class LibvirtBackupExecutor:
         if operation.state is not ReclaimOperationState.COMPLETED:
             return run
 
-        return self.repository.clear_recovery_required(
+        return self.repository.transition_run(
             run.id,
-            "capacity reclaim recovered automatically",
-            self.clock.now(),
+            RunState.BACKING_UP,
         )
 
 
@@ -1334,7 +1332,7 @@ class LibvirtBackupExecutor:
                 operation.storage_destination_id
             ).execute(operation.id)
         except ReclaimRecoveryRequiredError as exc:
-            self.repository.mark_recovery_required(
+            self.repository.enter_transaction_recovery(
                 run.id,
                 f"capacity reclaim requires recovery: {exc}",
                 self.clock.now(),
