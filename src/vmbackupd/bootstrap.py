@@ -7,6 +7,7 @@ import threading
 from enum import StrEnum
 
 from .application import VmbackupApplication
+from .bundle import BundlePathPlanner
 from .clock import SystemClock
 from .command import SubprocessCommandRunner
 from .config import AppConfig
@@ -560,10 +561,52 @@ def compose(
     if storage_preparer is _DEFAULT_STORAGE_PREPARER:
         storage_preparer = StoragePrepareClient()
 
+    # `reclaim.recover` is served from the API/compose thread, which owns
+    # its own SQLiteRepository connection distinct from the one used by
+    # RuntimeWorker's background thread. It therefore cannot reach into
+    # RuntimeWorker._run's local `executor_for` closure (that closure is
+    # bound to a different thread's connection and isn't in scope here
+    # anyway). Recovery only needs the durable ReclaimExecutor state
+    # machine, so build one directly from compose()'s own repository and
+    # SSH collaborators instead of standing up a full LibvirtBackupExecutor.
+    reclaim_ssh_client = SSHReplicaTransferClient(
+        ssh_identity_manager,
+        ssh_known_hosts_manager,
+    )
+
+    def reclaim_destination_resolver(destination_id):
+        return repository.get_storage_destination(
+            node.id,
+            destination_id,
+        )
+
+    def remote_reclaim_delete(destination, bundle):
+        if not destination.remote_storage_id:
+            raise RuntimeError(
+                "SSH replica destination has no remote storage ID"
+            )
+
+        reclaim_ssh_client.delete(
+            destination,
+            storage_id=destination.remote_storage_id,
+            restore_point_id=bundle.restore_point_id,
+            bundle_object_id=bundle.source_bundle_object_id,
+        )
+
     def reclaim_recover(operation_id):
         operation = repository.get_reclaim_operation(operation_id)
-        executor = executor_for(operation.destination_id)
-        return executor.recover_reclaim_operation(operation_id)
+        destination = repository.get_storage_destination(
+            node.id,
+            operation.destination_id,
+        )
+        executor = ReclaimExecutor(
+            repository,
+            BundlePathPlanner(destination.backup_data_root),
+            storage_destination_id=destination.id,
+            destination_resolver=reclaim_destination_resolver,
+            remote_delete=remote_reclaim_delete,
+        )
+        return executor.recover(operation_id)
 
 
     application = VmbackupApplication(
