@@ -45,7 +45,7 @@ class VmbackupApplication:
     def __init__(self, repository: SQLiteRepository, runtime, driver, config, node, clock: Clock,
                  version: str, storage_tester=None, storage_preparer=None,
                  ssh_identity_manager=None, ssh_known_hosts_manager=None,
-                 ssh_receiver_manager=None) -> None:
+                 ssh_receiver_manager=None, reclaim_recover_handler=None) -> None:
         self.repository, self.runtime, self.driver = repository, runtime, driver
         self.config, self.node, self.clock, self.version = config, node, clock, version
         self.storage_tester = storage_tester or LocalStorageTester()
@@ -55,6 +55,7 @@ class VmbackupApplication:
         self.ssh_preflight_client = None
         self.ssh_storage_discovery_client = None
         self.ssh_receiver_manager = ssh_receiver_manager
+        self.reclaim_recover_handler = reclaim_recover_handler
 
     def dispatch(self, method: str, params: dict) -> object:
         handlers = {
@@ -1868,13 +1869,13 @@ class VmbackupApplication:
 
 
     def reclaim_recover(self, operation_id):
-        if not hasattr(self, "reclaim_executor"):
+        if self.reclaim_recover_handler is None:
             raise ApplicationError(
                 "RECLAIM_RECOVERY_UNAVAILABLE",
-                "reclaim executor is not available",
+                "reclaim recovery handler is not configured",
             )
 
-        value = self.reclaim_executor.recover(operation_id)
+        value = self.reclaim_recover_handler(operation_id)
 
         return {
             "id": value.id,

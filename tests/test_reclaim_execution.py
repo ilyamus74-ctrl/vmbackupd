@@ -11,6 +11,7 @@ from vmbackupd.bundle import BundlePathPlanner
 from vmbackupd.models import (
     ReclaimBundleState,
     ReclaimOperationState,
+    StorageType,
 )
 from vmbackupd.reclaim_execution import (
     ReclaimExecutor,
@@ -115,6 +116,25 @@ class FakeRepository:
         )
         assert bundle.state is ReclaimBundleState.PURGING
         bundle.state = ReclaimBundleState.PURGED
+        return bundle
+
+    def mark_remote_reclaim_bundle_purged(
+        self,
+        operation_id,
+        destination_id,
+        source_bundle_object_id,
+        *,
+        error=None,
+    ):
+        self.calls.append("remote-bundle-purged")
+        bundle = self._bundle(
+            destination_id,
+            source_bundle_object_id,
+        )
+        assert bundle.state is ReclaimBundleState.PLANNED
+        bundle.state = ReclaimBundleState.PURGED
+        if error is not None:
+            self.operation.error = error
         return bundle
 
     def mark_reclaim_purged(self, operation_id):
@@ -899,3 +919,96 @@ def test_pre_destructive_invariant_failure_aborts_planned_reclaim():
         repository.operation.state
         is ReclaimOperationState.ABORTED
     )
+
+
+def test_unavailable_ssh_replica_does_not_block_local_reclaim(
+    tmp_path,
+):
+    planner = BundlePathPlanner(tmp_path)
+    quarantiner = FakeQuarantiner(planner)
+    purger = FakePurger(planner)
+
+    local_source = tmp_path / "local-source"
+    local_source.mkdir()
+
+    operation = SimpleNamespace(
+        id=OPERATION_ID,
+        storage_destination_id=STORAGE_ID,
+        state=ReclaimOperationState.PLANNED,
+        required_backup_bytes=60,
+        reserve_bytes=10,
+        free_bytes_after=None,
+        recovery_from_state=None,
+        error=None,
+    )
+
+    local_bundle = SimpleNamespace(
+        operation_id=OPERATION_ID,
+        chain_id="chain",
+        restore_point_id=RESTORE_POINT_ID,
+        destination_id=STORAGE_ID,
+        source_bundle_object_id=str(local_source),
+        state=ReclaimBundleState.PLANNED,
+        quarantine_object_id=None,
+        expected_physical_bytes=None,
+        source_device=None,
+        source_inode=None,
+    )
+
+    remote_bundle = SimpleNamespace(
+        operation_id=OPERATION_ID,
+        chain_id="chain",
+        restore_point_id=RESTORE_POINT_ID,
+        destination_id="ssh-replica",
+        source_bundle_object_id=(
+            "vms/11111111-1111-4111-8111-111111111111/"
+            "2026/08/20260820T010203Z_"
+            "22222222-2222-4222-8222-222222222222"
+        ),
+        state=ReclaimBundleState.PLANNED,
+        quarantine_object_id=None,
+        expected_physical_bytes=None,
+        source_device=None,
+        source_inode=None,
+    )
+
+    repository = FakeRepository(
+        operation,
+        [local_bundle, remote_bundle],
+    )
+
+    destinations = {
+        STORAGE_ID: SimpleNamespace(
+            storage_type=StorageType.LOCAL,
+        ),
+        "ssh-replica": SimpleNamespace(
+            storage_type=StorageType.SSH,
+        ),
+    }
+
+    remote_calls = []
+
+    def remote_delete(destination, bundle):
+        remote_calls.append(bundle.destination_id)
+        raise OSError("receiver unavailable")
+
+    executor = ReclaimExecutor(
+        repository,
+        planner,
+        storage_destination_id=STORAGE_ID,
+        quarantiner=quarantiner,
+        purger=purger,
+        free_space_reader=lambda _: 100,
+        destination_resolver=destinations.__getitem__,
+        remote_delete=remote_delete,
+    )
+
+    completed = executor.execute(OPERATION_ID)
+
+    assert completed.state is ReclaimOperationState.COMPLETED
+    assert "require-recovery" not in repository.calls
+    assert remote_calls == ["ssh-replica"]
+    assert remote_bundle.state is ReclaimBundleState.PURGED
+    assert local_bundle.state is ReclaimBundleState.PURGED
+    assert not local_source.exists()
+    assert "receiver unavailable" in operation.error

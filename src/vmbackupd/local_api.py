@@ -106,8 +106,14 @@ class ApiServer:
                 response = {"version": API_VERSION, "id": request_id, "ok": True, "result": result}
             except ApplicationError as exc:
                 response = self._error(request_id, exc.code, str(exc))
-            except Exception:
-                response = self._error(request_id, "INTERNAL_ERROR", "internal server error")
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                response = self._error(
+                    request_id,
+                    "INTERNAL_ERROR",
+                    f"{type(exc).__name__}: {exc}",
+                )
             await self._write(writer, response)
         finally:
             writer.close()

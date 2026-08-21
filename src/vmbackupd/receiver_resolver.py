@@ -374,6 +374,7 @@ def helper_main(
     namespace_probe=receiver_namespace_ready,
     publisher=None,
     fetcher=None,
+    reclaim_deleter=None,
 ) -> int:
     import sys
 
@@ -410,7 +411,12 @@ def helper_main(
         request.get("version")
         != INTERNAL_PROTOCOL_VERSION
         or operation
-        not in {"resolve", "publish", "fetch_manifest"}
+        not in {
+            "resolve",
+            "publish",
+            "fetch_manifest",
+            "reclaim_delete",
+        }
     ):
         return 64
 
@@ -427,6 +433,14 @@ def helper_main(
             "storage_id",
             "transfer_id",
             "restore_point_id",
+        }
+    elif operation == "reclaim_delete":
+        expected = {
+            "version",
+            "operation",
+            "storage_id",
+            "restore_point_id",
+            "bundle_object_id",
         }
     else:
         expected = {
@@ -515,6 +529,43 @@ def helper_main(
                 }
 
             except ReceiverPublishError as exc:
+                response = {
+                    "version":
+                        INTERNAL_PROTOCOL_VERSION,
+                    "ok": False,
+                    "error": {
+                        "code": exc.code,
+                        "message": str(exc),
+                    },
+                }
+
+        elif operation == "reclaim_delete":
+            from .receiver_reclaim_delete import (
+                ReceiverReclaimDeleteError,
+                delete_published_replica,
+            )
+
+            handler = (
+                delete_published_replica
+                if reclaim_deleter is None
+                else reclaim_deleter
+            )
+
+            try:
+                result = handler(
+                    storage,
+                    request.get("restore_point_id"),
+                    request.get("bundle_object_id"),
+                )
+
+                response = {
+                    "version":
+                        INTERNAL_PROTOCOL_VERSION,
+                    "ok": True,
+                    "result": result,
+                }
+
+            except ReceiverReclaimDeleteError as exc:
                 response = {
                     "version":
                         INTERNAL_PROTOCOL_VERSION,

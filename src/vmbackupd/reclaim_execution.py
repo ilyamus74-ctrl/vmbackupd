@@ -14,6 +14,8 @@ from .models import (
     ReclaimBundleState,
     ReclaimOperation,
     ReclaimOperationState,
+    StorageDestination,
+    StorageType,
 )
 from .repository import SQLiteRepository
 
@@ -70,6 +72,12 @@ class ReclaimExecutor:
         quarantiner: BundleQuarantiner | None = None,
         purger: BundlePurger | None = None,
         free_space_reader: Callable[[Path], int] | None = None,
+        destination_resolver: (
+            Callable[[str], StorageDestination] | None
+        ) = None,
+        remote_delete: (
+            Callable[[StorageDestination, ReclaimBundle], None] | None
+        ) = None,
     ) -> None:
         if not storage_destination_id:
             raise ValueError(
@@ -86,6 +94,28 @@ class ReclaimExecutor:
         self.free_space_reader = (
             free_space_reader
             or self._default_free_space_reader
+        )
+        self.destination_resolver = destination_resolver
+        self.remote_delete = remote_delete
+
+    def _destination(
+        self,
+        bundle: ReclaimBundle,
+    ) -> StorageDestination | None:
+        if self.destination_resolver is None:
+            return None
+        return self.destination_resolver(
+            bundle.destination_id
+        )
+
+    def _is_ssh_bundle(
+        self,
+        bundle: ReclaimBundle,
+    ) -> bool:
+        destination = self._destination(bundle)
+        return (
+            destination is not None
+            and destination.storage_type is StorageType.SSH
         )
 
     @staticmethod
@@ -345,6 +375,49 @@ class ReclaimExecutor:
             )
 
         for bundle in bundles:
+            destination = self._destination(bundle)
+
+            if (
+                destination is not None
+                and destination.storage_type is StorageType.SSH
+            ):
+                if bundle.state is ReclaimBundleState.PURGED:
+                    continue
+
+                if bundle.state is not ReclaimBundleState.PLANNED:
+                    raise ReclaimExecutionError(
+                        "RETIRING contains invalid SSH bundle state "
+                        f"{bundle.state}"
+                    )
+
+                error = None
+
+                try:
+                    if self.remote_delete is None:
+                        raise ReclaimExecutionError(
+                            "SSH replica reclaim deleter is unavailable"
+                        )
+
+                    self.remote_delete(
+                        destination,
+                        bundle,
+                    )
+
+                except Exception as exc:
+                    error = (
+                        "SSH replica reclaim delete failed "
+                        f"for destination {bundle.destination_id}: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
+                self.repository.mark_remote_reclaim_bundle_purged(
+                    operation_id,
+                    bundle.destination_id,
+                    bundle.source_bundle_object_id,
+                    error=error,
+                )
+                continue
+
             if (
                 bundle.state
                 is ReclaimBundleState.QUARANTINED
@@ -468,6 +541,14 @@ class ReclaimExecutor:
             )
 
         for bundle in bundles:
+            if self._is_ssh_bundle(bundle):
+                if bundle.state is not ReclaimBundleState.PURGED:
+                    raise ReclaimExecutionError(
+                        "quarantined operation contains invalid "
+                        f"SSH bundle state {bundle.state}"
+                    )
+                continue
+
             if (
                 bundle.state
                 is not ReclaimBundleState.QUARANTINED
@@ -551,6 +632,14 @@ class ReclaimExecutor:
             )
 
         for bundle in bundles:
+            if self._is_ssh_bundle(bundle):
+                if bundle.state is not ReclaimBundleState.PURGED:
+                    raise ReclaimExecutionError(
+                        "PURGING operation contains invalid "
+                        f"SSH bundle state {bundle.state}"
+                    )
+                continue
+
             if (
                 bundle.state
                 is ReclaimBundleState.QUARANTINED
@@ -674,6 +763,9 @@ class ReclaimExecutor:
                 raise ReclaimExecutionError(
                     "PURGED operation contains non-PURGED bundle"
                 )
+
+            if self._is_ssh_bundle(bundle):
+                continue
 
             self._verify_one_purged(bundle)
 

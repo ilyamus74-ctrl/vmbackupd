@@ -5311,11 +5311,13 @@ class SQLiteRepository:
             """
             SELECT DISTINCT
                 rpl.*
-            FROM reclaim_bundles rb
-            JOIN restore_point_locations rpl
-              ON rpl.restore_point_id = rb.restore_point_id
+            FROM restore_point_locations rpl
+            JOIN reclaim_bundles rb
+              ON rb.restore_point_id = rpl.restore_point_id
+             AND rb.destination_id = rpl.destination_id
             WHERE rb.operation_id = ?
               AND rpl.role = 'REPLICA'
+              AND rb.state != 'PURGED'
             ORDER BY
                 rpl.restore_point_id,
                 rpl.destination_id
@@ -6517,35 +6519,54 @@ class SQLiteRepository:
                 """SELECT
                        COUNT(*) AS total,
                        SUM(
-                           CASE WHEN state = 'QUARANTINED'
-                               THEN 1 ELSE 0 END
-                       ) AS quarantined,
+                           CASE
+                               WHEN sd.storage_type = 'LOCAL'
+                                AND rb.state = 'QUARANTINED'
+                               THEN 1
+                               WHEN sd.storage_type = 'SSH'
+                                AND rb.state = 'PURGED'
+                               THEN 1
+                               ELSE 0
+                           END
+                       ) AS ready,
                        SUM(
                            CASE
-                               WHEN quarantine_object_id IS NULL
-                                 OR expected_physical_bytes IS NULL
-                                 OR source_device IS NULL
-                                 OR source_inode IS NULL
-                               THEN 1 ELSE 0
+                               WHEN sd.storage_type = 'LOCAL'
+                                AND (
+                                    rb.quarantine_object_id IS NULL
+                                    OR rb.expected_physical_bytes IS NULL
+                                    OR rb.source_device IS NULL
+                                    OR rb.source_inode IS NULL
+                                )
+                               THEN 1
+                               ELSE 0
                            END
                        ) AS missing_evidence,
                        COALESCE(
-                           SUM(expected_physical_bytes),
+                           SUM(
+                               CASE
+                                   WHEN sd.storage_type = 'LOCAL'
+                                   THEN rb.expected_physical_bytes
+                                   ELSE 0
+                               END
+                           ),
                            0
                        ) AS physical_total
-                   FROM reclaim_bundles
-                   WHERE operation_id = ?""",
+                   FROM reclaim_bundles rb
+                   JOIN storage_destinations sd
+                     ON sd.id = rb.destination_id
+                   WHERE rb.operation_id = ?""",
                 (operation_id,),
             ).fetchone()
 
             if (
                 counts["total"] == 0
-                or counts["quarantined"] != counts["total"]
+                or counts["ready"] != counts["total"]
                 or counts["missing_evidence"] != 0
             ):
                 raise DomainInvariantError(
-                    "reclaim quarantine requires all bundles "
-                    "QUARANTINED with evidence"
+                    "reclaim quarantine requires all bundles QUARANTINED "
+                    "locally or PURGED remotely with valid evidence"
                 )
 
             if (
@@ -6563,6 +6584,8 @@ class SQLiteRepository:
                    LEFT JOIN reclaim_bundles rb
                      ON rb.operation_id = rc.operation_id
                     AND rb.chain_id = rc.chain_id
+                   LEFT JOIN storage_destinations sd
+                     ON sd.id = rb.destination_id
                    WHERE rc.operation_id = ?
                    GROUP BY
                        rc.operation_id,
@@ -6571,12 +6594,23 @@ class SQLiteRepository:
                    HAVING COUNT(rb.restore_point_id) = 0
                       OR SUM(
                            CASE
-                               WHEN rb.state = 'QUARANTINED'
-                               THEN 1 ELSE 0
+                               WHEN sd.storage_type = 'LOCAL'
+                                AND rb.state = 'QUARANTINED'
+                               THEN 1
+                               WHEN sd.storage_type = 'SSH'
+                                AND rb.state = 'PURGED'
+                               THEN 1
+                               ELSE 0
                            END
                          ) != COUNT(rb.restore_point_id)
                       OR COALESCE(
-                           SUM(rb.expected_physical_bytes),
+                           SUM(
+                               CASE
+                                   WHEN sd.storage_type = 'LOCAL'
+                                   THEN rb.expected_physical_bytes
+                                   ELSE 0
+                               END
+                           ),
                            0
                          ) != rc.expected_physical_bytes
                    LIMIT 1""",
@@ -7193,15 +7227,28 @@ class SQLiteRepository:
 
             remaining = self.connection.execute(
                 """SELECT 1
-                   FROM reclaim_bundles
-                   WHERE operation_id = ?
-                     AND state != 'QUARANTINED'
+                   FROM reclaim_bundles rb
+                   JOIN storage_destinations sd
+                     ON sd.id = rb.destination_id
+                   WHERE rb.operation_id = ?
+                     AND (
+                         (
+                             sd.storage_type = 'LOCAL'
+                             AND rb.state != 'QUARANTINED'
+                         )
+                         OR
+                         (
+                             sd.storage_type = 'SSH'
+                             AND rb.state != 'PURGED'
+                         )
+                     )
                    LIMIT 1""",
                 (operation_id,),
             ).fetchone()
             if remaining is not None:
                 raise DomainInvariantError(
-                    "reclaim purge requires quarantined bundles"
+                    "reclaim purge requires LOCAL bundles QUARANTINED "
+                    "and SSH bundles PURGED"
                 )
 
             self._set_reclaim_operation_state(
@@ -7332,12 +7379,14 @@ class SQLiteRepository:
         operation_id: str,
         destination_id: str,
         source_bundle_object_id: str,
+        *,
+        error: str | None = None,
     ) -> ReclaimBundle:
         """Mark SSH reclaim object removed after remote deletion."""
 
         self.connection.execute("BEGIN IMMEDIATE")
         try:
-            self._require_reclaim_operation_state(
+            operation = self._require_reclaim_operation_state(
                 operation_id,
                 ReclaimOperationState.RETIRING,
             )
@@ -7361,6 +7410,31 @@ class SQLiteRepository:
             if cursor.rowcount != 1:
                 raise DomainInvariantError(
                     "remote reclaim bundle state transition failed"
+                )
+
+            if error is not None:
+                detail = error.strip()
+                if not detail:
+                    raise ValueError(
+                        "remote reclaim error must not be empty"
+                    )
+                self.connection.execute(
+                    """UPDATE reclaim_operations
+                       SET error = COALESCE(error || '; ', '') || ?,
+                           updated_at = ?
+                       WHERE id = ?""",
+                    (
+                        detail,
+                        utcnow().isoformat(),
+                        operation_id,
+                    ),
+                )
+                self._insert_event(
+                    Event(
+                        job_run_id=operation["job_run_id"],
+                        event_type="RECLAIM_REMOTE_DELETE_FAILED",
+                        message=detail,
+                    )
                 )
 
             self.connection.commit()

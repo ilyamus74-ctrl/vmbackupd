@@ -5,6 +5,16 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/.." && pwd)
 cd -- "$repo_root"
 source_date_epoch=$(git -C "$repo_root" log -1 --format=%ct)
+
+# Prevent accidental RPM builds from stale git index snapshots.
+# The snapshot below is created from git index only, therefore
+# unstaged working tree changes would silently disappear.
+if [[ -n "$(git -C "$repo_root" diff --name-only)" ]]; then
+    echo "WARNING: unstaged changes exist and will NOT be included in RPM." >&2
+    git -C "$repo_root" diff --name-only >&2
+fi
+
+
 work_root=${RPMBUILD_WORK_ROOT:-$(mktemp -d)}
 keep_work_root=${RPMBUILD_KEEP_WORK_ROOT:-0}
 output_dir=${RPMBUILD_OUTPUT_DIR:-$repo_root/dist/rpm}

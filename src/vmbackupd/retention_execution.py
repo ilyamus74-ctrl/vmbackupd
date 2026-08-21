@@ -53,6 +53,8 @@ class RetentionReclaimService:
         reclaim_executor_factory: (
             Callable[[str], ReclaimExecutor] | None
         ) = None,
+        destination_resolver=None,
+        remote_delete=None,
     ) -> None:
         self.repository = repository
         self.bundle_planner = bundle_planner
@@ -72,6 +74,8 @@ class RetentionReclaimService:
         self.reclaim_executor_factory = (
             reclaim_executor_factory
         )
+        self.destination_resolver = destination_resolver
+        self.remote_delete = remote_delete
 
     def _executor(
         self,
@@ -87,6 +91,8 @@ class RetentionReclaimService:
             self.bundle_planner,
             storage_destination_id=storage_destination_id,
             free_space_reader=self.free_space_reader,
+            destination_resolver=self.destination_resolver,
+            remote_delete=self.remote_delete,
         )
 
     def execute_for_run(

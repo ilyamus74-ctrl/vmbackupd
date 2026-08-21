@@ -19,6 +19,8 @@ from .local_api import ApiServer
 from .models import StorageDestination, StorageType
 from .repository import DomainInvariantError, SQLiteRepository
 from .replica_worker import ReplicaWorker
+from .replica_sender import SSHReplicaTransferClient
+from .reclaim_execution import ReclaimExecutor
 from .restore_libvirt import (
     LocalRestoreDefinitionExecutor,
     LocalRestoreDomainBuilder,
@@ -191,6 +193,60 @@ class RuntimeWorker:
                 self.config.libvirt.uri,
             )
 
+            ssh_root = (
+                self.config.daemon.database_path.parent
+                / "ssh"
+            )
+            reclaim_identity_manager = SSHIdentityManager(
+                ssh_root,
+                runner,
+                shared_identity_id=_system_ssh_identity_id(
+                    self.node_id
+                ),
+            )
+            reclaim_known_hosts_manager = (
+                SSHKnownHostsManager(
+                    ssh_root
+                )
+            )
+            reclaim_ssh_client = (
+                SSHReplicaTransferClient(
+                    reclaim_identity_manager,
+                    reclaim_known_hosts_manager,
+                )
+            )
+
+            def reclaim_destination_resolver(
+                destination_id,
+            ):
+                return repository.get_storage_destination(
+                    self.node_id,
+                    destination_id,
+                )
+
+            def remote_reclaim_delete(
+                destination,
+                bundle,
+            ):
+                if not destination.remote_storage_id:
+                    raise RuntimeError(
+                        "SSH replica destination has no "
+                        "remote storage ID"
+                    )
+
+                reclaim_ssh_client.delete(
+                    destination,
+                    storage_id=(
+                        destination.remote_storage_id
+                    ),
+                    restore_point_id=(
+                        bundle.restore_point_id
+                    ),
+                    bundle_object_id=(
+                        bundle.source_bundle_object_id
+                    ),
+                )
+
             def executor_for(destination):
                 staging = StagingFilesystem(
                     self.config.daemon.control_root, destination.backup_data_root,
@@ -205,7 +261,14 @@ class RuntimeWorker:
                     output_preparer=QemuOutputImagePreparer(runner, staging, inspector),
                     allow_libvirt_mutation=self.config.libvirt.allow_mutation,
                     minimum_free_bytes=destination.minimum_free_bytes,
-                    minimum_free_percent=destination.minimum_free_percent, clock=clock,
+                    minimum_free_percent=destination.minimum_free_percent,
+                    clock=clock,
+                    reclaim_destination_resolver=(
+                        reclaim_destination_resolver
+                    ),
+                    remote_reclaim_delete=(
+                        remote_reclaim_delete
+                    ),
                 )
 
             runtime = DaemonRuntime(
@@ -497,12 +560,19 @@ def compose(
     if storage_preparer is _DEFAULT_STORAGE_PREPARER:
         storage_preparer = StoragePrepareClient()
 
+    def reclaim_recover(operation_id):
+        operation = repository.get_reclaim_operation(operation_id)
+        executor = executor_for(operation.destination_id)
+        return executor.recover_reclaim_operation(operation_id)
+
+
     application = VmbackupApplication(
         repository, runtime, read_driver, config, node, clock, __version__,
         storage_preparer=storage_preparer,
         ssh_identity_manager=ssh_identity_manager,
         ssh_known_hosts_manager=ssh_known_hosts_manager,
         ssh_receiver_manager=ssh_receiver_manager,
+        reclaim_recover_handler=reclaim_recover,
     )
     application.ssh_preflight_client = ssh_preflight_client
     application.ssh_storage_discovery_client = (

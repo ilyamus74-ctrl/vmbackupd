@@ -44,6 +44,10 @@ from .receiver_transfer import (
     TRANSFER_COMMAND,
     TRANSFER_PROTOCOL_VERSION,
 )
+from .receiver_reclaim_delete import (
+    RECLAIM_DELETE_COMMAND,
+    RECLAIM_DELETE_PROTOCOL_VERSION,
+)
 
 
 _SAFE_DISK = re.compile(
@@ -57,7 +61,6 @@ _REQUIRED_METADATA = (
 )
 
 _MAX_RESPONSE_LINE = 64 * 1024
-RECLAIM_DELETE_COMMAND = "vmbackupd-reclaim-delete-v1"
 
 
 class ReplicaSenderError(RuntimeError):
@@ -1196,34 +1199,185 @@ class SSHReplicaTransferClient:
 
     def delete(
         self,
-        destination,
+        destination: StorageDestination,
         *,
         storage_id: str,
         restore_point_id: str,
         bundle_object_id: str,
-    ) -> None:
+    ) -> dict:
+        storage_id = _canonical_uuid(
+            storage_id,
+            "remote storage ID",
+        )
+        restore_point_id = _canonical_uuid(
+            restore_point_id,
+            "Restore Point ID",
+        )
+
         argv = self._ssh_argv(
             destination,
             RECLAIM_DELETE_COMMAND,
         )
-        process = self.process_factory(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env={
-                **os.environ,
-                "VMBACKUPD_RECLAIM_DELETE": json.dumps({
-                    "storage_id": storage_id,
-                    "restore_point_id": restore_point_id,
-                    "bundle_object_id": bundle_object_id,
-                }),
-            },
-        )
-        _, stderr = process.communicate()
-        if process.returncode != 0:
-            raise ReplicaSenderError(
-                stderr.decode(errors="replace")
-            )
+
+        with tempfile.TemporaryFile(
+            mode="w+b"
+        ) as stderr:
+            try:
+                process = self.process_factory(
+                    argv,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr,
+                    bufsize=0,
+                    env={
+                        **os.environ,
+                        "LC_ALL": "C",
+                        "LANG": "C",
+                    },
+                )
+            except OSError as exc:
+                raise ReplicaSenderError(
+                    "cannot start SSH replica delete transport"
+                ) from exc
+
+            if (
+                process.stdin is None
+                or process.stdout is None
+            ):
+                process.kill()
+                raise ReplicaSenderError(
+                    "SSH replica delete pipes are unavailable"
+                )
+
+            try:
+                self._write_control(
+                    process.stdin,
+                    {
+                        "protocol_version":
+                            RECLAIM_DELETE_PROTOCOL_VERSION,
+                        "operation": "RECLAIM_DELETE",
+                        "storage_id": storage_id,
+                        "restore_point_id": restore_point_id,
+                        "bundle_object_id": bundle_object_id,
+                    },
+                )
+
+                line = process.stdout.readline(
+                    _MAX_RESPONSE_LINE + 1
+                )
+
+                if (
+                    not line
+                    or len(line) > _MAX_RESPONSE_LINE
+                    or not line.endswith(b"\n")
+                ):
+                    raise ReplicaSenderError(
+                        "receiver delete response is missing or oversized"
+                    )
+
+                try:
+                    result = json.loads(
+                        line.decode("utf-8")
+                    )
+                except (
+                    UnicodeDecodeError,
+                    json.JSONDecodeError,
+                ) as exc:
+                    raise ReplicaSenderError(
+                        "receiver delete response is not valid JSON"
+                    ) from exc
+
+                if (
+                    not isinstance(result, dict)
+                    or result.get("service")
+                        != "vmbackupd-receiver"
+                    or result.get("protocol_version")
+                        != RECLAIM_DELETE_PROTOCOL_VERSION
+                ):
+                    raise ReplicaSenderError(
+                        "receiver delete protocol identity mismatch"
+                    )
+
+                if result.get("status") == "ERROR":
+                    error = result.get("error")
+                    code = (
+                        str(
+                            error.get(
+                                "code",
+                                "RECLAIM_DELETE_FAILED",
+                            )
+                        )
+                        if isinstance(error, dict)
+                        else "RECLAIM_DELETE_FAILED"
+                    )
+                    message = (
+                        str(
+                            error.get(
+                                "message",
+                                "receiver delete failed",
+                            )
+                        )
+                        if isinstance(error, dict)
+                        else "receiver delete failed"
+                    )
+                    raise ReplicaSenderError(
+                        f"receiver rejected replica delete "
+                        f"[{code}]: {message}"
+                    )
+
+                if result.get("status") != "DELETED":
+                    raise ReplicaSenderError(
+                        "unexpected receiver delete status"
+                    )
+
+                for key, expected in (
+                    ("storage_id", storage_id),
+                    ("restore_point_id", restore_point_id),
+                    ("bundle_object_id", bundle_object_id),
+                ):
+                    if result.get(key) != expected:
+                        raise ReplicaSenderError(
+                            "receiver delete identity mismatch"
+                        )
+
+                process.stdin.close()
+
+                try:
+                    returncode = process.wait(
+                        timeout=20
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    process.kill()
+                    process.wait()
+                    raise ReplicaSenderError(
+                        "SSH replica delete did not terminate"
+                    ) from exc
+
+                if returncode != 0:
+                    detail = self._stderr_tail(stderr)
+                    raise ReplicaSenderError(
+                        "SSH replica delete transport failed"
+                        + (
+                            f": {detail}"
+                            if detail
+                            else ""
+                        )
+                    )
+
+                return result
+
+            except Exception:
+                try:
+                    process.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                except Exception:
+                    pass
+                raise
 
     def publish(
         self,

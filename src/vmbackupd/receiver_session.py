@@ -149,6 +149,7 @@ def main(
     transfer_runner=None,
     publish_runner=None,
     restore_manifest_runner=None,
+    reclaim_delete_runner=None,
 ) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
 
@@ -195,7 +196,12 @@ def main(
         return runner()
 
     if original == RECLAIM_DELETE_COMMAND:
-        return run_receiver_reclaim_delete()
+        runner = (
+            run_receiver_reclaim_delete
+            if reclaim_delete_runner is None
+            else reclaim_delete_runner
+        )
+        return runner()
 
     if original == RESTORE_MANIFEST_COMMAND:
         runner = (

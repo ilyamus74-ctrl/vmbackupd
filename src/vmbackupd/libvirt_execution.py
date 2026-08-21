@@ -538,6 +538,8 @@ class LibvirtBackupExecutor:
         output_preparer: QemuOutputImagePreparer | None = None,
         minimum_free_bytes: int = 0, minimum_free_percent: float = 0,
         clock: Clock | None = None,
+        reclaim_destination_resolver=None,
+        remote_reclaim_delete=None,
     ) -> None:
         if minimum_free_bytes < 0 or not 0 <= minimum_free_percent <= 100:
             raise ValueError("invalid free-space reserve")
@@ -551,6 +553,10 @@ class LibvirtBackupExecutor:
         self.minimum_free_bytes = minimum_free_bytes
         self.minimum_free_percent = minimum_free_percent
         self.clock = clock or SystemClock()
+        self.reclaim_destination_resolver = (
+            reclaim_destination_resolver
+        )
+        self.remote_reclaim_delete = remote_reclaim_delete
         self.planner = BackupPlanner(repository)
         self.planning = LibvirtPlanningService(
             repository, read_driver,
@@ -571,6 +577,10 @@ class LibvirtBackupExecutor:
                 lambda _:
                     self.staging.free_space()[0]
             ),
+            destination_resolver=(
+                self.reclaim_destination_resolver
+            ),
+            remote_delete=self.remote_reclaim_delete,
         )
         self._ownership_tokens: set[str] = set()
         self._current_step_owned = False
@@ -872,6 +882,20 @@ class LibvirtBackupExecutor:
             return self._poll_running(run)
         return run
 
+    def recover_reclaim_operation(
+        self,
+        operation_id: str,
+    ):
+        operation = self.repository.get_reclaim_operation(
+            operation_id
+        )
+
+        executor = self._reclaim_executor(
+            operation.destination_id
+        )
+
+        return executor.recover(operation_id)
+
     def _reclaim_executor(
         self,
         storage_destination_id: str,
@@ -881,6 +905,10 @@ class LibvirtBackupExecutor:
             self.bundle_planner,
             storage_destination_id=storage_destination_id,
             free_space_reader=lambda _: self.staging.free_space()[0],
+            destination_resolver=(
+                self.reclaim_destination_resolver
+            ),
+            remote_delete=self.remote_reclaim_delete,
         )
 
     @staticmethod
