@@ -1190,6 +1190,181 @@ class RepositoryV2:
 
 
 
+
+    def list_reclaim_bundles(
+        self,
+        **kwargs,
+    ):
+        return self.connection.execute(
+            """
+            SELECT *
+            FROM reclaim_bundles
+            ORDER BY created_at
+            """
+        ).fetchall()
+
+
+    def list_reclaim_chains(
+        self,
+        **kwargs,
+    ):
+        return self.connection.execute(
+            """
+            SELECT *
+            FROM restore_points
+            ORDER BY created_at
+            """
+        ).fetchall()
+
+
+    def begin_reclaim_bundle_purge(
+        self,
+        bundle_id,
+        **kwargs,
+    ):
+        self.connection.execute(
+            """
+            UPDATE reclaim_bundles
+            SET state=?
+            WHERE id=?
+            """,
+            (
+                "PURGING",
+                bundle_id,
+            ),
+        )
+        self.connection.commit()
+
+
+    def begin_reclaim_purge(
+        self,
+        restore_point_id,
+        **kwargs,
+    ):
+        self.connection.execute(
+            """
+            UPDATE restore_points
+            SET status=?
+            WHERE id=?
+            """,
+            (
+                "PURGING",
+                restore_point_id,
+            ),
+        )
+        self.connection.commit()
+
+
+    def begin_reclaim_retirement(
+        self,
+        restore_point_id,
+        **kwargs,
+    ):
+        return self.begin_reclaim_purge(
+            restore_point_id,
+            **kwargs,
+        )
+
+
+    def mark_reclaim_bundle_purged(
+        self,
+        bundle_id,
+        **kwargs,
+    ):
+        self.connection.execute(
+            """
+            UPDATE reclaim_bundles
+            SET state=?
+            WHERE id=?
+            """,
+            (
+                "PURGED",
+                bundle_id,
+            ),
+        )
+        self.connection.commit()
+
+
+    def mark_reclaim_bundle_quarantined(
+        self,
+        bundle_id,
+        **kwargs,
+    ):
+        self.connection.execute(
+            """
+            UPDATE reclaim_bundles
+            SET state=?
+            WHERE id=?
+            """,
+            (
+                "QUARANTINED",
+                bundle_id,
+            ),
+        )
+        self.connection.commit()
+
+
+    def mark_remote_reclaim_bundle_purged(
+        self,
+        bundle_id,
+        **kwargs,
+    ):
+        return self.mark_reclaim_bundle_purged(
+            bundle_id,
+            **kwargs,
+        )
+
+
+    def mark_reclaim_purged(
+        self,
+        restore_point_id,
+        **kwargs,
+    ):
+        self.connection.execute(
+            """
+            UPDATE restore_points
+            SET status=?
+            WHERE id=?
+            """,
+            (
+                "DELETED",
+                restore_point_id,
+            ),
+        )
+        self.connection.commit()
+
+
+    def mark_reclaim_quarantined(
+        self,
+        restore_point_id,
+        **kwargs,
+    ):
+        self.connection.execute(
+            """
+            UPDATE restore_points
+            SET status=?
+            WHERE id=?
+            """,
+            (
+                "QUARANTINED",
+                restore_point_id,
+            ),
+        )
+        self.connection.commit()
+
+
+    def retire_reclaim_catalog(
+        self,
+        restore_point_id,
+        **kwargs,
+    ):
+        return self.mark_reclaim_purged(
+            restore_point_id,
+            **kwargs,
+        )
+
+
+
     def add_vm(self, node_id, name):
         ident = str(uuid.uuid4())
         self.connection.execute(
