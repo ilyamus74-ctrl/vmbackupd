@@ -7458,7 +7458,7 @@ class SQLiteRepository:
             ),
         ).fetchone()
 
-        return self._row_to_reclaim_bundle(row)
+        return self._reclaim_bundle(row)
 
 
     def mark_reclaim_bundle_purged(
