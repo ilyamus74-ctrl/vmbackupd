@@ -515,6 +515,72 @@ class RepositoryV2:
             },
         )()
 
+    def list_storage_destinations(self, node_id=None):
+
+        if node_id:
+            rows = self.connection.execute(
+                """
+                SELECT *
+                FROM storage_destinations
+                WHERE node_id=?
+                """,
+                (node_id,),
+            ).fetchall()
+
+        else:
+            rows = self.connection.execute(
+                """
+                SELECT *
+                FROM storage_destinations
+                """
+            ).fetchall()
+
+
+        result = []
+
+        for row in rows:
+            config = json.loads(
+                row[4] or "{}"
+            )
+
+            result.append(
+                type(
+                    "StorageDestinationRecord",
+                    (),
+                    {
+                        "id": row[0],
+                        "node_id": row[1],
+                        "name": row[2],
+                        "storage_type": (
+                            StorageType(row[3])
+                            if not isinstance(row[3], StorageType)
+                            else row[3]
+                        ),
+                        "config": config,
+                        "config_json": row[4],
+
+                        # совместимость со старым StorageDestination
+                        "backup_data_root": config.get(
+                            "backup_data_root",
+                            "",
+                        ),
+                        "remote_storage_id": config.get(
+                            "remote_storage_id",
+                        ),
+                        "backup_data_uid": config.get(
+                            "backup_data_uid",
+                        ),
+                        "backup_data_gid": config.get(
+                            "backup_data_gid",
+                        ),
+                        "backup_data_mode": config.get(
+                            "backup_data_mode",
+                        ),
+                    },
+                )()
+            )
+
+        return result
 
     def list_storage_destinations(self, node_id=None):
         if node_id:
