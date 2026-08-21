@@ -35,6 +35,18 @@ snapshot_root="$work_root/index-snapshot"
 mkdir -p "$snapshot_root" "$work_root/rpmbuild"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS} "$output_dir"
 git -C "$repo_root" checkout-index --all --force --prefix="$snapshot_root/"
 version=$(python3 -c 'import pathlib,sys,tomllib; print(tomllib.loads(pathlib.Path(sys.argv[1]).read_text())["project"]["version"])' "$snapshot_root/pyproject.toml")
+
+release=1
+if compgen -G "$output_dir/vmbackupd-$version-*.noarch.rpm" > /dev/null; then
+    last_release=$(rpm -qp --qf "%{RELEASE}\n"         "$output_dir"/vmbackupd-"$version"-*.noarch.rpm         | sed 's/%.*//'         | sort -n         | tail -1)
+
+    if [[ "$last_release" =~ ^[0-9]+$ ]]; then
+        release=$((last_release + 1))
+    fi
+fi
+
+echo "RPM version: $version-$release"
+
 manifest="$work_root/source-files"
 git -C "$repo_root" ls-files --cached \
     | grep -Ev '^(\.git|\.venv|build|dist|tests)/' \
@@ -51,6 +63,7 @@ install -pm 0644 "$snapshot_root/packaging/vmbackupd.spec" "$work_root/rpmbuild/
 rpmbuild -ba "$work_root/rpmbuild/SPECS/vmbackupd.spec" \
     --define "_topdir $work_root/rpmbuild" \
     --define "upstream_version $version" \
+    --define "release $release" \
     --define "_source_date_epoch $source_date_epoch"
 
 find "$work_root/rpmbuild/RPMS" "$work_root/rpmbuild/SRPMS" \
