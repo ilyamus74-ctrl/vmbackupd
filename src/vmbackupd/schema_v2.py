@@ -170,6 +170,46 @@ CREATE TABLE IF NOT EXISTS recovery_tasks (
 """,
 
 
+"""
+CREATE TABLE IF NOT EXISTS restore_operations (
+    id TEXT PRIMARY KEY,
+
+    restore_point_id TEXT NOT NULL
+        REFERENCES restore_points(id),
+
+    source_destination_id TEXT NOT NULL
+        REFERENCES storage_destinations(id),
+
+    target_node_id TEXT NOT NULL
+        REFERENCES nodes(id),
+
+    source_role TEXT NOT NULL,
+
+    source_bundle_object_id TEXT NOT NULL,
+
+    target_vm_name TEXT NOT NULL,
+
+    target_domain_uuid TEXT NOT NULL UNIQUE,
+
+    target_root TEXT NOT NULL,
+
+    network_mode TEXT NOT NULL DEFAULT 'DISCONNECTED',
+
+    start_after_restore INTEGER NOT NULL DEFAULT 0,
+
+    state TEXT NOT NULL,
+
+    error TEXT,
+
+    recovery_reason TEXT,
+
+    created_at TEXT NOT NULL,
+
+    updated_at TEXT NOT NULL
+)
+""",
+
+
 )
 
 
