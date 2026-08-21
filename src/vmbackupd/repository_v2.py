@@ -1849,6 +1849,99 @@ class RepositoryV2:
         }
 
 
+
+    def _restore_operation_from_row(
+        self,
+        row,
+    ):
+        from .models import (
+            RestoreOperation,
+            RestorePointLocationRole,
+            RestoreNetworkMode,
+            RestoreOperationState,
+        )
+
+        return RestoreOperation(
+            id=row["id"],
+            restore_point_id=row["restore_point_id"],
+            source_destination_id=row["source_destination_id"],
+            target_node_id=row["target_node_id"],
+            source_role=RestorePointLocationRole(
+                row["source_role"]
+            ),
+            source_bundle_object_id=row["source_bundle_object_id"],
+            target_vm_name=row["target_vm_name"],
+            target_root=row["target_root"],
+            target_domain_uuid=row["target_domain_uuid"],
+            network_mode=RestoreNetworkMode(
+                row["network_mode"]
+            ),
+            start_after_restore=bool(
+                row["start_after_restore"]
+            ),
+            state=RestoreOperationState(
+                row["state"]
+            ),
+            error=row["error"],
+            recovery_reason=row["recovery_reason"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+
+    def get_restore_operation(
+        self,
+        operation_id,
+    ):
+        self.connection.row_factory = __import__(
+            "sqlite3"
+        ).Row
+
+        row = self.connection.execute(
+            """
+            SELECT *
+            FROM restore_operations
+            WHERE id=?
+            """,
+            (
+                operation_id,
+            ),
+        ).fetchone()
+
+        if row is None:
+            return None
+
+        return self._restore_operation_from_row(
+            row
+        )
+
+
+    def list_restore_operations_for_node(
+        self,
+        node_id,
+    ):
+        self.connection.row_factory = __import__(
+            "sqlite3"
+        ).Row
+
+        rows = self.connection.execute(
+            """
+            SELECT *
+            FROM restore_operations
+            WHERE target_node_id=?
+            ORDER BY created_at
+            """,
+            (
+                node_id,
+            ),
+        ).fetchall()
+
+        return [
+            self._restore_operation_from_row(row)
+            for row in rows
+        ]
+
+
     def list_successful_restore_points(
         self,
         storage_id=None,
