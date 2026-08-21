@@ -216,6 +216,7 @@ class RepositoryV2:
     def create_storage_destination(
         self,
         destination,
+        make_default=True,
     ):
 
         ident = (
