@@ -29,7 +29,9 @@ def test_runtime_v2_start_tick():
 
     result = runtime.tick()
 
-    assert result == []
+    assert len(result) == 1
+
+    assert result[0] == run
 
 
 def test_runtime_v2_execute_isolated():

@@ -44,7 +44,21 @@ class DaemonRuntimeV2:
         if not self.running:
             return []
 
-        return self.recover_runs()
+        progressed = []
+
+        recovery_results = (
+            self.process_recovery_tasks()
+        )
+
+        for result in recovery_results:
+            if result is not None:
+                progressed.append(result)
+
+        progressed.extend(
+            self.recover_runs()
+        )
+
+        return progressed
 
 
     def recover_runs(self):

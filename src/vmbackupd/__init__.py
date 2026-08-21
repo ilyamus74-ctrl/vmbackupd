@@ -22,7 +22,10 @@ from .retention import (
 from .runtime import DaemonRuntime
 from .scheduler import IntervalScheduler
 from .schema import (
-    CURRENT_SCHEMA_VERSION, SchemaError, SchemaMigrationError, UnsupportedSchemaError,
+    CURRENT_SCHEMA_VERSION,
+    SchemaError,
+    SchemaMigrationError,
+    UnsupportedSchemaError,
 )
 
 __all__ = [
