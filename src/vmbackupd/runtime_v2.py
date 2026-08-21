@@ -16,9 +16,11 @@ class DaemonRuntimeV2:
         self,
         repository,
         executor=None,
+        capacity_adapter=None,
     ):
         self.repository = repository
         self.executor = executor
+        self.capacity_adapter = capacity_adapter
 
         from vmbackupd.recovery_policy_v2 import (
             RecoveryPolicyV2,
@@ -145,6 +147,10 @@ class DaemonRuntimeV2:
             try:
 
                 task["repository"] = self.repository
+
+                task["capacity_adapter"] = (
+                    self.capacity_adapter
+                )
 
 
                 result = self.resume_recovery_task(
