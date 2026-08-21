@@ -1365,6 +1365,76 @@ class RepositoryV2:
 
 
 
+
+    def get_controller(
+        self,
+        **kwargs,
+    ):
+        return self.connection.execute(
+            """
+            SELECT *
+            FROM nodes
+            LIMIT 1
+            """
+        ).fetchone()
+
+
+    def assert_run_execution_owned(
+        self,
+        run_id,
+        **kwargs,
+    ):
+        row = self.connection.execute(
+            """
+            SELECT id
+            FROM job_runs
+            WHERE id=?
+            """,
+            (
+                run_id,
+            ),
+        ).fetchone()
+
+        if row is None:
+            raise RuntimeError(
+                "run does not exist"
+            )
+
+        return True
+
+
+    def fail_restore(
+        self,
+        run_id,
+        reason=None,
+        **kwargs,
+    ):
+        self.connection.execute(
+            """
+            UPDATE job_runs
+            SET state=?
+            WHERE id=?
+            """,
+            (
+                "FAILED",
+                run_id,
+            ),
+        )
+        self.connection.commit()
+
+
+    def record_cleanup_failure(
+        self,
+        run_id,
+        reason=None,
+        **kwargs,
+    ):
+        return self.fail_restore(
+            run_id,
+            reason,
+        )
+
+
     def add_vm(self, node_id, name):
         ident = str(uuid.uuid4())
         self.connection.execute(
