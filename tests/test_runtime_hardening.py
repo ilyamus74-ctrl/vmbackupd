@@ -387,3 +387,148 @@ def test_clear_recovery_required_rejects_transaction_recovering_state():
             "invalid direct clear",
             clock.now(),
         )
+
+
+def test_transaction_recovery_survives_daemon_restart_and_resumes():
+    repository, node, _, first, _, clock = setup_repository()
+
+    run = add_run(repository, first, RunState.BACKING_UP)
+
+    repository.enter_transaction_recovery(
+        run.id,
+        "daemon crashed during reclaim transaction",
+        clock.now(),
+    )
+
+    calls = []
+
+    class RecoveryExecutor:
+        def resume_recovery(self, run_id):
+            calls.append(run_id)
+
+            return repository.complete_transaction_recovery(
+                run_id,
+                "transaction recovery completed",
+                clock.now(),
+            )
+
+        def advance_run(self, run_id):
+            return repository.get_run(run_id)
+
+    # first daemon instance dies after transaction recovery was persisted
+
+    runtime = DaemonRuntime(
+        repository,
+        node.id,
+        clock,
+        RecoveryExecutor(),
+    )
+
+    runtime.start()
+    runtime.tick()
+
+    result = repository.get_run(run.id)
+
+    assert calls == [run.id]
+    assert result.state is RunState.BACKING_UP
+    assert result.recovery_required is False
+
+    repository.close()
+
+
+
+def test_capacity_reclaim_transaction_recovery_survives_daemon_restart():
+    repository, node, _, first, _, clock = setup_repository()
+
+    run = add_run(repository, first, RunState.BACKING_UP)
+
+    repository.enter_transaction_recovery(
+        run.id,
+        "capacity reclaim interrupted before backup continuation",
+        clock.now(),
+    )
+
+    calls = []
+
+    class RecoveryExecutor:
+        def resume_recovery(self, run_id):
+            calls.append(run_id)
+
+            return repository.complete_transaction_recovery(
+                run_id,
+                "capacity reclaim recovery completed",
+                clock.now(),
+            )
+
+    runtime1 = DaemonRuntime(
+        repository,
+        node.id,
+        clock,
+        RecoveryExecutor(),
+    )
+
+    runtime1.start()
+    runtime1.tick()
+
+    result = repository.get_run(run.id)
+
+    assert calls == [run.id]
+    assert result.state is RunState.BACKING_UP
+    assert result.recovery_required is False
+
+    # simulate daemon crash/restart: old controller lease is removed
+    daemon = repository.get_daemon(runtime1.instance_id)
+
+    repository.release_controller(
+        node.id,
+        daemon.instance_id,
+        clock.now(),
+    )
+
+    repository.stop_daemon(
+        daemon.instance_id,
+        clock.now(),
+    )
+
+    runtime2_calls = []
+
+    class RestartExecutor:
+        def resume_recovery(self, run_id):
+            runtime2_calls.append(run_id)
+            return repository.get_run(run_id)
+
+    runtime2 = DaemonRuntime(
+        repository,
+        node.id,
+        clock,
+        RestartExecutor(),
+    )
+
+    runtime2.start()
+    runtime2.tick()
+
+    result = repository.get_run(run.id)
+
+    assert runtime2_calls == []
+    assert result.state is RunState.BACKING_UP
+    assert result.recovery_required is False
+
+
+def test_failure_classification_persists():
+    repository, node, _, first, _, clock = setup_repository()
+
+    from vmbackupd.models import FailureClass
+
+    run = add_run(repository, first, RunState.BACKING_UP)
+
+    repository.mark_failure_class(
+        run.id,
+        FailureClass.EXECUTION_UNKNOWN,
+        "controller lease lost",
+        clock.now(),
+    )
+
+    result = repository.get_run(run.id)
+
+    assert result.failure_class is FailureClass.EXECUTION_UNKNOWN
+    assert result.failure_reason == "controller lease lost"

@@ -4176,3 +4176,35 @@ Current safety boundary:
     remote restore acquisition    NO
     remote restore execution      NO
     remote restore acceptance     NO
+
+
+
+# Project Status
+
+
+## Schema v2 recovery foundation
+
+
+Status: COMPLETED
+
+
+Implemented:
+
+
+- New schema foundation
+- RepositoryV2
+- Error event storage
+- Runtime state machine
+- Restart recovery
+- Recovery queue
+- Recovery executor registry
+
+
+
+
+Next:
+
+
+- ReclaimRecoveryExecutor
+- Real reclaim resume workflow
+- Backup continuation after reclaim

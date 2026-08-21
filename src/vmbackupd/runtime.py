@@ -102,10 +102,10 @@ class DaemonRuntime:
                 if recovered is not None:
                     progressed.append(recovered)
 
-                run = self.repository.get_run(run.id)
-
-                if run.state is RunState.RECOVERING:
-                    continue
+                # Recovery owns this daemon tick.
+                # Never start/resume normal backup execution in the
+                # same tick after transactional recovery completes.
+                continue
 
             elif run.recovery_required:
                 # Legacy recovery flag:

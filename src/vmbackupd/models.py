@@ -21,6 +21,15 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+class FailureClass(StrEnum):
+    NONE = "NONE"
+    TRANSACTION_RECOVERY = "TRANSACTION_RECOVERY"
+    EXECUTION_UNKNOWN = "EXECUTION_UNKNOWN"
+    LOCAL_FAILURE = "LOCAL_FAILURE"
+    REMOTE_FAILURE = "REMOTE_FAILURE"
+    OPERATOR_REQUIRED = "OPERATOR_REQUIRED"
+
+
 class RunState(StrEnum):
     SCHEDULED = "SCHEDULED"
     QUEUED = "QUEUED"
@@ -568,6 +577,8 @@ class JobRun:
     missed_schedule_slots: int = 0
     recovery_required: bool = False
     recovery_reason: str | None = None
+    failure_class: FailureClass = FailureClass.NONE
+    failure_reason: str | None = None
     recovery_context: RecoveryContext | None = None
     cleanup_authorized: bool = False
     created_at: datetime = field(default_factory=utcnow)

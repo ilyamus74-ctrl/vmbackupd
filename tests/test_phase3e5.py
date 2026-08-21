@@ -187,6 +187,8 @@ def version_one_database(path):
     connection.execute("ALTER TABLE backup_artifacts DROP COLUMN published_object_id")
     connection.execute("ALTER TABLE restore_points DROP COLUMN bundle_object_id")
     connection.execute("ALTER TABLE job_runs DROP COLUMN storage_destination_id")
+    connection.execute("ALTER TABLE job_runs DROP COLUMN failure_reason")
+    connection.execute("ALTER TABLE job_runs DROP COLUMN failure_class")
     connection.execute(
         "ALTER TABLE backup_jobs DROP COLUMN backup_size_margin_percent"
     )

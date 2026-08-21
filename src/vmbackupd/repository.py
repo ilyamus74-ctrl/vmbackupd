@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 
 from .bundle import BundlePathPlanner
 from .models import (
+    FailureClass,
     ArtifactKind, ArtifactState, BackupArtifact, BackupChain, BackupChainStatus,
     BackupJob, BackupJobReplica, BackupKind, BackupPolicy, CatchUpMode,
     DaemonInstance, Event, ExecutionLease, JobRun, JobRunReplica,
@@ -4266,6 +4267,87 @@ class SQLiteRepository:
                                          message=reason, created_at=now))
         return self.get_run(run_id)
 
+    def complete_transaction_recovery(
+        self,
+        run_id: str,
+        reason: str,
+        now: datetime,
+        state: RunState = RunState.BACKING_UP,
+    ) -> JobRun:
+        run = self.get_run(run_id)
+
+        if run.state is not RunState.RECOVERING:
+            raise DomainInvariantError(
+                "only RECOVERING run can complete transaction recovery"
+            )
+
+        with self.connection:
+            self.connection.execute(
+                """
+                UPDATE job_runs
+                SET state = ?,
+                    recovery_required = 0,
+                    recovery_reason = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    state.value,
+                    now.isoformat(),
+                    run_id,
+                ),
+            )
+
+            self._insert_event(
+                Event(
+                    job_run_id=run_id,
+                    event_type="RUN_RECOVERY_COMPLETED",
+                    message=reason,
+                    created_at=now,
+                )
+            )
+
+        return self.get_run(run_id)
+
+
+    def mark_failure_class(
+        self,
+        run_id: str,
+        failure_class,
+        reason: str,
+        now: datetime,
+    ) -> JobRun:
+        run = self.get_run(run_id)
+
+        with self.connection:
+            self.connection.execute(
+                """
+                UPDATE job_runs
+                SET failure_class = ?,
+                    failure_reason = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    failure_class.value,
+                    reason,
+                    now.isoformat(),
+                    run_id,
+                ),
+            )
+
+            self._insert_event(
+                Event(
+                    job_run_id=run_id,
+                    event_type="RUN_FAILURE_CLASSIFIED",
+                    message=f"{failure_class.value}: {reason}",
+                    created_at=now,
+                )
+            )
+
+        return self.get_run(run_id)
+
+
     def clear_recovery_required(self, run_id: str, reason: str, now: datetime) -> JobRun:
         run = self.get_run(run_id)
 
@@ -8262,6 +8344,11 @@ class SQLiteRepository:
             is_catch_up=bool(row["is_catch_up"]),
             missed_schedule_slots=row["missed_schedule_slots"],
             recovery_required=bool(row["recovery_required"]),
+            failure_class=FailureClass(
+                row["failure_class"]
+            ),
+            failure_reason=row["failure_reason"],
+
             recovery_reason=row["recovery_reason"],
             cleanup_authorized=bool(row["cleanup_authorized"]),
             created_at=datetime.fromisoformat(row["created_at"]),
