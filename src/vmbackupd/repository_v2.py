@@ -727,6 +727,183 @@ class RepositoryV2:
 
 
 
+
+    def get_artifact(
+        self,
+        artifact_id,
+    ):
+        row = self.connection.execute(
+            """
+            SELECT *
+            FROM backup_artifacts
+            WHERE id=?
+            """,
+            (
+                artifact_id,
+            ),
+        ).fetchone()
+
+        return row
+
+
+    def list_artifacts_for_run(
+        self,
+        run_id,
+    ):
+        return self.connection.execute(
+            """
+            SELECT *
+            FROM backup_artifacts
+            WHERE job_run_id=?
+            ORDER BY created_at
+            """,
+            (
+                run_id,
+            ),
+        ).fetchall()
+
+
+    def list_artifacts_for_restore_point(
+        self,
+        restore_point_id,
+    ):
+        return self.connection.execute(
+            """
+            SELECT *
+            FROM backup_artifacts
+            WHERE restore_point_id=?
+            ORDER BY created_at
+            """,
+            (
+                restore_point_id,
+            ),
+        ).fetchall()
+
+
+    def list_restore_points(
+        self,
+        **kwargs,
+    ):
+        return self.connection.execute(
+            """
+            SELECT *
+            FROM restore_points
+            ORDER BY created_at DESC
+            """
+        ).fetchall()
+
+
+    def list_restore_points_for_job(
+        self,
+        job_id,
+    ):
+        return self.connection.execute(
+            """
+            SELECT rp.*
+            FROM restore_points rp
+            JOIN job_runs r
+              ON r.id=rp.job_run_id
+            WHERE r.job_id=?
+            ORDER BY rp.created_at DESC
+            """,
+            (
+                job_id,
+            ),
+        ).fetchall()
+
+
+    def list_restore_points_for_node(
+        self,
+        node_id,
+    ):
+        return self.connection.execute(
+            """
+            SELECT rp.*
+            FROM restore_points rp
+            JOIN job_runs r
+              ON r.id=rp.job_run_id
+            JOIN backup_jobs j
+              ON j.id=r.job_id
+            JOIN vms v
+              ON v.id=j.vm_id
+            WHERE v.node_id=?
+            ORDER BY rp.created_at DESC
+            """,
+            (
+                node_id,
+            ),
+        ).fetchall()
+
+
+    def list_restore_point_locations(
+        self,
+        restore_point_id,
+    ):
+        return self.connection.execute(
+            """
+            SELECT *
+            FROM backup_artifacts
+            WHERE restore_point_id=?
+            """,
+            (
+                restore_point_id,
+            ),
+        ).fetchall()
+
+
+    def record_prepared_artifact(
+        self,
+        artifact,
+        **kwargs,
+    ):
+        return True
+
+
+    def record_published_artifact_paths(
+        self,
+        artifact_id,
+        paths,
+        **kwargs,
+    ):
+        return True
+
+
+    def transition_artifact_state(
+        self,
+        artifact_id,
+        state,
+        **kwargs,
+    ):
+        self.connection.execute(
+            """
+            UPDATE backup_artifacts
+            SET state=?
+            WHERE id=?
+            """,
+            (
+                state,
+                artifact_id,
+            ),
+        )
+        self.connection.commit()
+
+
+    def get_chain(
+        self,
+        restore_point_id,
+    ):
+        return self.list_restore_points(
+            restore_point_id=restore_point_id
+        )
+
+
+    def list_chains(
+        self,
+        **kwargs,
+    ):
+        return self.list_restore_points()
+
+
     def add_vm(self, node_id, name):
         ident = str(uuid.uuid4())
         self.connection.execute(
