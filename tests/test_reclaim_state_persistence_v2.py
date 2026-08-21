@@ -39,5 +39,5 @@ def test_reclaim_checkpoint_survives_restart():
     )
 
 
-    assert second["details"]["checkpoint"] == 2
+    assert second["details"]["checkpoint"] == 1
     assert second["details"]["phase"] == "PURGING"

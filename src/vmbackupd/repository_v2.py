@@ -110,6 +110,37 @@ class RepositoryV2:
         )
         return ident
 
+    def resume_run_after_recovery(
+        self,
+        run_id,
+    ):
+
+        self.connection.execute(
+            """
+            UPDATE job_runs
+            SET state=?,
+                updated_at=?
+            WHERE id=?
+            """,
+            (
+                "SCHEDULED",
+                now(),
+                run_id,
+            ),
+        )
+
+        self.append_event(
+            run_id,
+            "RECOVERY_RECLAIM_COMPLETED",
+            {
+                "action": "resume_backup",
+            },
+        )
+
+        self.connection.commit()
+
+
+
     def set_state(self, run_id, state):
         self.connection.execute(
             """

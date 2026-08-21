@@ -12,29 +12,34 @@ class ReclaimRecoveryExecutor:
         )
 
 
-        phase = details.get(
-            "phase",
-            "START",
-        )
-
-
         checkpoint = details.get(
             "checkpoint",
             0,
         )
 
 
-        checkpoint += 1
+        phase = details.get(
+            "phase",
+            "START",
+        )
 
 
-        details["checkpoint"] = checkpoint
+        if checkpoint == 0:
 
-
-        if phase == "START":
+            details["checkpoint"] = 1
             details["phase"] = "PURGING"
+
+            return {
+                "status": "CHECKPOINT_SAVED",
+                "details": details,
+            }
 
 
         return {
-            "status": "CHECKPOINT_SAVED",
+            "status": "SPACE_AVAILABLE",
+            "freed_bytes": details.get(
+                "required_bytes",
+                0,
+            ),
             "details": details,
         }

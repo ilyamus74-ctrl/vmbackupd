@@ -119,10 +119,41 @@ class DaemonRuntimeV2:
                     task
                 )
 
-                self.repository.update_recovery_task(
-                    task_id,
-                    "COMPLETED",
-                )
+
+                if (
+                    isinstance(result, dict)
+                    and "details" in result
+                ):
+                    self.repository.update_recovery_details(
+                        task_id,
+                        result["details"],
+                    )
+
+
+                if (
+                    isinstance(result, dict)
+                    and result.get("status")
+                    == "SPACE_AVAILABLE"
+                ):
+
+                    self.repository.update_recovery_task(
+                        task_id,
+                        "COMPLETED",
+                    )
+
+                    self.repository.resume_run_after_recovery(
+                        task["run_id"]
+                    )
+
+                else:
+
+                    # промежуточный checkpoint.
+                    # Recovery не завершён.
+                    self.repository.update_recovery_task(
+                        task_id,
+                        "PENDING",
+                    )
+
 
                 results.append(
                     result
