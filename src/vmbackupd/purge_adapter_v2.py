@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from vmbackupd.physical_delete_adapter_v2 import PhysicalDeleteAdapter
+
 
 class PurgeAdapter:
 
@@ -7,8 +9,14 @@ class PurgeAdapter:
     def __init__(
         self,
         repository=None,
+        physical_delete=None,
     ):
         self.repository = repository
+        self.physical_delete = (
+            physical_delete
+            if physical_delete is not None
+            else PhysicalDeleteAdapter()
+        )
 
 
     def resolve_artifact(
@@ -284,6 +292,88 @@ class PurgeAdapter:
         )
 
 
+        metadata = artifact.get(
+            "metadata",
+            {}
+        )
+
+
+        artifact_path = metadata.get(
+            "path"
+        )
+
+
+        validated_path = (
+            self.validate_artifact_path(
+                plan["restore_point_id"],
+                artifact_path,
+            )
+        )
+
+
+        if validated_path is None:
+            self.repository.append_purge_event(
+                plan["restore_point_id"],
+                "PURGE_FAILED",
+                "artifact path validation failed",
+            )
+
+            return {
+                "deleted": False,
+                "reason":
+                    "INVALID_ARTIFACT_PATH",
+            }
+
+
+        delete_result = (
+            self.physical_delete
+            .delete_path(
+                validated_path
+            )
+        )
+
+
+        status = delete_result.get(
+            "status"
+        )
+
+
+        if status == "FAILED":
+
+            self.repository.append_purge_event(
+                plan["restore_point_id"],
+                "PURGE_FAILED",
+                delete_result.get(
+                    "message"
+                ),
+            )
+
+            return {
+                "deleted": False,
+                "reason":
+                    "PHYSICAL_DELETE_FAILED",
+            }
+
+
+        if status == "NOT_FOUND":
+
+            self.repository.append_purge_event(
+                plan["restore_point_id"],
+                "PURGE_FILE_MISSING",
+                delete_result.get(
+                    "message"
+                ),
+            )
+
+        else:
+
+            self.repository.append_purge_event(
+                plan["restore_point_id"],
+                "PURGE_COMPLETED",
+                None,
+            )
+
+
         self.repository.delete_backup_artifact(
             artifact["id"]
         )
@@ -300,6 +390,8 @@ class PurgeAdapter:
                 plan["restore_point_id"],
             "artifact_id":
                 artifact["id"],
+            "physical":
+                delete_result,
         }
 
 

@@ -1,5 +1,6 @@
 
 import sqlite3
+from pathlib import Path
 import json
 
 from vmbackupd.schema_v2 import ensure_schema
@@ -21,7 +22,24 @@ def test_purge_executes_only_after_plan_allows():
 
     node = repo.add_node("node")
     vm = repo.add_vm(node, "vm")
-    storage = repo.add_storage(node, "storage")
+
+    storage_root = Path(
+        "/tmp/vmbackupd-test-storage"
+    )
+
+    storage_root.mkdir(
+        exist_ok=True
+    )
+
+    storage = repo.add_storage(
+        node,
+        "storage",
+        {
+            "backup_data_root":
+                str(storage_root)
+        }
+    )
+
     job = repo.add_job(vm, storage, "job")
 
     run1 = repo.create_run(
@@ -81,6 +99,13 @@ def test_purge_executes_only_after_plan_allows():
     )
 
 
+    bundle = storage_root / "bundle"
+
+    bundle.write_text(
+        "bundle"
+    )
+
+
     repo.connection.execute(
         """
         INSERT INTO backup_artifacts(
@@ -99,7 +124,7 @@ def test_purge_executes_only_after_plan_allows():
             json.dumps(
                 {
                     "path":
-                        "/backup/bundle"
+                        str(bundle)
                 }
             ),
             "now",

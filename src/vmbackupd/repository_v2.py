@@ -234,6 +234,54 @@ class RepositoryV2:
 
 
 
+
+    def append_purge_event(
+        self,
+        restore_point_id,
+        event_type,
+        message=None,
+    ):
+
+        ident = str(uuid.uuid4())
+
+
+        self.connection.execute(
+            """
+            INSERT INTO run_events(
+                id,
+                job_run_id,
+                event_type,
+                data_json,
+                created_at
+            )
+            SELECT
+                ?,
+                job_run_id,
+                ?,
+                ?,
+                ?
+            FROM restore_points
+            WHERE id=?
+            """,
+            (
+                ident,
+                event_type,
+                json.dumps(
+                    {
+                        "message":
+                            message
+                    }
+                ),
+                now(),
+                restore_point_id,
+            ),
+        )
+
+
+        self.connection.commit()
+
+
+
     def delete_backup_artifact(
         self,
         artifact_id,

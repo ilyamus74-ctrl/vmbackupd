@@ -40,6 +40,7 @@ from .restore_runtime import (
 from .runtime import DaemonRuntime
 from .capacity_adapter_v2 import CapacityAdapter
 from .purge_adapter_v2 import PurgeAdapter
+from .physical_delete_adapter_v2 import PhysicalDeleteAdapter
 from .ssh_identity import SSHIdentityManager
 from .ssh_known_hosts import SSHKnownHostsManager
 from .ssh_receiver import SSHReceiverRegistry
@@ -277,8 +278,11 @@ class RuntimeWorker:
             capacity_adapter = CapacityAdapter(
                 repository
             )
+            physical_delete = PhysicalDeleteAdapter()
+
             purge_adapter = PurgeAdapter(
-                repository
+                repository,
+                physical_delete,
             )
 
             runtime = DaemonRuntime(
