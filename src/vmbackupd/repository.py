@@ -4268,6 +4268,12 @@ class SQLiteRepository:
 
     def clear_recovery_required(self, run_id: str, reason: str, now: datetime) -> JobRun:
         run = self.get_run(run_id)
+
+        if run.state is RunState.RECOVERING:
+            raise DomainInvariantError(
+                "transaction recovery must complete before clearing recovery flag"
+            )
+
         if not run.recovery_required:
             return run
         with self.connection:

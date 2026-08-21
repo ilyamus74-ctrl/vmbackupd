@@ -365,3 +365,25 @@ def test_engine_rejects_transaction_recovering_run():
 
     with pytest.raises(DomainInvariantError, match="transaction-recovering"):
         engine.advance_run(run.id)
+
+
+def test_clear_recovery_required_rejects_transaction_recovering_state():
+    repository, node, _, first, _, clock = setup_repository()
+
+    run = add_run(repository, first, RunState.BACKING_UP)
+
+    repository.enter_transaction_recovery(
+        run.id,
+        "reclaim interrupted",
+        clock.now(),
+    )
+
+    with pytest.raises(
+        DomainInvariantError,
+        match="transaction recovery must complete",
+    ):
+        repository.clear_recovery_required(
+            run.id,
+            "invalid direct clear",
+            clock.now(),
+        )
