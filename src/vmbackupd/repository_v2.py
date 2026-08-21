@@ -904,6 +904,137 @@ class RepositoryV2:
         return self.list_restore_points()
 
 
+
+    def bind_libvirt_domain_uuid(
+        self,
+        vm_id,
+        domain_uuid,
+    ):
+        self.connection.execute(
+            """
+            UPDATE vms
+            SET libvirt_domain_uuid=?
+            WHERE id=?
+            """,
+            (
+                domain_uuid,
+                vm_id,
+            ),
+        )
+        self.connection.commit()
+
+
+    def persist_libvirt_plan(
+        self,
+        run_id,
+        plan,
+    ):
+        self.connection.execute(
+            """
+            UPDATE job_runs
+            SET libvirt_plan_json=?
+            WHERE id=?
+            """,
+            (
+                json.dumps(plan),
+                run_id,
+            ),
+        )
+        self.connection.commit()
+
+
+    def get_persisted_libvirt_plan(
+        self,
+        run_id,
+    ):
+        row = self.connection.execute(
+            """
+            SELECT libvirt_plan_json
+            FROM job_runs
+            WHERE id=?
+            """,
+            (
+                run_id,
+            ),
+        ).fetchone()
+
+        if row is None or not row[0]:
+            return None
+
+        return json.loads(row[0])
+
+
+    def get_libvirt_operation(
+        self,
+        operation_id,
+    ):
+        row = self.connection.execute(
+            """
+            SELECT *
+            FROM libvirt_operations
+            WHERE id=?
+            """,
+            (
+                operation_id,
+            ),
+        ).fetchone()
+
+        return row
+
+
+    def transition_libvirt_external_state(
+        self,
+        operation_id,
+        state,
+        **kwargs,
+    ):
+        self.connection.execute(
+            """
+            UPDATE libvirt_operations
+            SET state=?
+            WHERE id=?
+            """,
+            (
+                state,
+                operation_id,
+            ),
+        )
+        self.connection.commit()
+
+
+    def record_libvirt_poll(
+        self,
+        operation_id,
+        state,
+        **kwargs,
+    ):
+        return self.transition_libvirt_external_state(
+            operation_id,
+            state,
+        )
+
+
+    def record_libvirt_active_match(
+        self,
+        operation_id,
+        **kwargs,
+    ):
+        return True
+
+
+    def reject_libvirt_start(
+        self,
+        operation_id,
+        reason=None,
+        **kwargs,
+    ):
+        self.transition_libvirt_external_state(
+            operation_id,
+            "REJECTED",
+        )
+
+
+
     def add_vm(self, node_id, name):
         ident = str(uuid.uuid4())
         self.connection.execute(
