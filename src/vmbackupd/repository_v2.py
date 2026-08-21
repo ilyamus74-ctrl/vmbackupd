@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+
+from .models import StorageType
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -27,7 +29,20 @@ class RepositoryV2:
         self.connection = connection
 
     def add_node(self, name):
-        ident = str(uuid.uuid4())
+
+        provided_id = None
+
+        if not isinstance(name, str):
+            if hasattr(name, "name"):
+                provided_id = getattr(name, "id", None)
+                name = name.name
+            else:
+                raise TypeError(
+                    "node name must be string or object with name attribute"
+                )
+
+        ident = provided_id or str(uuid.uuid4())
+
         self.connection.execute(
             """
             INSERT INTO nodes(id,name,created_at)
@@ -35,6 +50,7 @@ class RepositoryV2:
             """,
             (ident, name, now()),
         )
+
         return ident
 
     def get_or_create_node(
@@ -152,7 +168,11 @@ class RepositoryV2:
                 "id": row[0],
                 "node_id": row[1],
                 "name": row[2],
-                "storage_type": row[3],
+                "storage_type": (
+                    StorageType(row[3])
+                    if not isinstance(row[3], StorageType)
+                    else row[3]
+                ),
                 "backup_data_root":
                     config.get(
                         "backup_data_root",
@@ -241,6 +261,38 @@ class RepositoryV2:
                 destination.minimum_free_percent,
         }
 
+
+        node_exists = self.connection.execute(
+            """
+            SELECT 1
+            FROM nodes
+            WHERE id=?
+            """,
+            (
+                destination.node_id,
+            ),
+        ).fetchone()
+
+        if node_exists is None:
+            self.connection.execute(
+                """
+                INSERT INTO nodes(
+                    id,
+                    name,
+                    created_at
+                )
+                VALUES(?,?,?)
+                """,
+                (
+                    destination.node_id,
+                    getattr(
+                        destination,
+                        "node_name",
+                        "local",
+                    ),
+                    now(),
+                ),
+            )
 
         self.connection.execute(
             """
@@ -414,7 +466,19 @@ class RepositoryV2:
         return True
 
 
-    def get_storage_destination(self, storage_id):
+    def get_storage_destination(self, *args):
+
+        if len(args) == 1:
+            storage_id = args[0]
+
+        elif len(args) == 2:
+            _, storage_id = args
+
+        else:
+            raise TypeError(
+                "get_storage_destination expects storage_id or node_id,storage_id"
+            )
+
         row = self.connection.execute(
             """
             SELECT *
@@ -424,7 +488,32 @@ class RepositoryV2:
             (storage_id,),
         ).fetchone()
 
-        return row
+
+        if row is None:
+            return None
+
+
+        config = json.loads(
+            row[4] or "{}"
+        )
+
+
+        return type(
+            "StorageDestinationRecord",
+            (),
+            {
+                "id": row[0],
+                "node_id": row[1],
+                "name": row[2],
+                "storage_type": (
+                    StorageType(row[3])
+                    if not isinstance(row[3], StorageType)
+                    else row[3]
+                ),
+                "config": config,
+                "config_json": row[4],
+            },
+        )()
 
 
     def list_storage_destinations(self, node_id=None):
@@ -1557,6 +1646,80 @@ class RepositoryV2:
             (ident,node_id,name,now()),
         )
         return ident
+
+    def add_storage_destination(
+        self,
+        destination,
+    ):
+        """
+        Legacy compatibility API.
+
+        Accepts StorageDestination object used by older services/tests.
+        """
+
+        if hasattr(destination, "id") and destination.id:
+            ident = destination.id
+        else:
+            ident = str(uuid.uuid4())
+
+        self.connection.execute(
+            """
+            INSERT INTO storage_destinations(
+                id,
+                node_id,
+                name,
+                storage_type,
+                config_json,
+                created_at
+            )
+            VALUES(?,?,?,?,?,?)
+            """,
+            (
+                ident,
+                destination.node_id,
+                destination.name,
+                getattr(
+                    destination.storage_type,
+                    "value",
+                    destination.storage_type,
+                ),
+                json.dumps(
+                    {
+                        "backup_data_root": str(
+                            destination.backup_data_root
+                        )
+                        if getattr(
+                            destination,
+                            "backup_data_root",
+                            None,
+                        )
+                        else None,
+                        "backup_data_mode": getattr(
+                            destination,
+                            "backup_data_mode",
+                            None,
+                        ),
+                        "backup_data_uid": getattr(
+                            destination,
+                            "backup_data_uid",
+                            None,
+                        ),
+                        "backup_data_gid": getattr(
+                            destination,
+                            "backup_data_gid",
+                            None,
+                        ),
+                    }
+                ),
+                now(),
+            ),
+        )
+
+        self.connection.commit()
+
+        return ident
+
+
 
     def add_storage(self, node_id, name, config=None):
         ident = str(uuid.uuid4())
