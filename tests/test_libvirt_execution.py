@@ -2383,3 +2383,24 @@ def test_retention_catchup_freezes_interrupted_destructive_reclaim(
             for event in events
         }
     )
+
+
+
+def test_quarantine_keeps_safety_recovery_outside_recovering_state(
+    execution,
+):
+    repository, _, _, run, _, _, _ = execution
+
+    value, _ = executor(execution)
+
+    operation = repository.get_libvirt_operation(run.id)
+
+    assert operation is not None
+
+    result = value._quarantine(
+        run.id,
+        "simulated unknown libvirt state",
+    )
+
+    assert result.recovery_required is True
+    assert result.state is not RunState.RECOVERING
