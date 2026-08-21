@@ -1435,6 +1435,61 @@ class RepositoryV2:
         )
 
 
+
+    def job_overview_for_node(
+        self,
+        node_id,
+        **kwargs,
+    ):
+        return self.connection.execute(
+            """
+            SELECT *
+            FROM backup_jobs
+            WHERE vm_id IN (
+                SELECT id
+                FROM vms
+                WHERE node_id=?
+            )
+            """,
+            (
+                node_id,
+            ),
+        ).fetchall()
+
+
+    def run_summary_for_node(
+        self,
+        node_id,
+        **kwargs,
+    ):
+        return self.connection.execute(
+            """
+            SELECT *
+            FROM job_runs
+            WHERE job_id IN (
+                SELECT id
+                FROM backup_jobs
+                WHERE vm_id IN (
+                    SELECT id
+                    FROM vms
+                    WHERE node_id=?
+                )
+            )
+            ORDER BY created_at DESC
+            """,
+            (
+                node_id,
+            ),
+        ).fetchall()
+
+
+    def schedule_due_job(
+        self,
+        **kwargs,
+    ):
+        return None
+
+
     def add_vm(self, node_id, name):
         ident = str(uuid.uuid4())
         self.connection.execute(
