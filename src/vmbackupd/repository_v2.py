@@ -1035,6 +1035,161 @@ class RepositoryV2:
 
 
 
+
+    def create_reclaim_operation(
+        self,
+        run_id=None,
+        storage_id=None,
+        **kwargs,
+    ):
+        ident = str(uuid.uuid4())
+
+        self.connection.execute(
+            """
+            INSERT INTO reclaim_operations(
+                id,
+                job_run_id,
+                storage_destination_id,
+                state,
+                metadata_json,
+                created_at
+            )
+            VALUES(?,?,?,?,?,?)
+            """,
+            (
+                ident,
+                run_id,
+                storage_id,
+                "PENDING",
+                json.dumps(kwargs),
+                now(),
+            ),
+        )
+
+        self.connection.commit()
+
+        return ident
+
+
+    def get_reclaim_operation(
+        self,
+        operation_id,
+    ):
+        return self.connection.execute(
+            """
+            SELECT *
+            FROM reclaim_operations
+            WHERE id=?
+            """,
+            (
+                operation_id,
+            ),
+        ).fetchone()
+
+
+    def get_reclaim_operation_for_run(
+        self,
+        run_id,
+    ):
+        return self.connection.execute(
+            """
+            SELECT *
+            FROM reclaim_operations
+            WHERE job_run_id=?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (
+                run_id,
+            ),
+        ).fetchone()
+
+
+    def require_reclaim_recovery(
+        self,
+        run_id,
+        details=None,
+    ):
+        self.connection.execute(
+            """
+            UPDATE job_runs
+            SET recovery_required=1,
+                recovery_details_json=?
+            WHERE id=?
+            """,
+            (
+                json.dumps(details or {}),
+                run_id,
+            ),
+        )
+
+        self.connection.commit()
+
+
+    def resume_reclaim_recovery(
+        self,
+        run_id,
+    ):
+        self.connection.execute(
+            """
+            UPDATE job_runs
+            SET recovery_required=0
+            WHERE id=?
+            """,
+            (
+                run_id,
+            ),
+        )
+
+        self.connection.commit()
+
+
+    def abort_reclaim(
+        self,
+        operation_id,
+        reason=None,
+    ):
+        self.connection.execute(
+            """
+            UPDATE reclaim_operations
+            SET state=?,
+                metadata_json=?
+            WHERE id=?
+            """,
+            (
+                "FAILED",
+                json.dumps(
+                    {
+                        "reason": reason
+                    }
+                ),
+                operation_id,
+            ),
+        )
+
+        self.connection.commit()
+
+
+    def complete_reclaim(
+        self,
+        operation_id,
+    ):
+        self.connection.execute(
+            """
+            UPDATE reclaim_operations
+            SET state=?
+            WHERE id=?
+            """,
+            (
+                "SUCCESS",
+                operation_id,
+            ),
+        )
+
+        self.connection.commit()
+
+
+
     def add_vm(self, node_id, name):
         ident = str(uuid.uuid4())
         self.connection.execute(
