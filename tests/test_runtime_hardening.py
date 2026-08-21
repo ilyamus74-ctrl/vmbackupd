@@ -299,3 +299,18 @@ def test_capacity_reclaim_recovery_is_resumed_by_daemon_tick():
     assert recovered.recovery_required is False
 
     repository.close()
+def test_transaction_recovery_uses_recovering_state():
+    repository, node, _, first, _, clock = setup_repository()
+
+    run = add_run(repository, first, RunState.BACKING_UP)
+
+    repository.enter_transaction_recovery(
+        run.id,
+        "reclaim transaction interrupted",
+        clock.now(),
+    )
+
+    result = repository.get_run(run.id)
+
+    assert result.state is RunState.RECOVERING
+    assert result.recovery_required is True
