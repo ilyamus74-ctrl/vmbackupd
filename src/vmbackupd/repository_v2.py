@@ -667,11 +667,35 @@ class RepositoryV2:
 
         return row
 
-
     def list_runs_for_node(
         self,
         node_id,
+        nonterminal_only=False,
+        **kwargs,
     ):
+        if nonterminal_only:
+            return self.connection.execute(
+                """
+                SELECT
+                    r.*
+                FROM job_runs r
+                JOIN backup_jobs j
+                  ON j.id=r.job_id
+                JOIN vms v
+                  ON v.id=j.vm_id
+                WHERE v.node_id=?
+                  AND r.state NOT IN (
+                      'SUCCESS',
+                      'FAILED',
+                      'COMPLETED'
+                  )
+                ORDER BY r.created_at DESC
+                """,
+                (
+                    node_id,
+                ),
+            ).fetchall()
+
         return self.connection.execute(
             """
             SELECT
@@ -688,7 +712,6 @@ class RepositoryV2:
                 node_id,
             ),
         ).fetchall()
-
 
     def list_runs_page_for_node(
         self,
