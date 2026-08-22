@@ -2769,7 +2769,34 @@ console.log(
                     model.discoveredVms,
                 );
 
-//                renderModel(model);
+//                try {
+                    console.log(
+                        "BEFORE RENDER MODEL",
+                        {
+                            modelType: typeof model,
+                            hasModel: Boolean(model),
+                            jobs: model && model.jobs,
+                            storage: model && model.storage,
+                            discoveredVms: model && model.discoveredVms,
+                            registeredVms: model && model.registeredVms,
+                            runs: model && model.runs,
+                        },
+                    );
+
+                    renderModel(model);
+
+                    console.log(
+                        "AFTER RENDER MODEL",
+                    );
+
+                } catch (error) {
+                    console.error(
+                        "RENDER MODEL FAILED",
+                        error,
+                        model,
+                    );
+                    throw error;
+                }
 console.log("CALL renderModel");
 renderModel(model);
 console.log("renderModel FINISHED");
