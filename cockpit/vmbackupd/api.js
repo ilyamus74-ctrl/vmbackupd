@@ -8,6 +8,8 @@
     const ALLOWED_METHODS = Object.freeze([
         "daemon.status",
         "vm.discover",
+        "vm.inventory",
+        "vm.registered.list",
         "vm.list",
         "storage.list",
         "storage.create",
