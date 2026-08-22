@@ -2728,7 +2728,18 @@
                         recovery: Array.isArray(recovery),
                     },
                 );
-
+console.log(
+    "BEFORE DERIVE TYPES",
+    {
+        status: typeof status,
+        inventory: Array.isArray(inventory),
+        registeredVms: Array.isArray(registeredVms),
+        storage: Array.isArray(storage),
+        jobs: Array.isArray(jobs),
+        runPage: typeof runPage,
+        recovery: Array.isArray(recovery),
+    }
+);
                 const model = deriveModel(
                     {
                         status: status,
@@ -2741,6 +2752,7 @@
                     },
                     new Date(),
                 );
+                console.log("AFTER DERIVE");
 console.log(
     "MODEL CREATED",
     model,
