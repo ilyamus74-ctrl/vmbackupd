@@ -1,4 +1,5 @@
 from vmbackupd.recovery_executor_v2 import default_registry
+import uuid
 
 """Runtime V2 foundation.
 
@@ -18,11 +19,23 @@ class DaemonRuntimeV2:
         executor=None,
         capacity_adapter=None,
         purge_adapter=None,
+        node_id=None,
+        clock=None,
+        lease_seconds=None,
+        controller_lease_seconds=None,
     ):
         self.repository = repository
+
         self.executor = executor
         self.capacity_adapter = capacity_adapter
         self.purge_adapter = purge_adapter
+
+        self.node_id = node_id
+        self.clock = clock
+        self.lease_seconds = lease_seconds
+        self.controller_lease_seconds = controller_lease_seconds
+
+        self.instance_id = None
 
         from vmbackupd.recovery_policy_v2 import (
             RecoveryPolicyV2,
@@ -35,6 +48,11 @@ class DaemonRuntimeV2:
 
     def start(self):
         self.running = True
+
+        if self.instance_id is None:
+            self.instance_id = str(uuid.uuid4())
+
+        return self.instance_id
 
 
     def stop(self):
