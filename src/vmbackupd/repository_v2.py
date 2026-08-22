@@ -622,6 +622,36 @@ class RepositoryV2:
                         "backup_data_mode": config.get(
                             "backup_data_mode",
                         ),
+
+                        "ssh_host": (
+                            row["ssh_host"]
+                            if "ssh_host" in row.keys()
+                            else None
+                        ),
+
+                        "ssh_port": (
+                            row["ssh_port"]
+                            if "ssh_port" in row.keys()
+                            else None
+                        ),
+
+                        "ssh_user": (
+                            row["ssh_user"]
+                            if "ssh_user" in row.keys()
+                            else None
+                        ),
+
+                        "ssh_remote_root": (
+                            row["ssh_remote_root"]
+                            if "ssh_remote_root" in row.keys()
+                            else None
+                        ),
+
+                        "remote_node_id": (
+                            row["remote_node_id"]
+                            if "remote_node_id" in row.keys()
+                            else None
+                        ),
                     },
                 )()
             )
