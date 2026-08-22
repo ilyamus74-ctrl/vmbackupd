@@ -2647,16 +2647,14 @@
             try {
                 const [
                     status,
-                    discoveredVms,
-                    registeredVms,
+                    inventory,
                     storage,
                     jobs,
                     runPage,
                     recovery,
                 ] = await Promise.all([
                     api.request("daemon.status"),
-                    api.request("vm.discover"),
-                    api.request("vm.list"),
+                    api.request("vm.inventory"),
                     api.request("storage.list"),
                     api.request(
                         "job.list",
@@ -2669,8 +2667,8 @@
                 const model = deriveModel(
                     {
                         status: status,
-                        discoveredVms: discoveredVms,
-                        registeredVms: registeredVms,
+                        discoveredVms: inventory,
+                        registeredVms: inventory,
                         storage: storage,
                         jobs: jobs,
                         runPage: runPage,
