@@ -21,6 +21,17 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+
+@dataclass(frozen=True)
+class DiscoveredVM:
+    """Runtime VM inventory entry discovered from hypervisor."""
+
+    external_id: str
+    name: str
+    uuid: str
+    state: str
+
+
 class FailureClass(StrEnum):
     NONE = "NONE"
     TRANSACTION_RECOVERY = "TRANSACTION_RECOVERY"

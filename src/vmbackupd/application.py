@@ -1214,7 +1214,20 @@ class VmbackupApplication:
         )
 
     def vm_discover(self): return list(self.driver.discover_domains())
-    def vm_list(self): return [serialization.vm(x) for x in self.repository.list_vms(self.node.id)]
+    def vm_list(self):
+        from .models import DiscoveredVM
+
+        return [
+            serialization.vm_inventory(
+                DiscoveredVM(
+                    external_id=item["external_id"],
+                    name=item["name"],
+                    uuid=item["uuid"],
+                    state=item["state"],
+                )
+            )
+            for item in self.driver.discover_domains()
+        ]
     def vm_show(self, id):
         value = self.repository.get_vm(id)
         self._require_local_vm(value)

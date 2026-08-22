@@ -9,6 +9,19 @@ def node(value: Node) -> dict:
     return {"id": value.id, "name": value.name, "created_at": value.created_at.isoformat()}
 
 
+def vm_inventory(value) -> dict:
+    """Serialize runtime VM discovered from libvirt."""
+
+    return {
+        "external_id": value.external_id,
+        "name": value.name,
+        "uuid": value.uuid,
+        "state": value.state,
+    }
+
+
+
+
 def vm(value: VM) -> dict:
     return {"id": value.id, "node_id": value.node_id, "name": value.name,
             "external_id": value.external_id, "libvirt_domain_uuid": value.libvirt_domain_uuid,
