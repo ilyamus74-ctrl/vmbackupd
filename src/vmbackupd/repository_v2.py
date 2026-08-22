@@ -615,8 +615,15 @@ class RepositoryV2:
 
     def storage_destination_identity_locked(
         self,
-        storage_id,
+        node_id=None,
+        storage_id=None,
     ):
+        # Compatibility with Repository V1 API:
+        # application passes (node_id, storage_id).
+        # Older internal callers may pass only storage_id.
+        if storage_id is None:
+            storage_id = node_id
+
         return False
 
 
