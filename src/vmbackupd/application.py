@@ -81,7 +81,9 @@ class VmbackupApplication:
             "receiver.key.list": self.receiver_key_list,
             "receiver.key.add": self.receiver_key_add,
             "receiver.key.revoke": self.receiver_key_revoke,
-            "vm.discover": self.vm_discover, "vm.list": self.vm_list,
+            "vm.discover": self.vm_discover,
+            "vm.inventory": self.vm_inventory,
+ "vm.inventory": self.vm_inventory, "vm.list": self.vm_list,
             "vm.show": self.vm_show, "vm.register": self.vm_register,
             "job.list": self.job_list, "job.show": self.job_show,
             "job.create": self.job_create, "job.update": self.job_update,
@@ -1213,7 +1215,27 @@ class VmbackupApplication:
             fingerprint
         )
 
-    def vm_discover(self): return list(self.driver.discover_domains())
+    def vm_discover(self): 
+        return list(self.driver.discover_domains())
+
+    def vm_inventory(self):
+        from .models import DiscoveredVM
+
+        return [
+            serialization.vm_inventory(
+                DiscoveredVM(
+                    external_id=item["external_id"],
+                    name=item["name"],
+                    uuid=item["uuid"],
+                    state=item["state"],
+                )
+            )
+            for item in self.driver.discover_domains()
+        ]
+
+    def vm_inventory(self):
+        return self.vm_list()
+
     def vm_list(self):
         from .models import DiscoveredVM
 
