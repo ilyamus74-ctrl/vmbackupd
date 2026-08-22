@@ -1,5 +1,10 @@
 (function () {
     "use strict";
+
+    let recentRunFilter = "ALL";
+    let recentRunPage = 0;
+    const RECENT_RUN_LIMIT = 5;
+
     window.VmbackupViews = {
         renderModel(model) {
                         renderSummary(model);
@@ -20,10 +25,6 @@
     };
 
 
-    console.log(
-        "VIEWS READY",
-        window.VmbackupViews
-    );
 
 })();
 
@@ -117,6 +118,65 @@
         const mutation = document.getElementById("mutation-state");
         mutation.textContent = model.status.libvirt_mutation_enabled ? "Mutation enabled" : "Mutation disabled";
         mutation.className = `badge ${model.status.libvirt_mutation_enabled ? "status-warning" : "status-neutral"}`;
+    }
+
+
+    function statusLabel(run) {
+        return run.state || run.status || "UNKNOWN";
+    }
+
+
+    function statusClass(run) {
+        const state = statusLabel(run).toLowerCase();
+
+        if (state === "success" || state === "completed")
+            return "status-success";
+
+        if (
+            state === "failed" ||
+            state === "error"
+        )
+            return "status-failed";
+
+        return "status-neutral";
+    }
+
+
+    function runDuration(run, now) {
+        if (!run.started_at || !run.finished_at)
+            return "—";
+
+        const seconds =
+            Math.max(
+                0,
+                Math.floor(
+                    (new Date(run.finished_at) -
+                     new Date(run.started_at)) / 1000
+                )
+            );
+
+        return `${seconds}s`;
+    }
+
+
+    function runError(run) {
+        return run.error ||
+               run.failure_reason ||
+               "—";
+    }
+
+
+    function localTimestamp(value) {
+        if (!value)
+            return "—";
+
+        return new Date(value).toLocaleString();
+    }
+
+
+    function vmName(map, id) {
+        const vm = map.get(id);
+        return vm ? vm.name : id;
     }
 
 
