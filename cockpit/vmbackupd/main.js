@@ -34,6 +34,21 @@
             model
         );
 
+        console.log(
+            "MODEL KEYS",
+            Object.keys(model)
+        );
+
+        console.log(
+            "MODEL VALUES",
+            {
+                successfulToday: model.successfulToday,
+                failedToday: model.failedToday,
+                active: model.active,
+                recoveryRequired: model.recoveryRequired,
+            }
+        );
+
         VmbackupViews.renderModel(model);
     }
 
