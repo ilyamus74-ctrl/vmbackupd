@@ -582,24 +582,6 @@ class RepositoryV2:
 
         return result
 
-    def list_storage_destinations(self, node_id=None):
-        if node_id:
-            return self.connection.execute(
-                """
-                SELECT *
-                FROM storage_destinations
-                WHERE node_id=?
-                """,
-                (node_id,),
-            ).fetchall()
-
-        return self.connection.execute(
-            """
-            SELECT *
-            FROM storage_destinations
-            """
-        ).fetchall()
-
 
     def update_storage_destination(
         self,
