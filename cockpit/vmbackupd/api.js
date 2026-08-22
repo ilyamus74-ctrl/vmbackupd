@@ -11,6 +11,8 @@
         "vm.inventory",
         "vm.registered.list",
         "vm.list",
+        "vm.inventory",
+        "vm.registered.list",
         "storage.list",
         "storage.create",
         "storage.update",
