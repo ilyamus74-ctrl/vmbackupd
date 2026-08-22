@@ -2741,14 +2741,26 @@
                     },
                     new Date(),
                 );
-
+console.log(
+    "MODEL CREATED",
+    model,
+    {
+        discoveredVms: model.discoveredVms,
+        registeredVms: model.registeredVms,
+        jobs: model.jobs,
+        storage: model.storage,
+        runs: model.runs,
+    }
+);
                 console.log(
                     "VM MODEL DISCOVERED",
                     model.discoveredVms,
                 );
 
-                renderModel(model);
-
+//                renderModel(model);
+console.log("CALL renderModel");
+renderModel(model);
+console.log("renderModel FINISHED");
                 if (
                     status.runtime_state === "RUNNING"
                 ) {
