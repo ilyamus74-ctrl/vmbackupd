@@ -358,7 +358,7 @@ class RepositoryV2:
                 {
                     "id": r[0],
                     "name": r[1],
-                    "created_at": r[2],
+                    "created_at": datetime.fromisoformat(r[2]),
                 },
             )()
             for r in rows
