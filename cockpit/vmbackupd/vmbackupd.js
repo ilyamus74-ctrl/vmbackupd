@@ -2196,6 +2196,11 @@
     }
 
     function renderDiscoveredVms(model) {
+        console.log(
+            "RENDER DISCOVERED VMS",
+            model.discoveredVms,
+        );
+
         const rows = model.discoveredVms.map(vm => tableRow([
             vm.name, vm.external_id, [vm.uuid, "identifier-cell"], badge(vm.state, "status-neutral"),
         ]));
