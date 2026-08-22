@@ -98,7 +98,6 @@
             const channel = global.cockpit.channel({
                 payload: "stream",
                 unix: SOCKET_PATH,
-                superuser: "require",
             });
             let buffer = "";
             let trailing = "";
