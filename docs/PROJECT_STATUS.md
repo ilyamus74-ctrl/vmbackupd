@@ -83,6 +83,27 @@ Closing commit:
 
 Implemented live refresh of active backup state in Cockpit.
 
+### Cockpit frontend controller split recovery
+
+Fixed frontend loading and rendering path after separation of the legacy
+vmbackupd.js controller into independent layers:
+
+- api.js handles RPC access
+- model.js builds UI model from daemon data
+- views.js renders UI sections
+- main.js coordinates initial loading
+
+Resolved issue:
+- System details renderer was present but unreachable because old
+  vmbackupd.js state dependencies remained in views layer.
+- Disabled legacy recent-runs renderer until its UI state
+  (recentRunFilter and pagination state) is migrated into the new view layer.
+
+Validated:
+- daemon.status RPC loading
+- model generation
+- views.js renderModel execution
+- System details renderingx
 ---
 
 ## Managed local storage lifecycle (R1)

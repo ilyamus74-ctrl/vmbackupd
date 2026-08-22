@@ -269,28 +269,6 @@
         return vm ? vm.name : `Unknown VM (${text(vmId)})`;
     }
 
-    function deriveModel(dataset, now) {
-        const vmById = indexById(dataset.registeredVms);
-        const jobById = indexById(dataset.jobs);
-        const storageById = indexById(dataset.storage);
-        const runPage = dataset.runPage;
-        const summary = runPage && runPage.summary ? runPage.summary : {};
-
-        return {
-            ...dataset,
-            runs: Array.isArray(runPage && runPage.items) ?
-                runPage.items : [],
-            now: now,
-            vmById: vmById,
-            jobById: jobById,
-            storageById: storageById,
-            successfulToday: Number(summary.successful_today || 0),
-            failedToday: Number(summary.failed_today || 0),
-            active: Number(summary.active || 0),
-            recoveryRequired: Number(summary.recovery_required || 0),
-        };
-    }
-
     function renderSummary(model) {
         document.getElementById("successful-today").textContent = String(model.successfulToday);
         document.getElementById("failed-today").textContent = String(model.failedToday);
@@ -2211,200 +2189,7 @@
         replaceRows("vms", rows, 4, "No libvirt virtual machines discovered");
     }
 
-    function renderSystemDetails(status) {
-        const details = document.getElementById("system-details");
-        const values = [
-            ["Version", status.version],
-            ["Node", status.node_name],
-            ["Node ID", status.node_id],
-            ["Daemon instance", status.daemon_instance_id],
-            ["Controller owned", status.controller_owned ? "Yes" : "No"],
-            ["Database schema", status.database_schema_version],
-            ["Libvirt URI", status.libvirt_uri],
-            ["Mutation", status.libvirt_mutation_enabled ? "Mutation enabled" : "Mutation disabled"],
-        ];
-        const nodes = [];
-        for (const [label, value] of values) {
-            nodes.push(element("dt", label));
-            nodes.push(element("dd", value));
-        }
-        details.replaceChildren(...nodes);
-    }
 
-    function renderModel(model) {
-        currentModel = model;
-        renderSummary(model);
-        renderRecentRuns(model);
-        renderJobs(model);
-        renderStorage(model);
-        renderDiscoveredVms(model);
-        renderSystemDetails(model.status);
-        void refreshReceiverSourcesSummary();
-    }
-
-    function populateJobOptions(editingJob) {
-        const vmSelect = document.getElementById("job-vm");
-        const storageSelect = document.getElementById("job-storage");
-        const replicaContainer = document.getElementById("job-replicas");
-
-        const registeredByUuid = new Map(currentModel.registeredVms
-            .filter(vm => vm.libvirt_domain_uuid)
-            .map(vm => [vm.libvirt_domain_uuid, vm]));
-
-        const options = [];
-
-        for (const vm of currentModel.registeredVms)
-            options.push({
-                value: `registered:${vm.id}`,
-                label: vm.name,
-                registered: true,
-            });
-
-        currentModel.discoveredVms.forEach((vm, index) => {
-            if (!registeredByUuid.has(vm.uuid))
-                options.push({
-                    value: `discovered:${index}`,
-                    label: `${vm.name} (will register)`,
-                    registered: false,
-                });
-        });
-
-        vmSelect.replaceChildren(...options.map(item => {
-            const option = element("option", item.label);
-            option.value = item.value;
-            return option;
-        }));
-
-        const primaryDestinations = currentModel.storage.filter(
-            destination => storageType(destination) !== "SSH"
-        );
-
-        storageSelect.replaceChildren(
-            ...primaryDestinations.map(destination => {
-                const option = element(
-                    "option",
-                    destination.name,
-                );
-                option.value = destination.id;
-                return option;
-            })
-        );
-
-        const selectedReplicas = new Set(
-            editingJob &&
-            Array.isArray(editingJob.replica_destination_ids) ?
-                editingJob.replica_destination_ids :
-                []
-        );
-
-        replicaContainer.replaceChildren(
-            ...currentModel.storage.map(destination => {
-                const label = document.createElement("label");
-                label.className = "replica-option";
-
-                const checkbox = document.createElement("input");
-                checkbox.type = "checkbox";
-                checkbox.value = destination.id;
-                checkbox.checked = selectedReplicas.has(
-                    destination.id
-                );
-
-                const description = document.createElement("span");
-                description.textContent =
-                    storageType(destination) === "SSH" ?
-                        `${destination.name} (SSH)` :
-                        `${destination.name} (Local)`;
-
-                label.append(
-                    checkbox,
-                    description,
-                );
-
-                return label;
-            })
-        );
-
-        if (editingJob) {
-            vmSelect.value =
-                `registered:${editingJob.vm_id}`;
-            storageSelect.value =
-                editingJob.storage_destination_id;
-        }
-
-        vmSelect.disabled = Boolean(editingJob);
-
-        updateJobReplicaOptions();
-        updateRegistrationNote();
-    }
-
-    function updateJobReplicaOptions() {
-        const primaryId =
-            document.getElementById("job-storage").value;
-
-        for (const checkbox of document.querySelectorAll(
-            '#job-replicas input[type="checkbox"]'
-        )) {
-            const matchesPrimary =
-                checkbox.value === primaryId;
-
-            checkbox.disabled = matchesPrimary;
-
-            if (matchesPrimary)
-                checkbox.checked = false;
-        }
-    }
-
-    function selectedJobReplicaIds() {
-        return [
-            ...document.querySelectorAll(
-                '#job-replicas input[type="checkbox"]:checked'
-            ),
-        ].map(checkbox => checkbox.value);
-    }
-
-    function updateRegistrationNote() {
-        document.getElementById("registration-note").hidden =
-            !document.getElementById("job-vm").value.startsWith("discovered:");
-    }
-
-    function openJobDialog(job = null) {
-        editingJobId = job ? job.id : null;
-        document.getElementById("job-dialog-title").textContent = job ? "Edit backup job" : "Add backup job";
-        populateJobOptions(job);
-        document.getElementById("job-name").value = job ? job.name : "";
-        document.getElementById("job-enabled").checked = job ? job.enabled : true;
-        document.getElementById("job-retain").value =
-            job ? job.restore_points_to_retain : 7;
-        document.getElementById("job-retain-field").hidden = !(
-            job && Number(job.max_incrementals_per_chain || 0) > 0
-        );
-        document.getElementById("job-full-chains").value =
-            job ? job.full_chains_to_retain : 2;
-        document.getElementById("job-minimum-chains").value =
-            job ? job.minimum_full_chains : 1;
-        document.getElementById("job-reclaim-mode").value =
-            job ? job.space_reclaim_mode : "SAFE";
-        document.getElementById("job-schedule").value = jobScheduleMode(job);
-
-        const interval = intervalParts(job ? job.interval_seconds : 3600);
-        document.getElementById("job-interval").value = interval.amount;
-        document.getElementById("job-interval-unit").value = String(interval.unit);
-
-        document.getElementById("job-daily-time").value =
-            job && job.daily_time ? job.daily_time : "01:00";
-        document.getElementById("job-schedule-timezone").value =
-            job && job.schedule_timezone ?
-                job.schedule_timezone : browserTimezone();
-
-        const nextRun = document.getElementById("job-next-run");
-        nextRun.hidden = !(job && job.next_run_at);
-        nextRun.textContent = job && job.next_run_at ?
-            `Current next run: ${localTimestamp(job.next_run_at)}. Recalculated after save.` : "";
-
-        updateScheduleFields();
-        document.getElementById("job-form-error").textContent = "";
-        jobDialog.showModal();
-    }
 
     async function updateJob(id, params) {
         try {
@@ -2718,7 +2503,6 @@
                 );
 
                 console.log(
-                    "DATASET TYPES",
                     {
                         inventory: Array.isArray(inventory),
                         registeredVms: Array.isArray(registeredVms),
@@ -2740,7 +2524,7 @@ console.log(
         recovery: Array.isArray(recovery),
     }
 );
-                const model = deriveModel(
+                const model = VmbackupModel.deriveModel(
                     {
                         status: status,
                         discoveredVms: inventory,
@@ -2754,7 +2538,6 @@ console.log(
                 );
                 console.log("AFTER DERIVE");
 console.log(
-    "MODEL CREATED",
     model,
     {
         discoveredVms: model.discoveredVms,
@@ -2771,7 +2554,6 @@ console.log(
 
 //                try {
                     console.log(
-                        "BEFORE RENDER MODEL",
                         {
                             modelType: typeof model,
                             hasModel: Boolean(model),
@@ -2783,17 +2565,23 @@ console.log(
                         },
                     );
 
-                    renderModel(model);
-
                     console.log(
-                        "AFTER RENDER MODEL",
+                        "CALL VmbackupViews.renderModel",
+                        {
+                            model,
+                            hasView: Boolean(window.VmbackupViews),
+                        },
                     );
 
-                    renderModel(model);
+                    VmbackupViews.renderModel(model);
+
+
+                    console.log("AFTER RENDER MODEL");
 
                     console.log(
-                        "AFTER RENDER MODEL",
                     );
+
+                    console.log("AFTER RENDER MODEL");
                 if (
                     status.runtime_state === "RUNNING"
                 ) {
@@ -2868,8 +2656,179 @@ console.log(
         }
     });
 
+
+
+    function updateJobReplicaOptions() {
+        const primaryId =
+            document.getElementById("job-storage").value;
+
+        for (const checkbox of document.querySelectorAll(
+            '#job-replicas input[type="checkbox"]'
+        )) {
+            const matchesPrimary =
+                checkbox.value === primaryId;
+
+            checkbox.disabled = matchesPrimary;
+
+            if (matchesPrimary)
+                checkbox.checked = false;
+        }
+    }
+
+
+
+
+    function populateJobOptions(editingJob) {
+        const vmSelect = document.getElementById("job-vm");
+        const storageSelect = document.getElementById("job-storage");
+        const replicaContainer = document.getElementById("job-replicas");
+
+        const registeredByUuid = new Map(currentModel.registeredVms
+            .filter(vm => vm.libvirt_domain_uuid)
+            .map(vm => [vm.libvirt_domain_uuid, vm]));
+
+        const options = [];
+
+        for (const vm of currentModel.registeredVms)
+            options.push({
+                value: `registered:${vm.id}`,
+                label: vm.name,
+                registered: true,
+            });
+
+        currentModel.discoveredVms.forEach((vm, index) => {
+            if (!registeredByUuid.has(vm.uuid))
+                options.push({
+                    value: `discovered:${index}`,
+                    label: `${vm.name} (will register)`,
+                    registered: false,
+                });
+        });
+
+        vmSelect.replaceChildren(...options.map(item => {
+            const option = element("option", item.label);
+            option.value = item.value;
+            return option;
+        }));
+
+        const primaryDestinations = currentModel.storage.filter(
+            destination => storageType(destination) !== "SSH"
+        );
+
+        storageSelect.replaceChildren(
+            ...primaryDestinations.map(destination => {
+                const option = element(
+                    "option",
+                    destination.name,
+                );
+                option.value = destination.id;
+                return option;
+            })
+        );
+
+        const selectedReplicas = new Set(
+            editingJob &&
+            Array.isArray(editingJob.replica_destination_ids) ?
+                editingJob.replica_destination_ids :
+                []
+        );
+
+        replicaContainer.replaceChildren(
+            ...currentModel.storage.map(destination => {
+                const label = document.createElement("label");
+                label.className = "replica-option";
+
+                const checkbox = document.createElement("input");
+                checkbox.type = "checkbox";
+                checkbox.value = destination.id;
+                checkbox.checked = selectedReplicas.has(
+                    destination.id
+                );
+
+                const description = document.createElement("span");
+                description.textContent =
+                    storageType(destination) === "SSH" ?
+                        `${destination.name} (SSH)` :
+                        `${destination.name} (Local)`;
+
+                label.append(
+                    checkbox,
+                    description,
+                );
+
+                return label;
+            })
+        );
+
+        if (editingJob) {
+            vmSelect.value =
+                `registered:${editingJob.vm_id}`;
+            storageSelect.value =
+                editingJob.storage_destination_id;
+        }
+
+        vmSelect.disabled = Boolean(editingJob);
+
+        updateJobReplicaOptions();
+        updateRegistrationNote();
+    }
+
+
+    function selectedJobReplicaIds() {
+        return [
+            ...document.querySelectorAll(
+                '#job-replicas input[type="checkbox"]:checked'
+            ),
+        ].map(checkbox => checkbox.value);
+    }
+
+
+    function updateRegistrationNote() {
+        document.getElementById("registration-note").hidden =
+            !document.getElementById("job-vm").value.startsWith("discovered:");
+    }
+
+    function openJobDialog(job = null) {
+        editingJobId = job ? job.id : null;
+        document.getElementById("job-dialog-title").textContent = job ? "Edit backup job" : "Add backup job";
+        populateJobOptions(job);
+        document.getElementById("job-name").value = job ? job.name : "";
+        document.getElementById("job-enabled").checked = job ? job.enabled : true;
+        document.getElementById("job-retain").value =
+            job ? job.restore_points_to_retain : 7;
+        document.getElementById("job-retain-field").hidden = !(
+            job && Number(job.max_incrementals_per_chain || 0) > 0
+        );
+        document.getElementById("job-full-chains").value =
+            job ? job.full_chains_to_retain : 2;
+        document.getElementById("job-minimum-chains").value =
+            job ? job.minimum_full_chains : 1;
+        document.getElementById("job-reclaim-mode").value =
+            job ? job.space_reclaim_mode : "SAFE";
+        document.getElementById("job-schedule").value = jobScheduleMode(job);
+
+        const interval = intervalParts(job ? job.interval_seconds : 3600);
+        document.getElementById("job-interval").value = interval.amount;
+        document.getElementById("job-interval-unit").value = String(interval.unit);
+
+        document.getElementById("job-daily-time").value =
+            job && job.daily_time ? job.daily_time : "01:00";
+        document.getElementById("job-schedule-timezone").value =
+            job && job.schedule_timezone ?
+                job.schedule_timezone : browserTimezone();
+
+        const nextRun = document.getElementById("job-next-run");
+        nextRun.hidden = !(job && job.next_run_at);
+        nextRun.textContent = job && job.next_run_at ?
+            `Current next run: ${localTimestamp(job.next_run_at)}. Recalculated after save.` : "";
+
+        updateScheduleFields();
+        document.getElementById("job-form-error").textContent = "";
+        jobDialog.showModal();
+    }
     refreshButton.addEventListener("click", refresh);
-    addJobButton.addEventListener("click", () => openJobDialog());
+
+addJobButton.addEventListener("click", () => openJobDialog());
     addStorageButton.addEventListener("click", () => openStorageDialog());
     document.getElementById("job-cancel").addEventListener("click", () => jobDialog.close());
     document.getElementById("job-vm").addEventListener("change", updateRegistrationNote);
