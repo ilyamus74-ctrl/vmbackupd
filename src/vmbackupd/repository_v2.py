@@ -352,11 +352,15 @@ class RepositoryV2:
         ).fetchall()
 
         return [
-            {
-                "id": r[0],
-                "name": r[1],
-                "created_at": r[2],
-            }
+            type(
+                "NodeRecord",
+                (),
+                {
+                    "id": r[0],
+                    "name": r[1],
+                    "created_at": r[2],
+                },
+            )()
             for r in rows
         ]
 
