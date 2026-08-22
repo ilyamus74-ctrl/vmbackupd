@@ -83,8 +83,9 @@ class VmbackupApplication:
             "receiver.key.revoke": self.receiver_key_revoke,
             "vm.discover": self.vm_discover,
             "vm.inventory": self.vm_inventory,
- "vm.inventory": self.vm_inventory, "vm.list": self.vm_list,
-            "vm.show": self.vm_show, "vm.register": self.vm_register,
+            "vm.registered.list": self.vm_registered_list,
+            "vm.show": self.vm_show,
+            "vm.register": self.vm_register,
             "job.list": self.job_list, "job.show": self.job_show,
             "job.create": self.job_create, "job.update": self.job_update,
             "backup.run": self.backup_run,
@@ -1233,38 +1234,38 @@ class VmbackupApplication:
             for item in self.driver.discover_domains()
         ]
 
-    def vm_inventory(self):
-        return self.vm_list()
 
-    def vm_list(self):
-        from .models import DiscoveredVM
-
+    def vm_registered_list(self):
         return [
-            serialization.vm_inventory(
-                DiscoveredVM(
-                    external_id=item["external_id"],
-                    name=item["name"],
-                    uuid=item["uuid"],
-                    state=item["state"],
-                )
-            )
-            for item in self.driver.discover_domains()
+            serialization.vm(x)
+            for x in self.repository.list_vms(self.node.id)
         ]
+
+
     def vm_show(self, id):
         value = self.repository.get_vm(id)
         self._require_local_vm(value)
         return serialization.vm(value)
+
 
     def vm_register(self, external_id, name=None):
         domain_uuid = self.driver.domain_uuid(external_id)
         xml = self.driver.domain_xml(external_id)
         xml_uuid = ET.fromstring(xml).findtext("uuid")
         if not xml_uuid or xml_uuid != domain_uuid:
-            raise ApplicationError("DOMAIN_IDENTITY_INVALID", "domain XML UUID does not match")
+            raise ApplicationError(
+                "DOMAIN_IDENTITY_INVALID",
+                "domain XML UUID does not match",
+            )
         domain_name = ET.fromstring(xml).findtext("name") or external_id
-        value = self.repository.register_vm(self.node.id, external_id, name or domain_name,
-                                            domain_uuid)
+        value = self.repository.register_vm(
+            self.node.id,
+            external_id,
+            name or domain_name,
+            domain_uuid,
+        )
         return serialization.vm(value)
+
 
     def _serialize_job(self, value):
         result = serialization.job(value)
