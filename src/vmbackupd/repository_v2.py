@@ -1760,6 +1760,7 @@ class RepositoryV2:
     def run_summary_for_node(
         self,
         node_id,
+        summary_since=None,
         **kwargs,
     ):
         return self.connection.execute(
