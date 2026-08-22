@@ -2680,10 +2680,34 @@
                     debugRequest("vm.inventory", api.request("vm.inventory")),
                     debugRequest("vm.registered.list", api.request("vm.registered.list")),
                     debugRequest("storage.list", api.request("storage.list")),
-                    api.request(
-                        "job.list",
-                        { overview: true },
-                    ),
+                    //api.request(
+                    //    "job.list",
+                    //    { overview: true },
+                    //),
+                    (async () => {
+    try {
+        const result = await api.request(
+            "job.list",
+            { overview: true },
+        );
+
+        console.log(
+            "RPC OK job.list",
+            result,
+            "TYPE",
+            typeof result,
+            Array.isArray(result),
+        );
+
+        return result;
+    } catch (error) {
+        console.error(
+            "RPC FAIL job.list",
+            error,
+        );
+        throw error;
+    }
+})(),
                     requestRecentRunPage(),
                     debugRequest("recovery.list", api.request("recovery.list")),
                 ]);
