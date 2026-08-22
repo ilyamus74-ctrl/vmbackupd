@@ -2693,6 +2693,18 @@
                     inventory,
                 );
 
+                console.log(
+                    "DATASET TYPES",
+                    {
+                        inventory: Array.isArray(inventory),
+                        registeredVms: Array.isArray(registeredVms),
+                        storage: Array.isArray(storage),
+                        jobs: Array.isArray(jobs),
+                        jobsValue: jobs,
+                        recovery: Array.isArray(recovery),
+                    },
+                );
+
                 const model = deriveModel(
                     {
                         status: status,
