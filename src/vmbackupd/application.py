@@ -1676,6 +1676,19 @@ class VmbackupApplication:
             )
 
         try:
+            import logging
+
+            logging.error(
+                "DEBUG RUN LIST REPOSITORY %s %r",
+                type(self.repository),
+                self.repository,
+            )
+
+            logging.error(
+                "DEBUG RUN LIST METHOD %r",
+                self.repository.list_runs_page_for_node,
+            )
+
             values, total = self.repository.list_runs_page_for_node(
                 self.node.id,
                 limit=limit,

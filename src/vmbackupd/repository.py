@@ -25,8 +25,11 @@ class SQLiteRepository:
 
     def __init__(
         self,
-        database_path,
+        database_path=None,
     ):
+
+        if database_path is None:
+            database_path = ":memory:"
 
         self.connection = sqlite3.connect(
             database_path

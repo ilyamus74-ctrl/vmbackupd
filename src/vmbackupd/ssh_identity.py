@@ -273,6 +273,29 @@ class SSHIdentityManager:
             "fingerprint": pair["fingerprint"],
         }
 
+    def _ensure_owned_by_process(
+        self,
+        path: Path,
+    ) -> None:
+        info = self._lstat(path)
+
+        if info is None:
+            raise SSHIdentityError(
+                "SSH_IDENTITY_STORAGE_ERROR",
+                f"identity path missing: {path}",
+            )
+
+        if (
+            info.st_uid != os.getuid()
+            or info.st_gid != os.getgid()
+        ):
+            raise SSHIdentityError(
+                "SSH_IDENTITY_OWNER_INVALID",
+                f"identity path ownership mismatch: {path}",
+            )
+
+
+
     def _generate_pair(
         self,
         directory: Path,
@@ -358,6 +381,10 @@ class SSHIdentityManager:
         try:
             self._generate_pair(temporary, destination_id)
 
+            self._ensure_owned_by_process(
+                temporary
+            )
+
             if self._lstat(directory) is not None:
                 raise SSHIdentityError(
                     "SSH_IDENTITY_EXISTS",
@@ -365,6 +392,11 @@ class SSHIdentityManager:
                 )
 
             os.rename(temporary, directory)
+
+            self._ensure_owned_by_process(
+                directory
+            )
+
             moved = True
             self._fsync_directory(self.identities_root)
         except SSHIdentityError:
@@ -399,6 +431,10 @@ class SSHIdentityManager:
                 prefix=".rotate-new-",
                 dir=self.identities_root,
             )
+        )
+
+        self._ensure_owned_by_process(
+            temporary
         )
         backup = Path(
             tempfile.mkdtemp(

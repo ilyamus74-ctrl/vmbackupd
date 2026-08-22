@@ -3,6 +3,29 @@
 
     console.log("MAIN CONTROLLER START");
 
+
+    async function safeRequest(method, params) {
+        try {
+            const result =
+                await VmbackupApi.request(
+                    method,
+                    params
+                );
+
+            console.log("RPC OK", method, result);
+            return result;
+
+        } catch (e) {
+            console.error(
+                "RPC FAILED",
+                method,
+                e
+            );
+
+            return [];
+        }
+    }
+
     async function start() {
         console.log("MAIN START");
 
@@ -16,15 +39,36 @@
             status
         );
 
+        const [
+            inventory,
+            registeredVms,
+            storage,
+            jobs,
+            runPage,
+            recovery
+        ] = await Promise.all([
+            safeRequest("vm.inventory"),
+            safeRequest("vm.registered.list"),
+            safeRequest("storage.list"),
+            safeRequest("job.list"),
+            safeRequest("run.list", {
+                limit: 5,
+                offset: 0
+            }),
+            safeRequest("recovery.list")
+        ]);
+
         const model =
             VmbackupModel.deriveModel(
                 {
                     status: status,
-                    discoveredVms: [],
-                    registeredVms: [],
-                    storage: [],
-                    jobs: [],
-                    recovery: []
+                    inventory: inventory,
+                    registeredVms: registeredVms,
+                    storage: storage,
+                    jobs: jobs,
+                    runs: runPage.runs || [],
+                    runPage: runPage,
+                    recovery: recovery
                 },
                 new Date()
             );

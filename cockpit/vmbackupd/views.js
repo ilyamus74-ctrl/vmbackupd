@@ -9,8 +9,11 @@
         renderModel(model) {
                         renderSummary(model);
 
-            // TEMP: disable broken recent runs renderer
-            // renderRecentRuns(model);
+            try {
+                renderRecentRuns(model);
+            } catch (e) {
+                console.error("RECENT RUNS FAILED", e);
+            }
 
             renderSystemDetails(model);
 
