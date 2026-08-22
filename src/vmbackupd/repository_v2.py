@@ -590,6 +590,18 @@ class RepositoryV2:
                             else False
                         ),
 
+                        "minimum_free_bytes": (
+                            row["minimum_free_bytes"]
+                            if "minimum_free_bytes" in row.keys()
+                            else 0
+                        ),
+
+                        "minimum_free_percent": (
+                            row["minimum_free_percent"]
+                            if "minimum_free_percent" in row.keys()
+                            else 0
+                        ),
+
                         "backup_data_root": config.get(
                             "backup_data_root",
                             "",
