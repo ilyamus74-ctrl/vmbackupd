@@ -797,10 +797,35 @@ class RepositoryV2:
         node_id,
         limit=50,
         offset=0,
+        result_filter="ALL",
         **kwargs,
     ):
-        return self.connection.execute(
-            """
+        where_result = ""
+
+        if result_filter == "SUCCESS":
+            where_result = "AND r.state IN ('SUCCESS','COMPLETED')"
+
+        elif result_filter == "FAILED":
+            where_result = "AND r.state='FAILED'"
+
+        total = self.connection.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM job_runs r
+            JOIN backup_jobs j
+              ON j.id=r.job_id
+            JOIN vms v
+              ON v.id=j.vm_id
+            WHERE v.node_id=?
+            {where_result}
+            """,
+            (
+                node_id,
+            ),
+        ).fetchone()[0]
+
+        rows = self.connection.execute(
+            f"""
             SELECT
                 r.*
             FROM job_runs r
@@ -809,6 +834,7 @@ class RepositoryV2:
             JOIN vms v
               ON v.id=j.vm_id
             WHERE v.node_id=?
+            {where_result}
             ORDER BY r.created_at DESC
             LIMIT ? OFFSET ?
             """,
@@ -818,6 +844,8 @@ class RepositoryV2:
                 offset,
             ),
         ).fetchall()
+
+        return rows, total
 
 
     def plan_run(
