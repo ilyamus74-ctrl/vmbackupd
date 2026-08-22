@@ -1616,7 +1616,7 @@ class RepositoryV2:
         node_id=None,
     ):
         if node_id is not None:
-            return self.connection.execute(
+            row = self.connection.execute(
                 """
                 SELECT *
                 FROM nodes
@@ -1624,14 +1624,31 @@ class RepositoryV2:
                 """,
                 (node_id,),
             ).fetchone()
+        else:
+            row = self.connection.execute(
+                """
+                SELECT *
+                FROM nodes
+                LIMIT 1
+                """
+            ).fetchone()
 
-        return self.connection.execute(
-            """
-            SELECT *
-            FROM nodes
-            LIMIT 1
-            """
-        ).fetchone()
+        if row is None:
+            return None
+
+        return type(
+            "ControllerRecord",
+            (),
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "daemon_instance_id": (
+                    row["daemon_instance_id"]
+                    if "daemon_instance_id" in row.keys()
+                    else None
+                ),
+            },
+        )()
 
 
     def assert_run_execution_owned(
