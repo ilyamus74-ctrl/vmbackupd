@@ -1,6 +1,10 @@
 (function () {
     "use strict";
-
+     console.log("VMBACKUP JS START");
+     console.log("VmbackupApi =", window.VmbackupApi);
+     console.log("SCRIPT URLS",
+         [...document.scripts].map(s => s.src)
+    );
     const api = window.VmbackupApi;
     const notice = document.getElementById("notice");
     const refreshButton = document.getElementById("refresh");
