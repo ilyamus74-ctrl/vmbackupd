@@ -1502,12 +1502,20 @@ class RepositoryV2:
         )
 
 
-
-
     def get_controller(
         self,
-        **kwargs,
+        node_id=None,
     ):
+        if node_id is not None:
+            return self.connection.execute(
+                """
+                SELECT *
+                FROM nodes
+                WHERE id=?
+                """,
+                (node_id,),
+            ).fetchone()
+
         return self.connection.execute(
             """
             SELECT *
