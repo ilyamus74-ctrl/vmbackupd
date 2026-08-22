@@ -2789,17 +2789,11 @@ console.log(
                         "AFTER RENDER MODEL",
                     );
 
-                } catch (error) {
-                    console.error(
-                        "RENDER MODEL FAILED",
-                        error,
-                        model,
+                    renderModel(model);
+
+                    console.log(
+                        "AFTER RENDER MODEL",
                     );
-                    throw error;
-                }
-console.log("CALL renderModel");
-renderModel(model);
-console.log("renderModel FINISHED");
                 if (
                     status.runtime_state === "RUNNING"
                 ) {
