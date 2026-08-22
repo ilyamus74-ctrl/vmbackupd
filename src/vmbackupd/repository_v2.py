@@ -27,6 +27,7 @@ class RepositoryV2:
 
     def __init__(self, connection):
         self.connection = connection
+        self.connection.row_factory = sqlite3.Row
 
     def add_node(self, name):
 
@@ -1941,10 +1942,6 @@ class RepositoryV2:
         self,
         operation_id,
     ):
-        self.connection.row_factory = __import__(
-            "sqlite3"
-        ).Row
-
         row = self.connection.execute(
             """
             SELECT *
@@ -1968,10 +1965,6 @@ class RepositoryV2:
         self,
         node_id,
     ):
-        self.connection.row_factory = __import__(
-            "sqlite3"
-        ).Row
-
         rows = self.connection.execute(
             """
             SELECT *
