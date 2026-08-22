@@ -2648,6 +2648,7 @@
                 const [
                     status,
                     inventory,
+                    registeredVms,
                     storage,
                     jobs,
                     runPage,
@@ -2655,6 +2656,7 @@
                 ] = await Promise.all([
                     api.request("daemon.status"),
                     api.request("vm.inventory"),
+                    api.request("vm.registered.list"),
                     api.request("storage.list"),
                     api.request(
                         "job.list",
@@ -2664,17 +2666,27 @@
                     api.request("recovery.list"),
                 ]);
 
+                console.log(
+                    "VM INVENTORY FROM RPC",
+                    inventory,
+                );
+
                 const model = deriveModel(
                     {
                         status: status,
                         discoveredVms: inventory,
-                        registeredVms: inventory,
+                        registeredVms: registeredVms,
                         storage: storage,
                         jobs: jobs,
                         runPage: runPage,
                         recovery: recovery,
                     },
                     new Date(),
+                );
+
+                console.log(
+                    "VM MODEL DISCOVERED",
+                    model.discoveredVms,
                 );
 
                 renderModel(model);
