@@ -495,7 +495,7 @@ class RepositoryV2:
 
 
         config = json.loads(
-            row[4] or "{}"
+            row["config_json"] or "{}"
         )
 
 
@@ -503,16 +503,37 @@ class RepositoryV2:
             "StorageDestinationRecord",
             (),
             {
-                "id": row[0],
-                "node_id": row[1],
-                "name": row[2],
+                "id": row["id"],
+                "node_id": row["node_id"],
+                "name": row["name"],
                 "storage_type": (
-                    StorageType(row[3])
-                    if not isinstance(row[3], StorageType)
-                    else row[3]
+                    StorageType(row["storage_type"])
+                    if not isinstance(row["storage_type"], StorageType)
+                    else row["storage_type"]
                 ),
                 "config": config,
-                "config_json": row[4],
+                "config_json": row["config_json"],
+                "is_default": bool(
+                    row["is_default"]
+                ) if "is_default" in row.keys() else False,
+
+                # совместимость со старым StorageDestination
+                "backup_data_root": config.get(
+                    "backup_data_root",
+                    "",
+                ),
+                "backup_data_mode": config.get(
+                    "backup_data_mode",
+                ),
+                "backup_data_uid": config.get(
+                    "backup_data_uid",
+                ),
+                "backup_data_gid": config.get(
+                    "backup_data_gid",
+                ),
+                "remote_storage_id": config.get(
+                    "remote_storage_id",
+                ),
             },
         )()
 
@@ -559,6 +580,7 @@ class RepositoryV2:
                         ),
                         "config": config,
                         "config_json": row[4],
+                        "is_default": bool(row[9]),
 
                         # совместимость со старым StorageDestination
                         "backup_data_root": config.get(
