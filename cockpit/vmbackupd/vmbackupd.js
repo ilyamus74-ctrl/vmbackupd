@@ -2654,6 +2654,19 @@
 
         const operation = (async () => {
             try {
+                console.log("REFRESH START");
+
+                const debugRequest = (name, promise) =>
+                    promise
+                        .then(value => {
+                            console.log("RPC OK", name, value);
+                            return value;
+                        })
+                        .catch(error => {
+                            console.error("RPC FAIL", name, error);
+                            throw error;
+                        });
+
                 const [
                     status,
                     inventory,
@@ -2663,16 +2676,16 @@
                     runPage,
                     recovery,
                 ] = await Promise.all([
-                    api.request("daemon.status"),
-                    api.request("vm.inventory"),
-                    api.request("vm.registered.list"),
-                    api.request("storage.list"),
+                    debugRequest("daemon.status", api.request("daemon.status")),
+                    debugRequest("vm.inventory", api.request("vm.inventory")),
+                    debugRequest("vm.registered.list", api.request("vm.registered.list")),
+                    debugRequest("storage.list", api.request("storage.list")),
                     api.request(
                         "job.list",
                         { overview: true },
                     ),
                     requestRecentRunPage(),
-                    api.request("recovery.list"),
+                    debugRequest("recovery.list", api.request("recovery.list")),
                 ]);
 
                 console.log(
