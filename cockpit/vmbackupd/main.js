@@ -108,6 +108,8 @@
         }
     }
 
+    VmbackupViews.configure({ refresh: start });
+
     start().catch(
         e => console.error(
             "MAIN FAILED",

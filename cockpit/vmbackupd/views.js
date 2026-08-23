@@ -18,9 +18,39 @@ function setNotice(message, kind) {
 (function () {
     "use strict";
 
+    const api = window.VmbackupApi;
+    const storageDialog = document.getElementById("storage-dialog");
+    const storageForm = document.getElementById("storage-form");
+    const storageDeleteButton = document.getElementById("storage-delete");
+    let currentModel = null;
+    let editingStorageId = null;
+    let refreshCallback = async () => {};
+
+
+    function failureMessage(error) {
+        if (error instanceof api.ProtocolError)
+            return `Malformed API response: ${error.message}`;
+        if (error instanceof api.ApiError)
+            return `API error ${error.code}: ${error.message}`;
+        if (error instanceof api.TransportError)
+            return `Cockpit administrative API channel failed: ${error.message}. Enable Administrative access and retry.`;
+        const detail = error && error.message ? `: ${error.message}` : "";
+        return `Unexpected frontend error${detail}`;
+    }
+
+
+    async function refresh() {
+        return refreshCallback();
+    }
+
 
     window.VmbackupViews = {
+        configure({ refresh: configuredRefresh }) {
+            if (typeof configuredRefresh === "function")
+                refreshCallback = configuredRefresh;
+        },
         renderModel(model) {
+            currentModel = model;
                         renderSummary(model);
 
             renderDiscoveredVms(model);
@@ -565,10 +595,6 @@ function setNotice(message, kind) {
             setNotice(failureMessage(error), "error");
         }
     }
-
-})();
-
-
 
     function actionButton(label, action, disabled, reason) {
         const button = document.createElement("button");
@@ -2291,3 +2317,27 @@ function setNotice(message, kind) {
             "recent-run-filter"
         ).value = recentRunFilter;
     }
+
+
+    document.getElementById("add-storage").addEventListener(
+        "click", () => openStorageDialog()
+    );
+    document.getElementById("storage-cancel").addEventListener(
+        "click", () => storageDialog.close()
+    );
+    document.getElementById("storage-test-candidate").addEventListener(
+        "click", testStorageCandidate
+    );
+    storageDeleteButton.addEventListener("click", deleteStorageDestination);
+    document.getElementById("storage-type").addEventListener(
+        "change", updateStorageTransportFields
+    );
+    storageForm.addEventListener("submit", saveStorage);
+
+    Object.assign(window.VmbackupViews, {
+        openStorageDialog,
+        renderStorage,
+        testStoredDestination,
+        failureMessage,
+    });
+})();
