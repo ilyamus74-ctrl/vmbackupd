@@ -50,6 +50,9 @@ class VmbackupApplication:
                  ssh_identity_manager=None, ssh_known_hosts_manager=None,
                  ssh_receiver_manager=None, reclaim_recover_handler=None) -> None:
         self.repository, self.runtime, self.driver = repository, runtime, driver
+        # Storage is the first migrated slice: bypass the facade's generic
+        # __getattr__ compatibility path and use the explicit NEW contract.
+        self.storage_repository = getattr(repository, "v2", repository)
         self.config, self.node, self.clock, self.version = config, node, clock, version
         self.storage_tester = storage_tester or LocalStorageTester()
         self.storage_preparer = storage_preparer
@@ -141,7 +144,7 @@ class VmbackupApplication:
     def daemon_status(self):
         controller = self.repository.get_controller(self.node.id)
         runs = self.repository.list_runs_for_node(self.node.id, nonterminal_only=True)
-        default = self.repository.get_default_storage_destination(self.node.id)
+        default = self.storage_repository.get_default_storage_destination(self.node.id)
         runtime_state = getattr(self.runtime, "runtime_state", "RUNNING")
         runtime_state = getattr(runtime_state, "value", runtime_state)
         return {"version": self.version, "node_id": self.node.id, "node_name": self.node.name,
@@ -224,7 +227,7 @@ class VmbackupApplication:
     def _serialize_storage(self, value):
         return serialization.storage(
             value, free_bytes=self._free(value),
-            identity_locked=self.repository.storage_destination_identity_locked(
+            identity_locked=self.storage_repository.storage_destination_identity_locked(
                 self.node.id, value.id
             ),
         )
@@ -237,12 +240,12 @@ class VmbackupApplication:
         )
         return [
             self._serialize_storage(value)
-            for value in self.repository.list_storage_destinations(self.node.id)
+            for value in self.storage_repository.list_storage_destinations(self.node.id)
             if value.id != system_identity_id
         ]
 
     def storage_show(self, id):
-        value = self.repository.get_storage_destination(self.node.id, id)
+        value = self.storage_repository.get_storage_destination(self.node.id, id)
         return self._serialize_storage(value)
 
     @staticmethod
@@ -317,10 +320,10 @@ class VmbackupApplication:
         return result
 
     def _seed_access_profile(self):
-        values = self.repository.list_storage_destinations(self.node.id)
+        values = self.storage_repository.list_storage_destinations(self.node.id)
         if values:
             try:
-                return self.repository.get_default_storage_destination(self.node.id)
+                return self.storage_repository.get_default_storage_destination(self.node.id)
             except DomainInvariantError:
                 return values[0]
         configured = next(
@@ -672,7 +675,7 @@ class VmbackupApplication:
                 remote_node_id=remote_node_id,
             )
 
-            created = self.repository.create_storage_destination(
+            created = self.storage_repository.create_storage_destination(
                 value,
                 make_default=make_default,
             )
@@ -698,7 +701,7 @@ class VmbackupApplication:
         if name is not None and (not isinstance(name, str) or not name.strip()):
             raise ApplicationError("INVALID_PARAMS", "storage name must not be empty")
 
-        current = self.repository.get_storage_destination(self.node.id, id)
+        current = self.storage_repository.get_storage_destination(self.node.id, id)
 
         if storage_type is not _UNSET:
             if not isinstance(storage_type, str):
@@ -821,7 +824,7 @@ class VmbackupApplication:
         if discovered_remote_node_id is not None:
             transport_patch["remote_node_id"] = discovered_remote_node_id
 
-        value = self.repository.update_storage_destination(
+        value = self.storage_repository.update_storage_destination(
             self.node.id,
             id,
             name=None if name is None else name.strip(),
@@ -838,7 +841,7 @@ class VmbackupApplication:
         return self._serialize_storage(value)
 
     def storage_delete(self, id):
-        destination = self.repository.get_storage_destination(
+        destination = self.storage_repository.get_storage_destination(
             self.node.id,
             id,
         )
@@ -849,7 +852,7 @@ class VmbackupApplication:
                 "system-managed SSH identity destination cannot be deleted",
             )
 
-        removed = self.repository.delete_storage_destination(
+        removed = self.storage_repository.delete_storage_destination(
             self.node.id,
             id,
         )
@@ -864,7 +867,7 @@ class VmbackupApplication:
 
     def storage_set_default(self, id):
         return self._serialize_storage(
-            self.repository.set_default_storage_destination(self.node.id, id)
+            self.storage_repository.set_default_storage_destination(self.node.id, id)
         )
 
     def storage_test(self, id=None, backup_data_root=_UNSET,
@@ -874,7 +877,7 @@ class VmbackupApplication:
                 backup_data_root, minimum_free_bytes, minimum_free_percent,
             )):
                 raise ApplicationError("INVALID_PARAMS", "test by ID or candidate, not both")
-            value = self.repository.get_storage_destination(self.node.id, id)
+            value = self.storage_repository.get_storage_destination(self.node.id, id)
             if value.storage_type is StorageType.SSH:
                 if value.remote_storage_id is not None:
                     discovery = self.ssh_storage_discover(
@@ -1005,7 +1008,7 @@ class VmbackupApplication:
             )
 
         if destination_id is not None:
-            destination = self.repository.get_storage_destination(
+            destination = self.storage_repository.get_storage_destination(
                 self.node.id,
                 destination_id,
             )
@@ -1072,7 +1075,7 @@ class VmbackupApplication:
         )
 
     def _require_ssh_hostkey_destination(self, destination_id):
-        destination = self.repository.get_storage_destination(
+        destination = self.storage_repository.get_storage_destination(
             self.node.id, destination_id
         )
         if destination.storage_type is not StorageType.SSH:
@@ -1399,13 +1402,13 @@ class VmbackupApplication:
         if storage_destination_id and storage_destination:
             raise ApplicationError("INVALID_PARAMS", "select destination by ID or name, not both")
         if storage_destination_id:
-            destination = self.repository.get_storage_destination(self.node.id, storage_destination_id)
+            destination = self.storage_repository.get_storage_destination(self.node.id, storage_destination_id)
         elif storage_destination:
-            destination = self.repository.get_storage_destination_by_name(self.node.id, storage_destination)
+            destination = self.storage_repository.get_storage_destination_by_name(self.node.id, storage_destination)
             if destination is None:
                 raise ApplicationError("NOT_FOUND", "storage destination not found")
         else:
-            destination = self.repository.get_default_storage_destination(self.node.id)
+            destination = self.storage_repository.get_default_storage_destination(self.node.id)
 
         if destination.storage_type is StorageType.SSH:
             raise ApplicationError(
@@ -1478,7 +1481,7 @@ class VmbackupApplication:
             raise ApplicationError("INVALID_PARAMS", "select destination by ID or name, not both")
 
         if storage_destination_id:
-            candidate = self.repository.get_storage_destination(
+            candidate = self.storage_repository.get_storage_destination(
                 self.node.id, storage_destination_id
             )
             if candidate.storage_type is StorageType.SSH:
@@ -1488,7 +1491,7 @@ class VmbackupApplication:
                     "backup destination",
                 )
         elif storage_destination:
-            candidate = self.repository.get_storage_destination_by_name(
+            candidate = self.storage_repository.get_storage_destination_by_name(
                 self.node.id, storage_destination
             )
             if candidate is None:
@@ -1559,7 +1562,7 @@ class VmbackupApplication:
                 "STORAGE_DESTINATION_REQUIRED",
                 "backup job has no storage destination",
             )
-        destination = self.repository.get_storage_destination(
+        destination = self.storage_repository.get_storage_destination(
             self.node.id, job.storage_destination_id
         )
         if destination.storage_type is StorageType.SSH:

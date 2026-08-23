@@ -179,14 +179,51 @@ and close. Its operational methods are resolved through `__getattr__` on its
 | Caller | Method family | Current owner | Target owner |
 |---|---|---|---|
 | `bootstrap.py` | node/storage bootstrap | `RepositoryV2` through facade | `RepositoryV2` |
-| `application.py` | node/storage/VM/job/run/read API | `RepositoryV2` through facade | NEW repositories/services |
+| `application.py` | storage list/show/create/update/delete/default | explicit `storage_repository` bound to `RepositoryV2` | `RepositoryV2` (migrated in Stage 2.1) |
+| `application.py` | VM/job/run and remaining API | `RepositoryV2` through facade | NEW repositories/services |
 | legacy planner/scheduler/engine | planning and scheduling | compatibility methods in `RepositoryV2` | NEW services + `RepositoryV2` |
 | legacy libvirt execution | run/artifact/publication/recovery | compatibility methods in `RepositoryV2` | NEW execution services + `RepositoryV2` |
 | reclaim/retention/restore/replica orchestration | durable operation methods | compatibility methods in `RepositoryV2` | corresponding NEW slice |
 | `RuntimeWorker` composition | background execution connection | `SQLiteRepository` facade | NEW runtime repository contract |
 
-This table records ownership; it does not assert that every compatibility method
-is complete. Stage 1 does not move or rewrite any method.
+This table records ownership; it does not assert that every remaining
+compatibility method is complete.
+
+## Storage boundary — Stage 2.1
+
+Storage management is a migrated NEW slice. The persistence path is:
+
+```text
+Cockpit storage handlers
+    ↓ explicit storage.* local API methods
+VmbackupApplication.storage_*
+    ↓ self.storage_repository (RepositoryV2, not facade __getattr__)
+RepositoryV2 explicit storage contract
+    ↓
+storage_destinations + config_json in schema_v2
+```
+
+| Operation | API method | Application method | NEW repository method | DB operation | Cockpit handler | Status |
+|---|---|---|---|---|---|---|
+| list | `storage.list` | `storage_list` | `list_storage_destinations` | scoped SELECT | refresh/render | NEW |
+| show | `storage.show` | `storage_show` | `get_storage_destination` | node-scoped SELECT | edit dialog | NEW |
+| create | `storage.create` | `storage_create` | `create_storage_destination` | validated INSERT | `saveStorage` | NEW |
+| update | `storage.update` | `storage_update` | `update_storage_destination` | validated JSON/name UPDATE | `saveStorage` | NEW |
+| delete | `storage.delete` | `storage_delete` | `delete_storage_destination` | reference-safe DELETE | `deleteStorageDestination` | NEW |
+| set default | `storage.set_default` | `storage_set_default` | `set_default_storage_destination` | atomic `is_default` JSON update | `setDefaultStorage` | NEW |
+| test | `storage.test` | `storage_test` | read by explicit get; probe is non-persistent | none | `testStoredDestination` | NEW |
+
+The stable LOCAL `config_json` keys are `backup_data_root`,
+`backup_data_mode`, `backup_data_uid`, `backup_data_gid`,
+`minimum_free_bytes`, `minimum_free_percent`, and `is_default`. SSH additionally
+uses only `ssh_host`, `ssh_port`, `ssh_user`, `ssh_remote_root`,
+`remote_storage_id`, and `remote_node_id`. Malformed or non-object JSON is a
+repository invariant failure; it is not silently replaced.
+
+The legacy `add_storage_destination` entry remains for non-migrated callers but
+delegates to the same NEW create operation. There is no second Storage
+persistence implementation. Other legacy modules may continue to consume the
+NEW `StorageDestination` record until their own slices migrate.
 
 ## Cockpit boundary
 
@@ -220,7 +257,6 @@ the RPM source asset set.
 
 ## Stage discipline
 
-Stage 1 may change classification comments, this document, release-build safety,
-Cockpit asset ownership, and guards only. It must not change DB schema, migrate
-`state.db`, rewrite repository methods, or change Web behavior. Functional
-migration starts in Stage 2 and proceeds by independently verified slices.
+Stage 1 established the baseline. Stage 2 proceeds by independently verified
+functional slices. Stage 2.1 changes only Storage management and does not change
+the schema or migrate `state.db`.

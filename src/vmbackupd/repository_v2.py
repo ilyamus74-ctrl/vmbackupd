@@ -13,9 +13,24 @@ import json
 import sqlite3
 import uuid
 
-from .models import StorageType
+from .models import StorageDestination, StorageType
 from dataclasses import dataclass
 from datetime import datetime, timezone
+
+
+class DomainInvariantError(Exception):
+    """A stable NEW repository contract invariant was violated."""
+
+
+_LOCAL_CONFIG_KEYS = {
+    "backup_data_root", "backup_data_mode", "backup_data_uid",
+    "backup_data_gid", "minimum_free_bytes", "minimum_free_percent",
+    "is_default",
+}
+_SSH_CONFIG_KEYS = _LOCAL_CONFIG_KEYS | {
+    "ssh_host", "ssh_port", "ssh_user", "ssh_remote_root",
+    "remote_storage_id", "remote_node_id",
+}
 
 
 def now():
@@ -31,6 +46,69 @@ class RepositoryV2:
     def __init__(self, connection):
         self.connection = connection
         self.connection.row_factory = sqlite3.Row
+
+    @staticmethod
+    def _storage_config(row):
+        try:
+            config = json.loads(row["config_json"] or "{}")
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise DomainInvariantError("STORAGE_CONFIG_INVALID") from exc
+        if not isinstance(config, dict):
+            raise DomainInvariantError("STORAGE_CONFIG_INVALID")
+        return config
+
+    @classmethod
+    def _storage_record(cls, row):
+        if row is None:
+            return None
+        config = cls._storage_config(row)
+        try:
+            storage_type = StorageType(row["storage_type"])
+            created_at = datetime.fromisoformat(row["created_at"])
+            return StorageDestination(
+                id=row["id"], node_id=row["node_id"], name=row["name"],
+                storage_type=storage_type,
+                backup_data_root=config.get("backup_data_root", ""),
+                backup_data_mode=config.get("backup_data_mode", 0o750),
+                backup_data_uid=config.get("backup_data_uid"),
+                backup_data_gid=config.get("backup_data_gid"),
+                minimum_free_bytes=config.get("minimum_free_bytes", 0),
+                minimum_free_percent=config.get("minimum_free_percent", 0),
+                is_default=bool(config.get("is_default", False)),
+                ssh_host=config.get("ssh_host"),
+                ssh_port=config.get("ssh_port"),
+                ssh_user=config.get("ssh_user"),
+                ssh_remote_root=config.get("ssh_remote_root"),
+                remote_storage_id=config.get("remote_storage_id"),
+                remote_node_id=config.get("remote_node_id"),
+                created_at=created_at,
+            )
+        except (TypeError, ValueError, KeyError) as exc:
+            raise DomainInvariantError("STORAGE_CONFIG_INVALID") from exc
+
+    @staticmethod
+    def _config_for_storage(destination, *, is_default=None):
+        keys = (
+            _SSH_CONFIG_KEYS
+            if destination.storage_type is StorageType.SSH
+            else _LOCAL_CONFIG_KEYS
+        )
+        values = {
+            "backup_data_root": str(destination.backup_data_root),
+            "backup_data_mode": destination.backup_data_mode,
+            "backup_data_uid": destination.backup_data_uid,
+            "backup_data_gid": destination.backup_data_gid,
+            "minimum_free_bytes": destination.minimum_free_bytes,
+            "minimum_free_percent": destination.minimum_free_percent,
+            "is_default": destination.is_default if is_default is None else is_default,
+            "ssh_host": destination.ssh_host,
+            "ssh_port": destination.ssh_port,
+            "ssh_user": destination.ssh_user,
+            "ssh_remote_root": destination.ssh_remote_root,
+            "remote_storage_id": destination.remote_storage_id,
+            "remote_node_id": destination.remote_node_id,
+        }
+        return {key: values[key] for key in keys}
 
     def add_node(self, name):
 
@@ -125,8 +203,17 @@ class RepositoryV2:
 
             if existing is None:
                 self.create_storage_destination(
-                    item
+                    item,
+                    make_default=(item.name == default_destination),
                 )
+
+        if default_destination is not None:
+            default = self.get_storage_destination_by_name(
+                node_id, default_destination
+            )
+            if default is None:
+                raise DomainInvariantError("STORAGE_DEFAULT_NOT_FOUND")
+            self.set_default_storage_destination(node_id, default.id)
 
         self.connection.commit()
 
@@ -140,12 +227,7 @@ class RepositoryV2:
 
         row = self.connection.execute(
             """
-            SELECT
-                id,
-                node_id,
-                name,
-                storage_type,
-                config_json
+            SELECT *
             FROM storage_destinations
             WHERE node_id=? AND name=?
             """,
@@ -160,45 +242,7 @@ class RepositoryV2:
             return None
 
 
-        config = json.loads(
-            row[4] or "{}"
-        )
-
-
-        return type(
-            "StorageDestinationRecord",
-            (),
-            {
-                "id": row[0],
-                "node_id": row[1],
-                "name": row[2],
-                "storage_type": (
-                    StorageType(row[3])
-                    if not isinstance(row[3], StorageType)
-                    else row[3]
-                ),
-                "backup_data_root":
-                    config.get(
-                        "backup_data_root",
-                        "",
-                    ),
-                "backup_data_mode":
-                    config.get(
-                        "backup_data_mode",
-                        0o750,
-                    ),
-                "backup_data_uid":
-                    config.get(
-                        "backup_data_uid",
-                        None,
-                    ),
-                "backup_data_gid":
-                    config.get(
-                        "backup_data_gid",
-                        None,
-                    ),
-            },
-        )()
+        return self._storage_record(row)
 
 
 
@@ -207,41 +251,30 @@ class RepositoryV2:
         node_id,
     ):
 
-        row = self.connection.execute(
-            """
-            SELECT
-                id,
-                node_id,
-                name,
-                storage_type,
-                config_json
-            FROM storage_destinations
-            WHERE node_id=?
-            ORDER BY created_at
-            LIMIT 1
-            """,
-            (
-                node_id,
-            ),
-        ).fetchone()
-
-
-        if row is None:
+        values = self.list_storage_destinations(node_id)
+        if not values:
             return None
-
-
-        return self.get_storage_destination_by_name(
-            node_id,
-            row[2],
-        )
+        defaults = [value for value in values if value.is_default]
+        if len(defaults) > 1:
+            raise DomainInvariantError("STORAGE_DEFAULT_AMBIGUOUS")
+        return defaults[0] if defaults else values[0]
 
 
 
     def create_storage_destination(
         self,
         destination,
-        make_default=True,
+        make_default=False,
     ):
+
+        if not isinstance(destination.name, str) or not destination.name.strip():
+            raise DomainInvariantError("STORAGE_NAME_INVALID")
+        if destination.storage_type not in (StorageType.LOCAL, StorageType.SSH):
+            raise DomainInvariantError("STORAGE_TYPE_INVALID")
+        if destination.minimum_free_bytes < 0:
+            raise DomainInvariantError("STORAGE_RESERVE_INVALID")
+        if not 0 <= destination.minimum_free_percent <= 100:
+            raise DomainInvariantError("STORAGE_RESERVE_INVALID")
 
         ident = (
             destination.id
@@ -250,20 +283,7 @@ class RepositoryV2:
         )
 
 
-        config = {
-            "backup_data_root":
-                str(destination.backup_data_root),
-            "backup_data_mode":
-                destination.backup_data_mode,
-            "backup_data_uid":
-                destination.backup_data_uid,
-            "backup_data_gid":
-                destination.backup_data_gid,
-            "minimum_free_bytes":
-                destination.minimum_free_bytes,
-            "minimum_free_percent":
-                destination.minimum_free_percent,
-        }
+        config = self._config_for_storage(destination, is_default=make_default)
 
 
         node_exists = self.connection.execute(
@@ -278,25 +298,17 @@ class RepositoryV2:
         ).fetchone()
 
         if node_exists is None:
-            self.connection.execute(
-                """
-                INSERT INTO nodes(
-                    id,
-                    name,
-                    created_at
-                )
-                VALUES(?,?,?)
-                """,
-                (
-                    destination.node_id,
-                    getattr(
-                        destination,
-                        "node_name",
-                        "local",
-                    ),
-                    now(),
-                ),
-            )
+            raise DomainInvariantError("STORAGE_NODE_NOT_FOUND")
+
+        duplicate = self.connection.execute(
+            "SELECT 1 FROM storage_destinations WHERE node_id=? AND name=?",
+            (destination.node_id, destination.name),
+        ).fetchone()
+        if duplicate is not None:
+            raise DomainInvariantError("STORAGE_NAME_EXISTS")
+
+        if make_default:
+            self._clear_storage_default(destination.node_id)
 
         self.connection.execute(
             """
@@ -313,10 +325,10 @@ class RepositoryV2:
             (
                 ident,
                 destination.node_id,
-                destination.name,
+                destination.name.strip(),
                 str(destination.storage_type),
                 json.dumps(config),
-                now(),
+                destination.created_at.isoformat(),
             ),
         )
 
@@ -474,75 +486,21 @@ class RepositoryV2:
         return True
 
 
-    def get_storage_destination(self, *args):
-
-        if len(args) == 1:
-            storage_id = args[0]
-
-        elif len(args) == 2:
-            _, storage_id = args
-
-        else:
-            raise TypeError(
-                "get_storage_destination expects storage_id or node_id,storage_id"
-            )
+    def get_storage_destination(self, node_id, storage_id):
 
         row = self.connection.execute(
             """
             SELECT *
             FROM storage_destinations
-            WHERE id=?
+            WHERE node_id=? AND id=?
             """,
-            (storage_id,),
+            (node_id, storage_id),
         ).fetchone()
 
 
         if row is None:
-            return None
-
-
-        config = json.loads(
-            row["config_json"] or "{}"
-        )
-
-
-        return type(
-            "StorageDestinationRecord",
-            (),
-            {
-                "id": row["id"],
-                "node_id": row["node_id"],
-                "name": row["name"],
-                "storage_type": (
-                    StorageType(row["storage_type"])
-                    if not isinstance(row["storage_type"], StorageType)
-                    else row["storage_type"]
-                ),
-                "config": config,
-                "config_json": row["config_json"],
-                "is_default": bool(
-                    row["is_default"]
-                ) if "is_default" in row.keys() else False,
-
-                # совместимость со старым StorageDestination
-                "backup_data_root": config.get(
-                    "backup_data_root",
-                    "",
-                ),
-                "backup_data_mode": config.get(
-                    "backup_data_mode",
-                ),
-                "backup_data_uid": config.get(
-                    "backup_data_uid",
-                ),
-                "backup_data_gid": config.get(
-                    "backup_data_gid",
-                ),
-                "remote_storage_id": config.get(
-                    "remote_storage_id",
-                ),
-            },
-        )()
+            raise KeyError(storage_id)
+        return self._storage_record(row)
 
     def list_storage_destinations(self, node_id=None):
 
@@ -552,6 +510,7 @@ class RepositoryV2:
                 SELECT *
                 FROM storage_destinations
                 WHERE node_id=?
+                ORDER BY created_at, id
                 """,
                 (node_id,),
             ).fetchall()
@@ -561,138 +520,136 @@ class RepositoryV2:
                 """
                 SELECT *
                 FROM storage_destinations
+                ORDER BY created_at, id
                 """
             ).fetchall()
 
 
-        result = []
-
-        for row in rows:
-            config = json.loads(
-                row["config_json"] or "{}"
-            )
-
-            result.append(
-                type(
-                    "StorageDestinationRecord",
-                    (),
-                    {
-                        "id": row["id"],
-                        "node_id": row["node_id"],
-                        "name": row["name"],
-                        "storage_type": (
-                            StorageType(row["storage_type"])
-                            if not isinstance(
-                                row["storage_type"],
-                                StorageType
-                            )
-                            else row["storage_type"]
-                        ),
-                        "config": config,
-                        "config_json": row["config_json"],
-
-                        "is_default": (
-                            bool(row["is_default"])
-                            if "is_default" in row.keys()
-                            else False
-                        ),
-
-                        "minimum_free_bytes": (
-                            row["minimum_free_bytes"]
-                            if "minimum_free_bytes" in row.keys()
-                            else 0
-                        ),
-
-                        "minimum_free_percent": (
-                            row["minimum_free_percent"]
-                            if "minimum_free_percent" in row.keys()
-                            else 0
-                        ),
-
-                        "backup_data_root": config.get(
-                            "backup_data_root",
-                            "",
-                        ),
-
-                        "remote_storage_id": config.get(
-                            "remote_storage_id",
-                        ),
-
-                        "backup_data_uid": config.get(
-                            "backup_data_uid",
-                        ),
-
-                        "backup_data_gid": config.get(
-                            "backup_data_gid",
-                        ),
-
-                        "backup_data_mode": config.get(
-                            "backup_data_mode",
-                        ),
-
-                        "ssh_host": (
-                            row["ssh_host"]
-                            if "ssh_host" in row.keys()
-                            else None
-                        ),
-
-                        "ssh_port": (
-                            row["ssh_port"]
-                            if "ssh_port" in row.keys()
-                            else None
-                        ),
-
-                        "ssh_user": (
-                            row["ssh_user"]
-                            if "ssh_user" in row.keys()
-                            else None
-                        ),
-
-                        "ssh_remote_root": (
-                            row["ssh_remote_root"]
-                            if "ssh_remote_root" in row.keys()
-                            else None
-                        ),
-
-                        "remote_node_id": (
-                            row["remote_node_id"]
-                            if "remote_node_id" in row.keys()
-                            else None
-                        ),
-                    },
-                )()
-            )
-
-        return result
+        return [self._storage_record(row) for row in rows]
 
 
     def update_storage_destination(
         self,
+        node_id,
         storage_id,
         **kwargs,
     ):
-        return True
+        make_default = kwargs.pop("make_default", False)
+        current = self.get_storage_destination(node_id, storage_id)
+        allowed = {
+            "name", "backup_data_root", "minimum_free_bytes",
+            "minimum_free_percent", "ssh_host", "ssh_port", "ssh_user",
+            "ssh_remote_root", "remote_storage_id", "remote_node_id",
+        }
+        unknown = set(kwargs) - allowed
+        if unknown:
+            raise TypeError(f"unsupported storage fields: {', '.join(sorted(unknown))}")
+        name = kwargs.pop("name", None)
+        for optional in (
+            "backup_data_root", "minimum_free_bytes", "minimum_free_percent"
+        ):
+            if kwargs.get(optional) is None:
+                kwargs.pop(optional, None)
+        if name is not None and (not isinstance(name, str) or not name.strip()):
+            raise DomainInvariantError("STORAGE_NAME_INVALID")
+        if name is not None:
+            name = name.strip()
+        if "minimum_free_bytes" in kwargs and kwargs["minimum_free_bytes"] < 0:
+            raise DomainInvariantError("STORAGE_RESERVE_INVALID")
+        if (
+            "minimum_free_percent" in kwargs
+            and not 0 <= kwargs["minimum_free_percent"] <= 100
+        ):
+            raise DomainInvariantError("STORAGE_RESERVE_INVALID")
+        if name is not None:
+            duplicate = self.connection.execute(
+                "SELECT 1 FROM storage_destinations WHERE node_id=? AND name=? AND id<>?",
+                (node_id, name, storage_id),
+            ).fetchone()
+            if duplicate is not None:
+                raise DomainInvariantError("STORAGE_NAME_EXISTS")
+        config = self._config_for_storage(current)
+        config.update(kwargs)
+        if make_default:
+            self._clear_storage_default(node_id)
+            config["is_default"] = True
+        self.connection.execute(
+            "UPDATE storage_destinations SET name=COALESCE(?, name), config_json=? "
+            "WHERE node_id=? AND id=?",
+            (name, json.dumps(config), node_id, storage_id),
+        )
+        self.connection.commit()
+        return self.get_storage_destination(node_id, storage_id)
 
 
     def delete_storage_destination(
         self,
+        node_id,
         storage_id,
     ):
+        current = self.get_storage_destination(node_id, storage_id)
+        referenced = self.connection.execute(
+            "SELECT 1 FROM backup_jobs WHERE storage_destination_id=? "
+            "UNION SELECT 1 FROM job_runs WHERE storage_destination_id=? LIMIT 1",
+            (storage_id, storage_id),
+        ).fetchone()
+        if referenced is not None:
+            raise DomainInvariantError("STORAGE_IN_USE")
         self.connection.execute(
             """
             DELETE FROM storage_destinations
-            WHERE id=?
+            WHERE node_id=? AND id=?
             """,
-            (storage_id,),
+            (node_id, storage_id),
         )
+        if current.is_default:
+            replacement = self.connection.execute(
+                "SELECT id FROM storage_destinations WHERE node_id=? ORDER BY created_at LIMIT 1",
+                (node_id,),
+            ).fetchone()
+            if replacement is not None:
+                self._set_storage_default(node_id, replacement[0])
         self.connection.commit()
+        return current
 
 
     def set_default_storage_destination(
         self,
+        node_id,
         storage_id,
     ):
-        return True
+        self.get_storage_destination(node_id, storage_id)
+        self._clear_storage_default(node_id)
+        self._set_storage_default(node_id, storage_id)
+        self.connection.commit()
+        return self.get_storage_destination(node_id, storage_id)
+
+    def _clear_storage_default(self, node_id):
+        rows = self.connection.execute(
+            "SELECT id, config_json FROM storage_destinations WHERE node_id=?",
+            (node_id,),
+        ).fetchall()
+        for row in rows:
+            config = self._storage_config(row)
+            if config.pop("is_default", None) is not None:
+                self.connection.execute(
+                    "UPDATE storage_destinations SET config_json=? WHERE id=?",
+                    (json.dumps(config), row["id"]),
+                )
+
+    def _set_storage_default(self, node_id, storage_id):
+        row = self.connection.execute(
+            "SELECT id, config_json FROM storage_destinations WHERE node_id=? AND id=?",
+            (node_id, storage_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError(storage_id)
+        config = self._storage_config(row)
+        config["is_default"] = True
+        self.connection.execute(
+            "UPDATE storage_destinations SET config_json=? WHERE id=?",
+            (json.dumps(config), storage_id),
+        )
 
 
     def storage_destination_identity_locked(
@@ -1872,67 +1829,11 @@ class RepositoryV2:
         Accepts StorageDestination object used by older services/tests.
         """
 
-        if hasattr(destination, "id") and destination.id:
-            ident = destination.id
-        else:
-            ident = str(uuid.uuid4())
-
-        self.connection.execute(
-            """
-            INSERT INTO storage_destinations(
-                id,
-                node_id,
-                name,
-                storage_type,
-                config_json,
-                created_at
-            )
-            VALUES(?,?,?,?,?,?)
-            """,
-            (
-                ident,
-                destination.node_id,
-                destination.name,
-                getattr(
-                    destination.storage_type,
-                    "value",
-                    destination.storage_type,
-                ),
-                json.dumps(
-                    {
-                        "backup_data_root": str(
-                            destination.backup_data_root
-                        )
-                        if getattr(
-                            destination,
-                            "backup_data_root",
-                            None,
-                        )
-                        else None,
-                        "backup_data_mode": getattr(
-                            destination,
-                            "backup_data_mode",
-                            None,
-                        ),
-                        "backup_data_uid": getattr(
-                            destination,
-                            "backup_data_uid",
-                            None,
-                        ),
-                        "backup_data_gid": getattr(
-                            destination,
-                            "backup_data_gid",
-                            None,
-                        ),
-                    }
-                ),
-                now(),
-            ),
+        created = self.create_storage_destination(
+            destination,
+            make_default=destination.is_default,
         )
-
-        self.connection.commit()
-
-        return ident
+        return created.id
 
 
 

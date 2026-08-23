@@ -12,16 +12,11 @@ New recovery/reclaim backend is provided by RepositoryV2.
 
 import sqlite3
 
-from .repository_v2 import RepositoryV2
+from .repository_v2 import DomainInvariantError, RepositoryV2
 from .schema_v2 import ensure_schema
 
 
 Repository = RepositoryV2
-
-
-class DomainInvariantError(Exception):
-    pass
-
 
 
 class SQLiteRepository:
