@@ -1,5 +1,8 @@
 """Versioned SQLite schema creation, validation, adoption, and migration."""
 
+# Architecture: LEGACY
+# Migration: reference for old invariants and upgrade knowledge; do not extend.
+
 from __future__ import annotations
 
 from zoneinfo import ZoneInfo as _SchemaZoneInfo

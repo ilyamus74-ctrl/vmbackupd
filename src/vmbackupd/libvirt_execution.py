@@ -1,5 +1,8 @@
 """Cooperative Phase 3B FULL push-backup execution boundaries."""
 
+# Architecture: LEGACY
+# Migration: preserve behavior while backup execution moves to NEW services.
+
 from __future__ import annotations
 
 import math

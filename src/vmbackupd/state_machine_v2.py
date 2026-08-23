@@ -4,6 +4,9 @@
 Single place for job run state transition rules.
 """
 
+# Architecture: NEW
+# Target: NEW job-run transition contract.
+
 
 class InvalidTransition(Exception):
     pass

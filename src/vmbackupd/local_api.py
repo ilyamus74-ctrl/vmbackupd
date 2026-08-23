@@ -1,5 +1,7 @@
 """Versioned bounded JSON-lines protocol over a local UNIX stream socket."""
 
+# Architecture: SHARED
+
 from __future__ import annotations
 
 import asyncio

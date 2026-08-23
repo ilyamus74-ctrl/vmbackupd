@@ -1,5 +1,8 @@
 """Deterministic cooperative mock executor with no real backup behavior."""
 
+# Architecture: LEGACY
+# Migration: do not extend; retain for old orchestration semantics and tests.
+
 from __future__ import annotations
 
 from collections.abc import Mapping

@@ -1,5 +1,8 @@
 """Strict execution state machine for backup runs."""
 
+# Architecture: LEGACY
+# Migration: preserve as the source of existing backup transition semantics.
+
 from __future__ import annotations
 
 from .models import RunState

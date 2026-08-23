@@ -1,5 +1,8 @@
 """Idempotent interval scheduling over persisted job cursors."""
 
+# Architecture: LEGACY
+# Migration: preserve scheduling semantics for later porting.
+
 from __future__ import annotations
 
 from .clock import Clock

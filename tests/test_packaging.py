@@ -209,6 +209,8 @@ def test_build_helper_is_offline_noninstalling_and_excludes_development_content(
     assert "rpmbuild -ba" in helper
     assert "ls-files --cached" in helper
     assert "checkout-index --all" in helper
+    assert "tracked unstaged changes exist; RPM build refused" in helper
+    assert "validate-cockpit-assets.py" in helper
     assert '"$snapshot_root/pyproject.toml"' in helper
     assert '"$snapshot_root/packaging"' in helper
     assert '--directory "$snapshot_root"' in helper
@@ -223,7 +225,7 @@ def test_build_helper_is_offline_noninstalling_and_excludes_development_content(
         assert forbidden not in helper
 
 
-def test_build_helper_uses_staged_index_snapshot_not_unstaged_worktree(tmp_path):
+def test_build_helper_refuses_unstaged_worktree_changes(tmp_path):
     repository = tmp_path / "source"
     packaging = repository / "packaging"
     packaging.mkdir(parents=True)
@@ -251,49 +253,17 @@ def test_build_helper_uses_staged_index_snapshot_not_unstaged_worktree(tmp_path)
     git("commit", "-qm", "baseline")
 
     (repository / "pyproject.toml").write_text(
-        '[project]\nname = "vmbackupd"\nversion = "0.2.0"\n'
-    )
-    for name in inputs:
-        (packaging / name).write_text(f"INDEXED {name}\n")
-    git("add", "pyproject.toml", "packaging")
-
-    (repository / "pyproject.toml").write_text(
         '[project]\nname = "vmbackupd"\nversion = "9.9.9"\n'
     )
-    for name in inputs:
-        (packaging / name).write_text(f"UNSTAGED {name}\n")
-    (repository / "arbitrary-untracked-secret").write_text("must not enter archive\n")
 
-    commands = tmp_path / "commands"
-    commands.mkdir()
-    fake_rpmbuild = commands / "rpmbuild"
-    fake_rpmbuild.write_text("#!/bin/sh\nexit 0\n")
-    fake_rpmbuild.chmod(0o755)
-    work = tmp_path / "work"
-    environment = os.environ | {
-        "PATH": f"{commands}:{os.environ['PATH']}",
-        "RPMBUILD_WORK_ROOT": str(work),
-        "RPMBUILD_KEEP_WORK_ROOT": "1",
-        "RPMBUILD_OUTPUT_DIR": str(tmp_path / "output"),
-    }
-    subprocess.run(("bash", str(packaging / "build-rpm.sh")), cwd=repository,
-                   env=environment, check=True, capture_output=True, text=True)
-
-    sources = work / "rpmbuild" / "SOURCES"
-    assert (work / "rpmbuild" / "SPECS" / "vmbackupd.spec").read_text() == (
-        "INDEXED vmbackupd.spec\n"
+    result = subprocess.run(
+        ("bash", "packaging/build-rpm.sh"),
+        cwd=repository,
+        capture_output=True,
+        text=True,
     )
-    for name in inputs[1:]:
-        assert (sources / name).read_text() == f"INDEXED {name}\n"
-    archive = sources / "vmbackupd-0.2.0.tar.gz"
-    with tarfile.open(archive) as value:
-        names = value.getnames()
-        indexed_pyproject = value.extractfile("vmbackupd-0.2.0/pyproject.toml")
-        assert indexed_pyproject is not None
-        assert b'version = "0.2.0"' in indexed_pyproject.read()
-    assert not any("arbitrary-untracked-secret" in name for name in names)
-    assert not any("/tests/" in name or "/build/" in name or "/dist/" in name
-                   or "/.venv/" in name for name in names)
+    assert result.returncode == 3
+    assert "tracked unstaged changes exist; RPM build refused" in result.stderr
 
 
 def test_packaging_document_keeps_future_components_explicitly_deferred():

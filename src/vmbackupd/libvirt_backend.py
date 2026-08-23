@@ -1,5 +1,7 @@
 """Read-only virsh inspection and persistent libvirt planning helpers."""
 
+# Architecture: SHARED
+
 from __future__ import annotations
 
 import re

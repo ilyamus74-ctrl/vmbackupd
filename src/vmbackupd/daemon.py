@@ -1,5 +1,7 @@
 """Foreground vmbackupd process entry point."""
 
+# Architecture: SHARED
+
 from __future__ import annotations
 
 import argparse

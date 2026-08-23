@@ -4,6 +4,9 @@
 Minimal repository for schema_v2.
 """
 
+# Architecture: NEW
+# Target: retained after the RepositoryV2 migration.
+
 from __future__ import annotations
 
 import json

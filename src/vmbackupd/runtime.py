@@ -6,6 +6,9 @@ Legacy bootstrap API is preserved.
 New implementation uses runtime_v2.
 """
 
+# Architecture: BRIDGE
+# Temporary compatibility facade preserving the legacy bootstrap API.
+
 
 from .runtime_v2 import DaemonRuntimeV2
 

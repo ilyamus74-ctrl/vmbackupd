@@ -6,12 +6,13 @@ repo_root=$(cd -- "$script_dir/.." && pwd)
 cd -- "$repo_root"
 source_date_epoch=$(git -C "$repo_root" log -1 --format=%ct)
 
-# Prevent accidental RPM builds from stale git index snapshots.
-# The snapshot below is created from git index only, therefore
-# unstaged working tree changes would silently disappear.
-if [[ -n "$(git -C "$repo_root" diff --name-only)" ]]; then
-    echo "WARNING: unstaged changes exist and will NOT be included in RPM." >&2
+# Release builds use the Git index snapshot. Refuse tracked unstaged changes so
+# the build cannot silently differ from the source visible in the working tree.
+if ! git -C "$repo_root" diff --quiet --; then
+    echo "ERROR: tracked unstaged changes exist; RPM build refused." >&2
+    echo "The release RPM is built from the Git index. Stage or revert these files:" >&2
     git -C "$repo_root" diff --name-only >&2
+    exit 3
 fi
 
 
@@ -34,6 +35,8 @@ fi
 snapshot_root="$work_root/index-snapshot"
 mkdir -p "$snapshot_root" "$work_root/rpmbuild"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS} "$output_dir"
 git -C "$repo_root" checkout-index --all --force --prefix="$snapshot_root/"
+python3 "$snapshot_root/packaging/validate-cockpit-assets.py" \
+    "$snapshot_root/cockpit/vmbackupd"
 version=$(python3 -c 'import pathlib,sys,tomllib; print(tomllib.loads(pathlib.Path(sys.argv[1]).read_text())["project"]["version"])' "$snapshot_root/pyproject.toml")
 manifest="$work_root/source-files"
 git -C "$repo_root" ls-files --cached \

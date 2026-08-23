@@ -1,5 +1,8 @@
 """Backup planning domain service."""
 
+# Architecture: LEGACY
+# Migration: preserve planning semantics for later porting.
+
 from .models import JobRun
 from .repository import SQLiteRepository
 

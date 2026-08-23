@@ -70,7 +70,7 @@ install -Dpm 0644 packaging/vmbackupd-storage-helper.socket \
 install -Dpm 0644 packaging/vmbackupd-storage-helper@.service \
     %{buildroot}%{_unitdir}/vmbackupd-storage-helper@.service
 install -d -m 0755 %{buildroot}%{_datadir}/cockpit/vmbackupd
-install -pm 0644 cockpit/vmbackupd/{manifest.json,index.html,api.js,vmbackupd.js,vmbackupd.css} \
+install -pm 0644 cockpit/vmbackupd/{manifest.json,index.html,api.js,model.js,views.js,main.js,vmbackupd.js,vmbackupd.css} \
     %{buildroot}%{_datadir}/cockpit/vmbackupd/
 
 install -Dpm 0755 packaging/receiver/vmbackupd-authorized-keys \

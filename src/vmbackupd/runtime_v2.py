@@ -1,3 +1,6 @@
+# Architecture: NEW
+# Target: state-driven daemon runtime for NEW services.
+
 from vmbackupd.recovery_executor_v2 import default_registry
 import uuid
 

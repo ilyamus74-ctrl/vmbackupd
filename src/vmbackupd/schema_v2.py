@@ -5,6 +5,9 @@ Clean schema foundation.
 No historical migrations.
 """
 
+# Architecture: NEW
+# Target: compact relational identity/state with extensible JSON metadata.
+
 from __future__ import annotations
 
 import sqlite3

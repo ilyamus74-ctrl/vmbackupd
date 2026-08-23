@@ -1,5 +1,8 @@
 """Single Phase 3C application composition root."""
 
+# Architecture: BRIDGE
+# Temporary composition boundary between NEW and LEGACY components.
+
 from __future__ import annotations
 
 from dataclasses import dataclass

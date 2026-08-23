@@ -6,6 +6,9 @@ Legacy services continue using SQLiteRepository.
 New recovery/reclaim backend is provided by RepositoryV2.
 """
 
+# Architecture: BRIDGE
+# Temporary compatibility boundary between legacy services and RepositoryV2.
+
 
 import sqlite3
 

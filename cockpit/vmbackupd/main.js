@@ -3,6 +3,8 @@
 
     console.log("MAIN CONTROLLER START");
 
+    let loading = false;
+
 
     async function safeRequest(method, params) {
         try {
@@ -27,7 +29,13 @@
     }
 
     async function start() {
-        console.log("MAIN START");
+        if (loading)
+            return;
+
+        loading = true;
+
+        try {
+            console.log("MAIN START");
 
         const status =
             await VmbackupApi.request(
@@ -94,6 +102,10 @@
         );
 
         VmbackupViews.renderModel(model);
+
+        } finally {
+            loading = false;
+        }
     }
 
     start().catch(
@@ -101,6 +113,16 @@
             "MAIN FAILED",
             e
         )
+    );
+
+    setInterval(
+        () => start().catch(
+            e => console.error(
+                "REFRESH FAILED",
+                e
+            )
+        ),
+        5000
     );
 
 })();

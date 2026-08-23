@@ -1,5 +1,8 @@
 """Explicit Phase 3C application services behind the local API."""
 
+# Architecture: BRIDGE
+# Temporary application boundary while legacy services move to NEW contracts.
+
 from __future__ import annotations
 
 import base64
