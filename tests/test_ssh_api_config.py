@@ -18,6 +18,7 @@ from vmbackupd.models import (
     VM,
 )
 from vmbackupd.repository import DomainInvariantError, SQLiteRepository
+from vmbackupd.ssh_storage_discovery import SSHStorageDiscoveryError
 
 
 NOW = datetime(2026, 8, 18, 15, 0, tzinfo=timezone.utc)
@@ -363,6 +364,166 @@ def test_storage_test_ssh_delegates_to_preflight_client(tmp_path):
     assert result["preflight_ready"] is True
     assert result["transport_ready"] is False
 
+    repository.close()
+
+
+def test_catalog_backed_ssh_test_uses_selected_remote_storage_capacity(tmp_path):
+    repository, node, _, ssh = catalog(tmp_path)
+    remote_id = "c097d776-eb93-4d93-9f33-0daa5ac05d08"
+    repository.update_storage_destination(
+        node.id, ssh.id,
+        remote_storage_id=remote_id,
+        ssh_remote_root=None,
+    )
+    app = application_for(repository, node)
+
+    class Discovery:
+        def discover(self, host, port, user):
+            return {"storages": [{
+                "id": remote_id,
+                "name": "STOR_HDD",
+                "path": "/STOR_HDD/vmbackupd",
+                "ready": True,
+                "free_bytes": 3_238_327_898_112,
+                "total_bytes": 4_000_000_000_000,
+                "minimum_free_bytes": 322_122_547_200,
+                "minimum_free_percent": 5.0,
+                "required_reserve_bytes": 322_122_547_200,
+                "usable_after_reserve_bytes": 2_916_205_350_912,
+            }]}
+
+    app.ssh_storage_discovery_client = Discovery()
+    result = app.dispatch("storage.test", {"id": ssh.id})
+
+    assert result["remote_storage_id"] == remote_id
+    assert result["remote_storage_name"] == "STOR_HDD"
+    assert result["remote_storage_path"] == "/STOR_HDD/vmbackupd"
+    assert result["free_bytes"] == 3_238_327_898_112
+    assert result["remote_minimum_free_bytes"] == 322_122_547_200
+    assert result["remote_minimum_free_percent"] == 5.0
+    assert result.get("backup_root") != "/srv/vmbackupd"
+    repository.close()
+
+
+def test_catalog_backed_ssh_test_rejects_unknown_remote_storage_id(tmp_path):
+    repository, node, _, ssh = catalog(tmp_path)
+    repository.update_storage_destination(
+        node.id, ssh.id,
+        remote_storage_id="c097d776-eb93-4d93-9f33-0daa5ac05d08",
+        ssh_remote_root=None,
+    )
+    app = application_for(repository, node)
+
+    class EmptyDiscovery:
+        def discover(self, host, port, user):
+            return {"storages": []}
+
+    app.ssh_storage_discovery_client = EmptyDiscovery()
+
+    with pytest.raises(ApplicationError) as caught:
+        app.dispatch("storage.test", {"id": ssh.id})
+
+    assert caught.value.code == "REMOTE_STORAGE_NOT_FOUND"
+    repository.close()
+
+
+def test_catalog_outage_does_not_change_persisted_remote_storage_identity(tmp_path):
+    repository, node, _, ssh = catalog(tmp_path)
+    remote_id = "c097d776-eb93-4d93-9f33-0daa5ac05d08"
+    repository.update_storage_destination(
+        node.id, ssh.id,
+        remote_storage_id=remote_id,
+        ssh_remote_root=None,
+    )
+    app = application_for(repository, node)
+
+    class UnavailableDiscovery:
+        def discover(self, host, port, user):
+            raise SSHStorageDiscoveryError(
+                "SSH_STORAGE_DISCOVERY_CONNECT_FAILED",
+                "receiver unavailable",
+            )
+
+    app.ssh_storage_discovery_client = UnavailableDiscovery()
+    with pytest.raises(ApplicationError) as caught:
+        app.dispatch("storage.test", {"id": ssh.id})
+
+    assert caught.value.code == "SSH_STORAGE_DISCOVERY_CONNECT_FAILED"
+    listed = next(
+        item for item in app.dispatch("storage.list", {})
+        if item["id"] == ssh.id
+    )
+    assert listed["remote_storage_id"] == remote_id
+    assert listed["ssh_remote_root"] is None
+    repository.close()
+
+
+def test_ssh_discovery_save_list_and_test_preserve_selected_remote_identity(tmp_path):
+    repository, node, _, _ = catalog(tmp_path)
+    remote_node_id = "8216baf7-b4d5-465f-b003-b70e59c7848b"
+    remote_storage_id = "c097d776-eb93-4d93-9f33-0daa5ac05d08"
+
+    class Preparer:
+        def prepare_staging(self, path, seed_root):
+            Path(path).mkdir(parents=True)
+            return {"ok": True, "kind": "SSH_STAGING", "path": str(path)}
+
+        def remove_staging(self, path, seed_root):
+            Path(path).rmdir()
+
+    app = application_for(repository, node, storage_preparer=Preparer())
+
+    class Discovery:
+        def discover(self, host, port, user):
+            return {
+                "node": {"node_id": remote_node_id, "node_name": "receiver"},
+                "storages": [{
+                    "id": remote_storage_id,
+                    "name": "STOR_HDD",
+                    "path": "/STOR_HDD/vmbackupd",
+                    "ready": True,
+                    "free_bytes": 3_238_327_898_112,
+                    "total_bytes": 4_000_000_000_000,
+                    "minimum_free_bytes": 322_122_547_200,
+                    "minimum_free_percent": 5.0,
+                    "required_reserve_bytes": 322_122_547_200,
+                    "usable_after_reserve_bytes": 2_916_205_350_912,
+                }],
+            }
+
+    app.ssh_storage_discovery_client = Discovery()
+    created = app.dispatch("storage.create", {
+        "name": "receiver-STOR_HDD",
+        "storage_type": "SSH",
+        "ssh_host": "62.205.155.66",
+        "ssh_port": 22022,
+        "ssh_user": "vmbackupd-transfer",
+        "remote_storage_id": remote_storage_id,
+        "ssh_remote_root": None,
+        "minimum_free_bytes": 0,
+        "minimum_free_percent": 0,
+    })
+
+    assert created["remote_storage_id"] == remote_storage_id
+    assert created["ssh_remote_root"] is None
+    assert created["remote_node_id"] == remote_node_id
+    persisted_node = next(
+        item for item in repository.list_nodes() if item.id == remote_node_id
+    )
+    assert persisted_node.name == "receiver"
+
+    listed = next(
+        item for item in app.dispatch("storage.list", {})
+        if item["id"] == created["id"]
+    )
+    assert listed["remote_storage_id"] == remote_storage_id
+    assert listed["ssh_remote_root"] is None
+
+    tested = app.dispatch("storage.test", {"id": created["id"]})
+    assert tested["remote_storage_id"] == remote_storage_id
+    assert tested["remote_storage_name"] == "STOR_HDD"
+    assert tested["remote_storage_path"] == "/STOR_HDD/vmbackupd"
+    assert tested["free_bytes"] == 3_238_327_898_112
     repository.close()
 
 def test_api_job_create_refuses_ssh_destination_without_creating_job(tmp_path):

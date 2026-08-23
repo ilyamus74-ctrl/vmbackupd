@@ -11,6 +11,7 @@ def run_node(body):
     harness = r"""
 const fs = require("fs");
 const vm = require("vm");
+const crypto = require("crypto");
 const nodes = new Map();
 const buttons = [];
 
@@ -21,6 +22,7 @@ function element(id = "") {
         children: [], listeners: {}, classList: { add() {}, remove() {} },
         addEventListener(name, callback) { this.listeners[name] = callback; },
         append(...values) { this.children.push(...values); },
+        appendChild(value) { this.children.push(value); return value; },
         replaceChildren(...values) { this.children = values; },
         showModal() { this.open = true; },
         close() { this.open = false; },
@@ -54,6 +56,7 @@ let request = async () => ({
     total_bytes: 100, free_bytes: 80, required_reserve_bytes: 0,
     usable_after_reserve_bytes: 80, will_create: false, errors: [],
 });
+let spawn = async () => "";
 
 const context = {
     console, document, setTimeout, clearTimeout, Node: class Node {},
@@ -65,6 +68,10 @@ context.window.VmbackupApi = {
     ApiError, ProtocolError, TransportError,
     request: (...args) => request(...args),
 };
+context.window.cockpit = { spawn: (...args) => spawn(...args) };
+context.window.crypto = crypto.webcrypto;
+context.window.atob = value => Buffer.from(value, "base64").toString("binary");
+context.window.btoa = value => Buffer.from(value, "binary").toString("base64");
 vm.createContext(context);
 vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), context);
 """
@@ -144,3 +151,116 @@ if (!message.includes("INVALID_PARAMS") || !message.includes("bad storage"))
     throw new Error(`API error detail lost: ${message}`);
 """)
     assert "VmbackupViews.configure({ refresh: start })" in MAIN.read_text()
+
+
+def test_persisted_ssh_destination_renders_without_probe_result():
+    run_node(r"""
+function visibleText(value) {
+    if (!value) return "";
+    if (Array.isArray(value)) return value.map(visibleText).join(" ");
+    return `${value.textContent || ""} ${visibleText(value.children || [])}`;
+}
+context.window.VmbackupViews.renderStorage({
+    status: { node_name: "node" },
+    storage: [
+        {
+            id: "local-1", name: "local-root", storage_type: "LOCAL",
+            backup_data_root: "/backup", minimum_free_bytes: 0,
+            minimum_free_percent: 0, free_bytes: 100, is_default: true,
+        },
+        {
+            id: "ssh-1", name: "receiver", storage_type: "SSH",
+            ssh_host: "receiver.example", ssh_port: 22022,
+            ssh_user: "vmbackupd-receiver", ssh_remote_root: "/srv/backup",
+            minimum_free_bytes: 0, minimum_free_percent: 0,
+            is_default: false,
+        },
+    ],
+});
+const rendered = visibleText(nodes.get("storage"));
+if (!rendered.includes("receiver")) throw new Error("SSH row missing");
+if (!rendered.includes("Not tested"))
+    throw new Error(`missing untested state: ${rendered}`);
+""")
+
+
+def test_ssh_probe_success_and_failure_remain_renderable():
+    run_node(r"""
+function visibleText(value) {
+    if (!value) return "";
+    if (Array.isArray(value)) return value.map(visibleText).join(" ");
+    return `${value.textContent || ""} ${visibleText(value.children || [])}`;
+}
+(async () => {
+    const views = context.window.VmbackupViews;
+    const destination = {
+        id: "ssh-1", name: "receiver", storage_type: "SSH",
+        ssh_host: "receiver.example", ssh_port: 22022,
+        ssh_user: "vmbackupd-receiver", ssh_remote_root: "/srv/backup",
+        minimum_free_bytes: 0, minimum_free_percent: 0, is_default: false,
+    };
+    const model = { status: { node_name: "node" }, storage: [destination] };
+    views.renderStorage(model);
+
+    request = async () => ({
+        ok: true, probe_type: "SSH", message: "Connected",
+        free_bytes: 80, total_bytes: 100, required_reserve_bytes: 0,
+        usable_after_reserve_bytes: 80, errors: [],
+    });
+    await views.testStoredDestination(destination);
+    let rendered = visibleText(nodes.get("storage"));
+    if (!rendered.includes("80 B"))
+        throw new Error(`successful probe free space missing: ${rendered}`);
+
+    request = async () => { throw new ApiError("SSH_TEST_FAILED", "receiver denied"); };
+    await views.testStoredDestination(destination);
+    rendered = visibleText(nodes.get("storage"));
+    if (!rendered.includes("Probe failed"))
+        throw new Error(`failed probe state missing: ${rendered}`);
+    const result = nodes.get("storage-test-result");
+    if (!result.textContent.includes("SSH_TEST_FAILED") ||
+        !result.textContent.includes("receiver denied"))
+        throw new Error(`backend failure hidden: ${result.textContent}`);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+
+
+def test_catalog_backed_probe_result_supplies_selected_name_path_and_capacity():
+    run_node(r"""
+function visibleText(value) {
+    if (!value) return "";
+    if (Array.isArray(value)) return value.map(visibleText).join(" ");
+    return `${value.textContent || ""} ${visibleText(value.children || [])}`;
+}
+(async () => {
+    const views = context.window.VmbackupViews;
+    const remoteId = "c097d776-eb93-4d93-9f33-0daa5ac05d08";
+    const destination = {
+        id: "ssh-1", name: "receiver", storage_type: "SSH",
+        ssh_host: "62.205.155.66", ssh_port: 22022,
+        ssh_user: "vmbackupd-transfer", ssh_remote_root: null,
+        remote_storage_id: remoteId,
+        minimum_free_bytes: 0, minimum_free_percent: 0, is_default: false,
+    };
+    views.renderStorage({ status: { node_name: "node" }, storage: [destination] });
+    request = async () => ({
+        ok: true, storage_type: "SSH", remote_storage_id: remoteId,
+        remote_storage_name: "STOR_HDD",
+        remote_storage_path: "/STOR_HDD/vmbackupd",
+        ready: true, free_bytes: 3243554570240, total_bytes: 4000000000000,
+        remote_minimum_free_bytes: 322122547200,
+        remote_minimum_free_percent: 5,
+        remote_required_reserve_bytes: 322122547200,
+        remote_usable_after_reserve_bytes: 2921432023040,
+    });
+    await views.testStoredDestination(destination);
+    const rendered = visibleText(nodes.get("storage"));
+    for (const expected of ["2.9 TiB", "300 GiB", "5%"])
+        if (!rendered.includes(expected)) throw new Error(`missing ${expected}: ${rendered}`);
+    if (rendered.includes("/srv/vmbackupd"))
+        throw new Error(`receiver root leaked into destination: ${rendered}`);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+    source = VIEWS.read_text()
+    assert "name: result.remote_storage_name" in source
+    assert "path: result.remote_storage_path" in source

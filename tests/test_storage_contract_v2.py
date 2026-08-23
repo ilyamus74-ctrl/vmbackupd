@@ -76,6 +76,54 @@ def test_repository_v2_storage_crud_and_json_contract(tmp_path):
     assert repo.get_default_storage_destination(node.id).id == first.id
 
 
+def test_repository_v2_preserves_catalog_backed_ssh_identity(tmp_path):
+    repo = repository()
+    node = add_node(repo)
+    remote_id = "c097d776-eb93-4d93-9f33-0daa5ac05d08"
+    value = StorageDestination(
+        id="ssh-storage", node_id=node.id, name="remote",
+        storage_type=StorageType.SSH,
+        backup_data_root=str(tmp_path / "staging"),
+        ssh_host="62.205.155.66", ssh_port=22022,
+        ssh_user="vmbackupd-transfer", ssh_remote_root=None,
+        remote_storage_id=remote_id,
+    )
+
+    repo.create_storage_destination(value)
+    loaded = repo.get_storage_destination(node.id, value.id)
+
+    assert loaded.remote_storage_id == remote_id
+    assert loaded.ssh_remote_root is None
+    config = json.loads(repo.connection.execute(
+        "SELECT config_json FROM storage_destinations WHERE id=?", (value.id,)
+    ).fetchone()[0])
+    assert config["remote_storage_id"] == remote_id
+    assert config["ssh_remote_root"] is None
+
+
+def test_catalog_backed_ssh_identity_survives_repository_restart(tmp_path):
+    database_path = tmp_path / "state.db"
+    remote_id = "c097d776-eb93-4d93-9f33-0daa5ac05d08"
+    repository = SQLiteRepository(database_path)
+    node = add_node(repository)
+    value = StorageDestination(
+        id="ssh-storage", node_id=node.id, name="remote",
+        storage_type=StorageType.SSH,
+        backup_data_root=str(tmp_path / "staging"),
+        ssh_host="62.205.155.66", ssh_port=22022,
+        ssh_user="vmbackupd-transfer", ssh_remote_root=None,
+        remote_storage_id=remote_id,
+    )
+    repository.v2.create_storage_destination(value)
+    repository.close()
+
+    reopened = SQLiteRepository(database_path)
+    loaded = reopened.v2.get_storage_destination(node.id, value.id)
+    assert loaded.remote_storage_id == remote_id
+    assert loaded.ssh_remote_root is None
+    reopened.close()
+
+
 def test_repository_v2_storage_ownership_duplicates_delete_safety_and_bad_json(tmp_path):
     repo = repository()
     node = add_node(repo, "local")

@@ -488,7 +488,7 @@ class VmbackupApplication:
 
         if len(matches) != 1:
             raise ApplicationError(
-                "SSH_REMOTE_STORAGE_NOT_FOUND",
+                "REMOTE_STORAGE_NOT_FOUND",
                 "selected remote storage is not exposed by the receiver",
             )
 
@@ -542,10 +542,17 @@ class VmbackupApplication:
                 )
 
                 node = discovery.get("node")
+                if node is None:
+                    # Storage discovery predates receiver node capability.
+                    # The stable remote storage ID remains usable during a
+                    # rolling upgrade; node topology can be linked after the
+                    # receiver exposes its identity.
+                    return remote_storage_id, None, None
+
                 if not isinstance(node, dict):
                     raise ApplicationError(
                         "SSH_STORAGE_DISCOVERY_PROTOCOL_INVALID",
-                        "receiver node identity is missing",
+                        "receiver node identity is invalid",
                     )
 
                 node_id = node.get("node_id")
@@ -894,7 +901,7 @@ class VmbackupApplication:
 
                     if len(matches) != 1:
                         raise ApplicationError(
-                            "SSH_REMOTE_STORAGE_NOT_FOUND",
+                            "REMOTE_STORAGE_NOT_FOUND",
                             "selected remote storage is not exposed by the receiver",
                         )
 
@@ -928,6 +935,7 @@ class VmbackupApplication:
                         "user": value.ssh_user,
                         "remote_storage_id": value.remote_storage_id,
                         "remote_storage_name": remote["name"],
+                        "remote_storage_path": remote["path"],
                         "authenticated": True,
                         "host_key_verified": True,
                         "ready": ready,
@@ -938,6 +946,10 @@ class VmbackupApplication:
                         "minimum_free_percent": value.minimum_free_percent,
                         "remote_required_reserve_bytes":
                             remote["required_reserve_bytes"],
+                        "remote_minimum_free_bytes":
+                            remote["minimum_free_bytes"],
+                        "remote_minimum_free_percent":
+                            remote["minimum_free_percent"],
                         "remote_usable_after_reserve_bytes":
                             remote["usable_after_reserve_bytes"],
                     }
@@ -1158,10 +1170,40 @@ class VmbackupApplication:
             / "host_public_key"
         )
 
+        receiver_pid = None
+        receiver_running = False
+        pid_path = Path("/run/vmbackupd-receiver/sshd.pid")
+        try:
+            receiver_pid = int(pid_path.read_text(encoding="ascii").strip())
+            os.kill(receiver_pid, 0)
+            receiver_running = True
+        except PermissionError:
+            # A root-owned sshd exists but the unprivileged daemon cannot
+            # signal it. kill(2) EPERM still proves that the PID exists.
+            receiver_running = receiver_pid is not None
+        except (FileNotFoundError, ProcessLookupError, ValueError, OSError):
+            receiver_pid = None
+
+        config_path = Path("/etc/vmbackupd/receiver_sshd_config")
+        try:
+            receiver_config = config_path.read_text(encoding="utf-8")
+        except OSError:
+            receiver_config = ""
+
         result = {
             "account": "vmbackupd-transfer",
             "port": 22022,
             "backup_root": "/srv/vmbackupd",
+            "service_running": receiver_running,
+            "service_pid": receiver_pid,
+            "restricted_shell_configured": (
+                "ForceCommand /usr/libexec/vmbackupd-receiver-session"
+                in receiver_config
+                and "AuthorizedKeysCommand /usr/libexec/vmbackupd-authorized-keys %u"
+                in receiver_config
+                and Path("/usr/libexec/vmbackupd-receiver-session").exists()
+                and Path("/usr/libexec/vmbackupd-authorized-keys").exists()
+            ),
             "host_key_exists": False,
             "host_key_type": None,
             "host_public_key": None,

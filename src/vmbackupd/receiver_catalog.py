@@ -173,6 +173,23 @@ def build_receiver_node_capability(
     }
 
 
+def build_optional_receiver_node_capability(
+    api_client,
+) -> dict | None:
+    """Read node capability when supported by the remote daemon generation.
+
+    Storage catalog discovery predates ``node.capability``.  Its absence must
+    not hide an otherwise valid registered storage catalog during a rolling
+    RPM upgrade.  Every other API/protocol error remains fatal.
+    """
+    try:
+        return build_receiver_node_capability(api_client)
+    except ApiClientError as exc:
+        if exc.code == "METHOD_NOT_FOUND":
+            return None
+        raise
+
+
 def build_receiver_storage_catalog(
     api_client,
     *,
@@ -219,6 +236,9 @@ def build_receiver_storage_catalog(
             "id": item["id"],
             "name": item["name"],
             "storage_type": "LOCAL",
+            # This is the root of an explicitly registered LOCAL destination,
+            # not arbitrary filesystem discovery or config_json passthrough.
+            "path": item["backup_data_root"],
             "is_default": bool(
                 item.get("is_default", False)
             ),
@@ -263,7 +283,7 @@ def helper_main(
     )
 
     try:
-        node = build_receiver_node_capability(client)
+        node = build_optional_receiver_node_capability(client)
         storages = build_receiver_storage_catalog(client)
     except (
         ApiClientError,

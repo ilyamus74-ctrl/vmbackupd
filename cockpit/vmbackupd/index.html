@@ -220,10 +220,16 @@
           <input id="storage-ssh-host" autocomplete="off">
         </label>
         <label>SSH port
-          <input id="storage-ssh-port" type="number" min="1" max="65535" value="22">
+          <input id="storage-ssh-port" type="number" min="1" max="65535" value="22022">
         </label>
         <label>Remote user
           <input id="storage-ssh-user" value="vmbackupd-transfer" autocomplete="off">
+        </label>
+        <label>Remote root
+          <input id="storage-ssh-remote-root"
+                 value="/srv/vmbackupd"
+                 autocomplete="off">
+          <small>Absolute receiver path used for direct receiver preflight.</small>
         </label>
         <div class="ssh-discovery-panel">
           <p id="storage-ssh-trust-status"
@@ -242,6 +248,10 @@
           </label>
 
           <div class="dialog-actions">
+            <button id="storage-ssh-fetch-key"
+                    type="button">
+              Fetch host key
+            </button>
             <button id="storage-ssh-trust-key"
                     type="button">
               Trust host key
@@ -458,6 +468,15 @@
           <dt>Port</dt>
           <dd id="receiver-port">—</dd>
 
+          <dt>Service</dt>
+          <dd id="receiver-service-status">—</dd>
+
+          <dt>Restricted shell</dt>
+          <dd id="receiver-restricted-status">—</dd>
+
+          <dt>Authorized sources</dt>
+          <dd id="receiver-authorized-count">—</dd>
+
           <dt>Backup root</dt>
           <dd id="receiver-backup-root">—</dd>
 
@@ -477,6 +496,11 @@
           </dd>
         </dl>
       </section>
+
+      <div class="ssh-section-actions">
+        <button id="receiver-repair" type="button">Initialize / Repair receiver</button>
+        <button id="receiver-refresh" type="button">Refresh status</button>
+      </div>
 
       <section class="ssh-setup-section">
         <h3>Authorized sources</h3>

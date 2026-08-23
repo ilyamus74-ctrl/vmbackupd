@@ -138,6 +138,7 @@ def _sanitize_storage(value: object) -> dict:
     storage_id = value.get("id")
     name = value.get("name")
     storage_type = value.get("storage_type")
+    path = value.get("path")
     is_default = value.get("is_default")
     ready = value.get("ready")
 
@@ -147,6 +148,9 @@ def _sanitize_storage(value: object) -> dict:
         or not isinstance(name, str)
         or not name.strip()
         or storage_type != "LOCAL"
+        or not isinstance(path, str)
+        or not path.startswith("/")
+        or ".." in path.split("/")
         or not isinstance(is_default, bool)
         or not isinstance(ready, bool)
     ):
@@ -222,6 +226,7 @@ def _sanitize_storage(value: object) -> dict:
         "id": storage_id.strip(),
         "name": name.strip(),
         "storage_type": "LOCAL",
+        "path": path,
         "is_default": is_default,
         "total_bytes": total_bytes,
         "free_bytes": free_bytes,
@@ -397,11 +402,11 @@ class SSHStorageDiscoveryClient:
                 "SSH receiver returned invalid storage discovery output",
             )
 
-        # The last line is the protocol record. Ignore possible PAM banners.
-        line = output.splitlines()[-1]
-
         try:
-            payload = json.loads(line)
+            # Protocol stdout is one JSON document.  Banners and diagnostics
+            # belong on stderr; accepting surrounding stdout would make the
+            # machine protocol ambiguous.
+            payload = json.loads(output)
         except json.JSONDecodeError:
             raise SSHStorageDiscoveryError(
                 "SSH_STORAGE_DISCOVERY_PROTOCOL_INVALID",

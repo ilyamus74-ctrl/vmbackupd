@@ -1754,12 +1754,42 @@ class RepositoryV2:
 
     def register_discovered_node(
         self,
-        name,
-        **kwargs,
+        node_id,
+        node_name,
     ):
-        return self.get_or_create_node(
-            name
+        if not isinstance(node_id, str) or not node_id.strip():
+            raise DomainInvariantError("REMOTE_NODE_IDENTITY_INVALID")
+        if not isinstance(node_name, str) or not node_name.strip():
+            raise DomainInvariantError("REMOTE_NODE_IDENTITY_INVALID")
+
+        node_id = node_id.strip()
+        node_name = node_name.strip()
+        by_id = self.connection.execute(
+            "SELECT id,name FROM nodes WHERE id=?", (node_id,)
+        ).fetchone()
+        by_name = self.connection.execute(
+            "SELECT id,name FROM nodes WHERE name=?", (node_name,)
+        ).fetchone()
+
+        if by_id is not None or by_name is not None:
+            if (
+                by_id is None
+                or by_name is None
+                or by_id[0] != node_id
+                or by_id[1] != node_name
+                or by_name[0] != node_id
+            ):
+                raise DomainInvariantError(
+                    "REMOTE_NODE_IDENTITY_CONFLICT"
+                )
+            return RepositoryNode(id=by_id[0], name=by_id[1])
+
+        self.connection.execute(
+            "INSERT INTO nodes(id,name,created_at) VALUES(?,?,?)",
+            (node_id, node_name, now()),
         )
+        self.connection.commit()
+        return RepositoryNode(id=node_id, name=node_name)
 
 
     def list_job_replicas(

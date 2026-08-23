@@ -249,6 +249,26 @@ bounded local API over /run/vmbackupd/vmbackupd.sock
 | `vmbackupd.js` | LEGACY | no | previous monolithic UI and mutation semantics | preserve as migration reference |
 | `vmbackupd.css` | SHARED | yes | current styling | retain |
 
+### SSH receiver GUI — Stage 2.2
+
+**Status: NEW / CLOSED.** Real RPM browser acceptance passed for managed client
+identity, explicit host-key trust, receiver catalog discovery, catalog-backed
+SSH destination persistence, and destination testing. The selected
+`remote_storage_id` is the source of truth; the receiver infrastructure root is
+not a backup destination and there is no fallback to another catalog entry.
+
+The active Cockpit controller owns the SSH client identity, receiver status,
+explicit host-key trust, and receiver preflight UI. It uses the bounded
+`ssh.identity.*`, `ssh.hostkey.*`, `receiver.*`, and `storage.test` API methods.
+The official receiver endpoint is port `22022`.
+
+Host keys are fetched with an argv-only `ssh-keyscan` Cockpit process, displayed
+with their SHA-256 fingerprint, and are never trusted automatically. Trust is a
+separate explicit API action. Receiver initialize/repair is a separate Cockpit
+administrative action that starts the packaged restricted receiver units with
+`superuser: "require"`. Private client and host keys are never returned to the
+browser. Replica transfer remains outside this slice.
+
 Before Stage 1, `main.js`, `model.js`, and `views.js` survived installation as
 unowned files even though `index.html` loaded them. Stage 1 packages those exact
 files without changing their JavaScript behavior. A package guard validates that

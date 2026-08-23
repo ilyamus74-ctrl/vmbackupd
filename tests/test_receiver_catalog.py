@@ -96,6 +96,7 @@ def test_receiver_catalog_exposes_only_sanitized_local_storage():
             "id": "local-1",
             "name": "HDD-Backup",
             "storage_type": "LOCAL",
+            "path": "/private/hdd",
             "is_default": True,
             "total_bytes": 4000,
             "free_bytes": 3300,
@@ -116,7 +117,6 @@ def test_receiver_catalog_exposes_only_sanitized_local_storage():
 
     assert "backup_data_root" not in encoded
     assert "receiver_directory" not in encoded
-    assert "/private/hdd" not in encoded
     assert "/private/staging" not in encoded
     assert "ssh-1" not in encoded
 
@@ -191,8 +191,61 @@ def test_receiver_catalog_helper_emits_path_free_contract():
 
     assert "backup_data_root" not in encoded
     assert "receiver_directory" not in encoded
-    assert "/private/hdd" not in encoded
     assert "/private/staging" not in encoded
+
+
+def test_receiver_catalog_survives_daemon_without_optional_node_capability():
+    class StorageOnlyApi(Api):
+        def request(self, method, params=None):
+            if method == "node.capability":
+                self.calls.append((method, params or {}))
+                raise ApiClientError(
+                    "METHOD_NOT_FOUND",
+                    "unknown method: node.capability",
+                )
+            return super().request(method, params)
+
+    output = io.StringIO()
+    errors = io.StringIO()
+    api = StorageOnlyApi()
+
+    result = helper_main(
+        api_client=api,
+        stdout=output,
+        stderr=errors,
+    )
+
+    assert result == 0
+    assert errors.getvalue() == ""
+    payload = json.loads(output.getvalue())
+    assert payload["node"] is None
+    assert [item["id"] for item in payload["storages"]] == ["local-1"]
+    assert api.calls == [
+        ("node.capability", {}),
+        ("storage.list", {}),
+        ("storage.test", {"id": "local-1"}),
+    ]
+
+
+def test_receiver_catalog_does_not_hide_other_node_capability_errors():
+    class BrokenApi(Api):
+        def request(self, method, params=None):
+            if method == "node.capability":
+                raise ApiClientError("INTERNAL_ERROR", "capability failed")
+            return super().request(method, params)
+
+    output = io.StringIO()
+    errors = io.StringIO()
+
+    result = helper_main(
+        api_client=BrokenApi(),
+        stdout=output,
+        stderr=errors,
+    )
+
+    assert result == 69
+    assert output.getvalue() == ""
+    assert "capability failed" in errors.getvalue()
 
 
 def test_receiver_namespace_ready_requires_transfer_layout_and_daemon_access(

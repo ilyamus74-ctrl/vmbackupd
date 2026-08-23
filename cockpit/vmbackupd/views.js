@@ -22,9 +22,16 @@ function setNotice(message, kind) {
     const storageDialog = document.getElementById("storage-dialog");
     const storageForm = document.getElementById("storage-form");
     const storageDeleteButton = document.getElementById("storage-delete");
+    const clientIdentityDialog = document.getElementById("client-identity-dialog");
+    const receiverDialog = document.getElementById("receiver-dialog");
+    const sshDialog = document.getElementById("ssh-dialog");
     let currentModel = null;
     let editingStorageId = null;
+    let sshSetupDestination = null;
     let refreshCallback = async () => {};
+    // Presentation-only state. A persisted SSH destination is valid before any
+    // probe has run, so an absent entry is an ordinary "not tested" state.
+    const sshStorageProbeResults = new Map();
 
 
     function failureMessage(error) {
@@ -63,6 +70,7 @@ function setNotice(message, kind) {
             }
 
             renderSystemDetails(model);
+            void refreshReceiverSourcesSummary();
 
             setNotice(
                 "Ready",
@@ -315,11 +323,15 @@ function setNotice(message, kind) {
 
         document.getElementById("storage-ssh-port").value =
             destination && destination.ssh_port ?
-                destination.ssh_port : 22;
+                destination.ssh_port : 22022;
 
         document.getElementById("storage-ssh-user").value =
             destination && destination.ssh_user ?
                 destination.ssh_user : "vmbackupd-transfer";
+
+        document.getElementById("storage-ssh-remote-root").value =
+            destination && destination.ssh_remote_root ?
+                destination.ssh_remote_root : "";
 
         const reserve = exactByteParts(
             destination ? destination.minimum_free_bytes : 0
@@ -397,6 +409,10 @@ function setNotice(message, kind) {
         ).onclick = discoverStorageSSH;
 
         document.getElementById(
+            "storage-ssh-fetch-key"
+        ).onclick = fetchStorageSSHHostKey;
+
+        document.getElementById(
             "storage-ssh-trust-key"
         ).onclick = trustStorageSSHHostKey;
 
@@ -435,6 +451,9 @@ function setNotice(message, kind) {
                 Number(document.getElementById("storage-ssh-port").value);
             params.ssh_user =
                 document.getElementById("storage-ssh-user").value.trim();
+            const remoteRoot = cleanPath(
+                document.getElementById("storage-ssh-remote-root").value
+            );
 
             const signature =
                 storageSSHEndpointSignature();
@@ -449,22 +468,31 @@ function setNotice(message, kind) {
                     item => item.id === selectedId
                 );
 
-            if (
+            if (!selected && !remoteRoot && (
                 !signature ||
                 signature !== storageSSHDiscoverySignature ||
-                !selected ||
-                selected.ready !== true
-            )
+                !selected
+            ))
+                throw new Error(
+                    "Enter a remote root or check connection and select a ready remote storage before saving."
+                );
+
+            if (
+                signature &&
+                signature === storageSSHDiscoverySignature &&
+                selected &&
+                selected.ready === true
+            ) {
+                params.remote_storage_id = selected.id;
+                params.ssh_remote_root = null;
+            } else if (remoteRoot) {
+                params.ssh_remote_root = remoteRoot;
+                params.remote_storage_id = null;
+            } else {
                 throw new Error(
                     "Check connection and select a ready remote storage before saving."
                 );
-
-            params.remote_storage_id =
-                selected.id;
-
-            // Explicitly clears a legacy path when editing an old
-            // SSH destination into the v11 stable-ID contract.
-            params.ssh_remote_root = null;
+            }
         }
 
         return params;
@@ -509,7 +537,7 @@ function setNotice(message, kind) {
             if (storageType(destination) === "SSH") {
                 sshStorageProbeResults.set(
                     destination.id,
-                    result,
+                    { status: "success", result },
                 );
 
                 if (currentModel)
@@ -519,8 +547,12 @@ function setNotice(message, kind) {
             showProbeResult(resultNode, result);
         } catch (error) {
             if (storageType(destination) === "SSH") {
-                sshStorageProbeResults.delete(
-                    destination.id
+                sshStorageProbeResults.set(
+                    destination.id,
+                    {
+                        status: "failed",
+                        error: failureMessage(error),
+                    },
                 );
 
                 if (currentModel)
@@ -733,16 +765,52 @@ function setNotice(message, kind) {
         const probe =
             sshStorageProbeResults.get(destination.id);
 
-        if (!probe)
-            return "Not checked";
+        if (!probe) {
+            const remote = remoteCatalogStorage(destination);
+            return remote ? bytes(remote.free_bytes) : "Not tested";
+        }
+
+        if (probe.status === "failed")
+            return "Probe failed";
+
+        const result = probe.result;
 
         if (
-            probe.free_bytes === null ||
-            probe.free_bytes === undefined
+            !result ||
+            result.free_bytes === null ||
+            result.free_bytes === undefined
         )
             return "Unknown";
 
-        return bytes(probe.free_bytes);
+        return bytes(result.free_bytes);
+    }
+
+    function remoteCatalogStorage(destination) {
+        if (!destination || !destination.remote_storage_id)
+            return null;
+        const discovered = storageSSHDiscoveryStorages.find(
+            item => item.id === destination.remote_storage_id
+        );
+        if (discovered)
+            return discovered;
+
+        const probe = sshStorageProbeResults.get(destination.id);
+        const result = probe && probe.status === "success" ? probe.result : null;
+        if (!result || result.remote_storage_id !== destination.remote_storage_id)
+            return null;
+
+        return {
+            id: result.remote_storage_id,
+            name: result.remote_storage_name,
+            path: result.remote_storage_path,
+            ready: result.ready === true,
+            free_bytes: result.free_bytes,
+            total_bytes: result.total_bytes,
+            minimum_free_bytes: result.remote_minimum_free_bytes,
+            minimum_free_percent: result.remote_minimum_free_percent,
+            required_reserve_bytes: result.remote_required_reserve_bytes,
+            usable_after_reserve_bytes: result.remote_usable_after_reserve_bytes,
+        };
     }
 
     function storageType(destination) {
@@ -764,12 +832,13 @@ function setNotice(message, kind) {
 
     function storageDestinationCell(destination) {
         const container = document.createElement("div");
+        const remote = remoteCatalogStorage(destination);
         const primary = element(
             "div",
             storageType(destination) === "SSH" ?
                 (
                     destination.remote_storage_id ?
-                        `Remote storage ${destination.remote_storage_id}` :
+                        `Remote storage: ${remote ? remote.name : destination.remote_storage_id}` :
                         `Legacy remote path ${destination.ssh_remote_root || "unknown"}`
                 ) :
                 destination.backup_data_root,
@@ -780,7 +849,9 @@ function setNotice(message, kind) {
         if (storageType(destination) === "SSH") {
             container.append(element(
                 "div",
-                "Staging managed automatically",
+                destination.remote_storage_id ?
+                    `Destination path: ${remote ? remote.path : "unknown until catalog refresh"}` :
+                    "Staging managed automatically",
                 "storage-secondary",
             ));
         }
@@ -789,6 +860,7 @@ function setNotice(message, kind) {
     }
 
     function renderStorage(model) {
+        currentModel = model;
         const rows = model.storage.map(destination => {
             const type = storageType(destination);
             const isSSH = type === "SSH";
@@ -825,8 +897,9 @@ function setNotice(message, kind) {
                 sshTarget(destination) :
                 text(model.status.node_name);
 
+            const remote = isSSH ? remoteCatalogStorage(destination) : null;
             const reserve = isSSH ?
-                `Remote: ${bytes(destination.minimum_free_bytes)} / ${text(destination.minimum_free_percent)}%` :
+                `Remote: ${bytes(remote ? remote.minimum_free_bytes : destination.minimum_free_bytes)} / ${text(remote ? remote.minimum_free_percent : destination.minimum_free_percent)}%` :
                 `${bytes(destination.minimum_free_bytes)} / ${text(destination.minimum_free_percent)}%`;
 
             return tableRow([
@@ -1132,12 +1205,16 @@ function setNotice(message, kind) {
             item => item.id === select.value
         );
 
-        submit.disabled = !(
+        const remoteRoot = cleanPath(
+            document.getElementById("storage-ssh-remote-root").value
+        );
+
+        submit.disabled = !(remoteRoot || (
             signature &&
             signature === storageSSHDiscoverySignature &&
             selected &&
             selected.ready === true
-        );
+        ));
     }
 
     function resetStorageSSHDiscovery(
@@ -1331,6 +1408,51 @@ function setNotice(message, kind) {
         }
     }
 
+    async function fetchStorageSSHHostKey() {
+        const errorNode = document.getElementById("storage-form-error");
+        const status = document.getElementById("storage-ssh-trust-status");
+        const endpoint = storageSSHEndpoint();
+        errorNode.textContent = "";
+
+        if (!endpoint.host || endpoint.host.startsWith("-") ||
+            !Number.isInteger(endpoint.port) || endpoint.port < 1 || endpoint.port > 65535) {
+            errorNode.textContent = "Enter a valid receiver host and port.";
+            return;
+        }
+
+        status.textContent = `Fetching ed25519 host key from ${endpoint.host}:${endpoint.port}…`;
+
+        try {
+            const output = await window.cockpit.spawn(
+                ["ssh-keyscan", "-T", "5", "-p", String(endpoint.port),
+                    "-t", "ed25519", endpoint.host],
+                { err: "message" },
+            );
+            const line = output.split("\n").find(value =>
+                value && !value.startsWith("#") && value.includes(" ssh-ed25519 ")
+            );
+            if (!line)
+                throw new Error("receiver returned no ed25519 host key");
+            const parts = line.trim().split(/\s+/);
+            const publicKey = `${parts[1]} ${parts[2]}`;
+            const raw = Uint8Array.from(window.atob(parts[2]), char => char.charCodeAt(0));
+            const digest = new Uint8Array(
+                await window.crypto.subtle.digest("SHA-256", raw)
+            );
+            const fingerprint = "SHA256:" + window.btoa(
+                String.fromCharCode(...digest)
+            ).replace(/=+$/, "");
+
+            document.getElementById("storage-ssh-hostkey").value = publicKey;
+            status.textContent =
+                `Fetched ${fingerprint} from ${endpoint.host}:${endpoint.port}. ` +
+                "Verify it out of band, then click Trust host key.";
+        } catch (error) {
+            errorNode.textContent = failureMessage(error);
+            status.textContent = "Host key fetch failed; trust was not changed.";
+        }
+    }
+
     async function discoverStorageSSH() {
         const errorNode = document.getElementById(
             "storage-form-error"
@@ -1432,6 +1554,9 @@ function setNotice(message, kind) {
                 Number(document.getElementById("storage-ssh-port").value);
             params.ssh_user =
                 document.getElementById("storage-ssh-user").value.trim();
+            const remoteRoot = cleanPath(
+                document.getElementById("storage-ssh-remote-root").value
+            );
 
             const signature =
                 storageSSHEndpointSignature();
@@ -1446,22 +1571,31 @@ function setNotice(message, kind) {
                     item => item.id === selectedId
                 );
 
-            if (
+            if (!selected && !remoteRoot && (
                 !signature ||
                 signature !== storageSSHDiscoverySignature ||
-                !selected ||
-                selected.ready !== true
-            )
+                !selected
+            ))
+                throw new Error(
+                    "Enter a remote root or check connection and select a ready remote storage before saving."
+                );
+
+            if (
+                signature &&
+                signature === storageSSHDiscoverySignature &&
+                selected &&
+                selected.ready === true
+            ) {
+                params.remote_storage_id = selected.id;
+                params.ssh_remote_root = null;
+            } else if (remoteRoot) {
+                params.ssh_remote_root = remoteRoot;
+                params.remote_storage_id = null;
+            } else {
                 throw new Error(
                     "Check connection and select a ready remote storage before saving."
                 );
-
-            params.remote_storage_id =
-                selected.id;
-
-            // Explicitly clears a legacy path when editing an old
-            // SSH destination into the v11 stable-ID contract.
-            params.ssh_remote_root = null;
+            }
         }
 
         return params;
@@ -1504,7 +1638,7 @@ function setNotice(message, kind) {
             if (storageType(destination) === "SSH") {
                 sshStorageProbeResults.set(
                     destination.id,
-                    result,
+                    { status: "success", result },
                 );
 
                 if (currentModel)
@@ -1514,8 +1648,12 @@ function setNotice(message, kind) {
             showProbeResult(resultNode, result);
         } catch (error) {
             if (storageType(destination) === "SSH") {
-                sshStorageProbeResults.delete(
-                    destination.id
+                sshStorageProbeResults.set(
+                    destination.id,
+                    {
+                        status: "failed",
+                        error: failureMessage(error),
+                    },
                 );
 
                 if (currentModel)
@@ -1907,6 +2045,10 @@ function setNotice(message, kind) {
             text(info.port);
         document.getElementById("receiver-backup-root").textContent =
             text(info.backup_root);
+        document.getElementById("receiver-service-status").textContent =
+            info.service_running ? "Running" : "Stopped";
+        document.getElementById("receiver-restricted-status").textContent =
+            info.restricted_shell_configured ? "Configured" : "Needs repair";
 
         document.getElementById("receiver-hostkey-status").textContent =
             info.host_key_exists ? "Available" : "Not generated";
@@ -1921,6 +2063,8 @@ function setNotice(message, kind) {
     }
 
     function renderReceiverSources(sources) {
+        document.getElementById("receiver-authorized-count").textContent =
+            String(sources.length);
         for (const bodyId of [
             "receiver-sources-summary",
             "receiver-sources",
@@ -2009,6 +2153,23 @@ function setNotice(message, kind) {
 
         receiverDialog.showModal();
         await refreshReceiverSetup();
+    }
+
+    async function repairReceiver() {
+        setReceiverSetupError("");
+        try {
+            await window.cockpit.spawn(
+                ["systemctl", "enable", "--now",
+                    "vmbackupd-receiver-catalog.socket",
+                    "vmbackupd-receiver-resolver.socket",
+                    "vmbackupd-receiver-sshd.service"],
+                { superuser: "require", err: "message" },
+            );
+            await refreshReceiverSetup();
+            setNotice("SSH receiver initialized and verified", "success");
+        } catch (error) {
+            setReceiverSetupError(failureMessage(error));
+        }
     }
 
     async function addReceiverSource() {
@@ -2334,10 +2495,59 @@ function setNotice(message, kind) {
     );
     storageForm.addEventListener("submit", saveStorage);
 
+    document.getElementById("client-identity-open").addEventListener(
+        "click", openClientIdentity
+    );
+    document.getElementById("client-identity-generate").addEventListener(
+        "click", generateClientIdentity
+    );
+    document.getElementById("client-identity-rotate").addEventListener(
+        "click", rotateClientIdentity
+    );
+    document.getElementById("client-identity-close").addEventListener(
+        "click", () => clientIdentityDialog.close()
+    );
+
+    document.getElementById("receiver-open").addEventListener(
+        "click", openReceiverSetup
+    );
+    document.getElementById("receiver-refresh").addEventListener(
+        "click", refreshReceiverSetup
+    );
+    document.getElementById("receiver-repair").addEventListener(
+        "click", repairReceiver
+    );
+    document.getElementById("receiver-source-add").addEventListener(
+        "click", addReceiverSource
+    );
+    document.getElementById("receiver-close").addEventListener(
+        "click", () => receiverDialog.close()
+    );
+
+    document.getElementById("ssh-identity-generate").addEventListener(
+        "click", generateSSHIdentity
+    );
+    document.getElementById("ssh-identity-rotate").addEventListener(
+        "click", rotateSSHIdentity
+    );
+    document.getElementById("ssh-hostkey-add").addEventListener(
+        "click", addSSHHostKey
+    );
+    document.getElementById("ssh-hostkey-revoke").addEventListener(
+        "click", revokeSSHHostKey
+    );
+    document.getElementById("ssh-close").addEventListener(
+        "click", () => sshDialog.close()
+    );
+
     Object.assign(window.VmbackupViews, {
         openStorageDialog,
         renderStorage,
         testStoredDestination,
         failureMessage,
+        openClientIdentity,
+        openReceiverSetup,
+        refreshReceiverSetup,
+        fetchStorageSSHHostKey,
     });
 })();
