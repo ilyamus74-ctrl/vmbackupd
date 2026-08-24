@@ -5,8 +5,8 @@ Description=vmbackupd restricted receiver storage resolver socket
 ListenStream=/run/vmbackupd-receiver-resolver.sock
 Accept=yes
 SocketUser=vmbackupd-transfer
-SocketGroup=vmbackupd-transfer
-SocketMode=0600
+SocketGroup=vmbackupd
+SocketMode=0660
 RemoveOnStop=yes
 
 [Install]

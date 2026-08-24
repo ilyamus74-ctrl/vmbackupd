@@ -300,10 +300,10 @@ def test_receiver_resolver_bridge_is_internal_and_socket_activated():
         in socket_unit
     )
     assert (
-        "SocketGroup=vmbackupd-transfer"
+        "SocketGroup=vmbackupd"
         in socket_unit
     )
-    assert "SocketMode=0600" in socket_unit
+    assert "SocketMode=0660" in socket_unit
 
     assert "User=vmbackupd" in service
     assert "Group=vmbackupd" in service

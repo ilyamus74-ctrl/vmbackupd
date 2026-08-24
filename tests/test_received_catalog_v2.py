@@ -37,5 +37,6 @@ def test_missing_published_marker_marks_catalog_missing(tmp_path):
 def test_received_delete_contract_is_exposed_in_application_source():
     source = open("src/vmbackupd/application.py", encoding="utf-8").read()
     assert '"received.delete": self.received_delete' in source
-    assert "delete_published_replica" in source
+    assert "ReceiverReclaimDeleteClient" in source
+    assert "deleter.delete(destination.id, source_id, object_id)" in source
     assert "source_bundle_object_id" in open("src/vmbackupd/repository_v2.py", encoding="utf-8").read()

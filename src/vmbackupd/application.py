@@ -1930,7 +1930,17 @@ class VmbackupApplication:
         ]
         candidates.sort(key=lambda value: int(value.get("sequence", 0)), reverse=True)
 
-        from .receiver_reclaim_delete import delete_published_replica, ReceiverReclaimDeleteError
+        # Do not delete receiver data directly from the main daemon.  The
+        # daemon is intentionally sandboxed and configured LOCAL storage roots
+        # may live outside its ReadWritePaths (for example /STOR).  Route the
+        # destructive operation through the restricted receiver resolver
+        # helper, which resolves the storage ID and performs the same checked
+        # publication delete used by SSH retention.
+        from .receiver_reclaim_delete import (
+            ReceiverReclaimDeleteClient,
+            ReceiverReclaimDeleteError,
+        )
+        deleter = ReceiverReclaimDeleteClient()
         deleted = []
         for value in candidates:
             source_id = value.get("source_restore_point_id")
@@ -1941,14 +1951,7 @@ class VmbackupApplication:
                     "received backup is missing publication identity",
                 )
             try:
-                delete_published_replica(
-                    {
-                        "storage_id": destination.id,
-                        "backup_data_root": destination.backup_data_root,
-                    },
-                    source_id,
-                    object_id,
-                )
+                deleter.delete(destination.id, source_id, object_id)
             except ReceiverReclaimDeleteError as exc:
                 raise ApplicationError(exc.code, str(exc)) from exc
             deleted.append(value["id"])
