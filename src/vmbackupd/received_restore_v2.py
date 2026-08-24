@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -188,7 +189,66 @@ class ReceivedRestoreRuntimeV2:
             raise ReceivedRestoreError("RESTORE_TARGET_SYMLINK_ESCAPE", "restore target parent escapes the selected storage root")
         if not os.access(resolved_parent, os.W_OK | os.X_OK):
             raise ReceivedRestoreError("RESTORE_TARGET_NOT_WRITABLE", "vmbackupd cannot write to target parent folder")
-        return target
+
+        destination = next(
+            item for item in self.repository.list_storage_destinations(self.node_id)
+            if str(Path(item.backup_data_root).resolve(strict=True)) == str(matching_root)
+        )
+        return target, matching_root, destination
+
+    @staticmethod
+    def _apply_libvirt_access(target: Path, storage_root: Path, destination) -> None:
+        """Make restored images traversable/readable by the storage's QEMU group.
+
+        LOCAL storage preparation already records the intended uid/gid.  Restore
+        subdirectories must inherit that access contract as well; otherwise a
+        perfectly materialized image can be unreadable by the qemu process.
+        """
+        gid = getattr(destination, "backup_data_gid", None)
+        if gid is None:
+            raise ReceivedRestoreError(
+                "RESTORE_TARGET_GROUP_UNAVAILABLE",
+                "selected LOCAL storage has no backup_data_gid for libvirt access",
+            )
+
+        # Repair every directory below the registered storage root that qemu
+        # must traverse.  Do not alter the storage root itself; it is managed
+        # by the storage preparation contract.
+        current = target.parent
+        ancestors = []
+        while current != storage_root:
+            ancestors.append(current)
+            parent = current.parent
+            if parent == current:
+                raise ReceivedRestoreError(
+                    "RESTORE_TARGET_OUTSIDE_LOCAL_STORAGE",
+                    "restore target escaped the selected storage root",
+                )
+            current = parent
+        for directory in reversed(ancestors):
+            try:
+                os.chown(directory, -1, int(gid))
+                mode = stat.S_IMODE(directory.stat().st_mode) | stat.S_IRGRP | stat.S_IXGRP
+                os.chmod(directory, mode)
+            except OSError as exc:
+                raise ReceivedRestoreError(
+                    "RESTORE_TARGET_PERMISSION_FAILED",
+                    f"cannot grant libvirt access to {directory}: {exc}",
+                ) from exc
+
+        for path in [target, *target.rglob("*")]:
+            try:
+                os.chown(path, -1, int(gid))
+                if path.is_dir():
+                    mode = stat.S_IMODE(path.stat().st_mode) | stat.S_IRGRP | stat.S_IXGRP
+                else:
+                    mode = stat.S_IMODE(path.stat().st_mode) | stat.S_IRGRP
+                os.chmod(path, mode)
+            except OSError as exc:
+                raise ReceivedRestoreError(
+                    "RESTORE_TARGET_PERMISSION_FAILED",
+                    f"cannot grant libvirt access to {path}: {exc}",
+                ) from exc
 
     def _materialize_disk(self, chain, target_dev: str, staging: Path):
         source = Path(chain[0]["bundle_object_id"]) / "disks" / f"{target_dev}.qcow2"
@@ -258,7 +318,7 @@ class ReceivedRestoreRuntimeV2:
                 )
             if operation.state is RestoreOperationState.VERIFYING:
                 chain, disk_targets = self._validate_chain(operation)
-                target = self._safe_target(operation)
+                target, storage_root, destination = self._safe_target(operation)
                 if operation.target_vm_name in tuple(self.read_driver.list_domain_names()):
                     raise ReceivedRestoreError("RESTORE_DOMAIN_NAME_EXISTS", "target libvirt domain name already exists")
                 operation = self.repository.transition_received_restore_v2(
@@ -281,6 +341,7 @@ class ReceivedRestoreRuntimeV2:
                     "chain": [p["id"] for p in chain],
                 }, sort_keys=True) + "\n", encoding="utf-8")
                 os.replace(staging, target)
+                self._apply_libvirt_access(target, storage_root, destination)
                 operation = self.repository.transition_received_restore_v2(
                     operation.id, "MATERIALIZING", "DEFINING", self.clock.now()
                 )

@@ -104,6 +104,7 @@ class VmbackupApplication:
             "restore_point.delete": self.restore_point_delete,
             "replica.retry": self.replica_retry,
             "received.list": self.received_list,
+            "received.delete": self.received_delete,
             "received.restore.create": self.received_restore_create,
             "restore.create": self.restore_create,
             "restore.list": self.restore_list,
@@ -1900,6 +1901,62 @@ class VmbackupApplication:
         # Keep MISSING imports in RepositoryV2 for diagnostics/history, but do
         # not present physically deleted replicas as restorable backups.
         return [value for value in values if value.get("status") == "AVAILABLE"]
+
+    def received_delete(self, restore_point_id):
+        if not isinstance(restore_point_id, str) or not restore_point_id.strip():
+            raise ApplicationError("INVALID_PARAMS", "restore_point_id must be a non-empty string")
+        point = self.repository.get_received_restore_point_v2(restore_point_id.strip(), self.node.id)
+        if point is None:
+            raise ApplicationError("NOT_FOUND", "received restore point not found")
+        try:
+            destination = self.repository.get_storage_destination(
+                self.node.id, point["storage_destination_id"]
+            )
+        except KeyError as exc:
+            raise ApplicationError("NOT_FOUND", "received storage destination not found") from exc
+        if destination.storage_type is not StorageType.LOCAL:
+            raise ApplicationError("RECEIVED_DELETE_STORAGE_INVALID", "received backup storage must be LOCAL")
+
+        # Deleting a base or middle incremental must also remove all descendants
+        # so the receiver can never be left with an orphan chain.
+        values = self.repository.list_received_restore_points(self.node.id)
+        chain_id = point.get("chain_id")
+        selected_sequence = int(point.get("sequence", 0))
+        candidates = [
+            value for value in values
+            if value.get("storage_destination_id") == point.get("storage_destination_id")
+            and value.get("chain_id") == chain_id
+            and int(value.get("sequence", 0)) >= selected_sequence
+        ]
+        candidates.sort(key=lambda value: int(value.get("sequence", 0)), reverse=True)
+
+        from .receiver_reclaim_delete import delete_published_replica, ReceiverReclaimDeleteError
+        deleted = []
+        for value in candidates:
+            source_id = value.get("source_restore_point_id")
+            object_id = value.get("source_bundle_object_id")
+            if not source_id or not object_id:
+                raise ApplicationError(
+                    "RECEIVED_DELETE_METADATA_INVALID",
+                    "received backup is missing publication identity",
+                )
+            try:
+                delete_published_replica(
+                    {
+                        "storage_id": destination.id,
+                        "backup_data_root": destination.backup_data_root,
+                    },
+                    source_id,
+                    object_id,
+                )
+            except ReceiverReclaimDeleteError as exc:
+                raise ApplicationError(exc.code, str(exc)) from exc
+            deleted.append(value["id"])
+
+        catalog = getattr(self, "received_catalog", None)
+        if catalog is not None:
+            catalog.reconcile()
+        return {"deleted_restore_point_ids": deleted}
 
     def received_restore_create(self, restore_point_id, target_vm_name, target_root=None,
                                 start_after_restore=False, target_destination_id=None,

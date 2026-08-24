@@ -525,3 +525,9 @@ def test_seeded_full_replica_renders_network_savings():
     assert 'replica.transport_mode === "SEEDED_FULL"' in source
     assert "Seeded FULL · transfer" in source
     assert "source_payload_bytes" in source
+
+
+def test_received_backup_delete_action_is_wired():
+    source = open("cockpit/vmbackupd/views.js", encoding="utf-8").read()
+    assert 'api.request("received.delete"' in source
+    assert 'actionButton("Delete", () => deleteReceivedBackup(point)' in source

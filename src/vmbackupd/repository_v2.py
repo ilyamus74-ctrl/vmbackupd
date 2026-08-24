@@ -3523,7 +3523,8 @@ class RepositoryV2:
             m=self._json_object(row["metadata_json"],"RESTORE_POINT_METADATA_INVALID")
             out.append({"id":row["id"],"kind":row["kind"],"status":m.get("received_status","AVAILABLE"),"created_at":row["created_at"],
                 "storage_destination_id":row["storage_destination_id"],"storage_name":row["storage_name"],"vm_name":row["vm_name"],
-                "bundle_object_id":m.get("bundle_object_id"),"source_restore_point_id":m.get("source_restore_point_id"),
+                "bundle_object_id":m.get("bundle_object_id"),"source_bundle_object_id":m.get("source_bundle_object_id"),
+                "source_restore_point_id":m.get("source_restore_point_id"),
                 "chain_id":m.get("chain_id"),"sequence":m.get("sequence",0),"parent_restore_point_id":m.get("parent_restore_point_id"),"origin":m.get("origin",{})})
         return out
 

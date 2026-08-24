@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,7 +45,7 @@ class Runtime(ReceivedRestoreRuntimeV2):
 def setup(tmp_path):
     repo=RepositoryV2.open(tmp_path/"state.db"); now=datetime.now(timezone.utc).isoformat(); root=tmp_path/"backup"; root.mkdir()
     repo.connection.execute("INSERT INTO nodes VALUES(?,?,?)",(NODE,"receiver",now))
-    repo.connection.execute("INSERT INTO storage_destinations VALUES(?,?,?,?,?,?)",(STORAGE,NODE,"STOR_HDD","LOCAL",json.dumps({"backup_data_root":str(root),"backup_data_mode":"0750","minimum_free_bytes":0,"minimum_free_percent":0,"is_default":True}),now)); repo.connection.commit()
+    repo.connection.execute("INSERT INTO storage_destinations VALUES(?,?,?,?,?,?)",(STORAGE,NODE,"STOR_HDD","LOCAL",json.dumps({"backup_data_root":str(root),"backup_data_mode":"0750","backup_data_gid":os.getgid(),"minimum_free_bytes":0,"minimum_free_percent":0,"is_default":True}),now)); repo.connection.commit()
     return repo,root
 
 
@@ -76,6 +77,9 @@ def test_received_incremental_restore_materializes_chain_defines_registers_and_s
     read=ReadDriver(); mutation=MutationDriver(read); runtime=Runtime(repo,NODE,Runner(),read,mutation,Clock(),True)
     result=runtime.advance(op.id)
     assert result.state.value=="SUCCESS"; assert target.joinpath("disks/vda.qcow2").is_file(); assert mutation.started==["restored"]
+    assert target.joinpath("disks/vda.qcow2").stat().st_gid == os.getgid()
+    assert target.parent.stat().st_gid == os.getgid()
+    assert target.parent.stat().st_mode & 0o050 == 0o050
     registered=[v for v in repo.list_vms(NODE) if v.name=="restored"]; assert len(registered)==1
     xml=target.joinpath("metadata/restored-domain.xml").read_text(); assert "/old.qcow2" not in xml; assert str(target/"disks/vda.qcow2") in xml; assert 'state="down"' in xml
 

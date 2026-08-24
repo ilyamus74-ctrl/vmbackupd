@@ -32,3 +32,10 @@ def test_reconcile_is_idempotent(tmp_path):
 
 def test_missing_published_marker_marks_catalog_missing(tmp_path):
     repo,root=setup_repo(tmp_path); _,marker=fixture(root); c=ReceivedCatalogV2(repo,NODE); c.reconcile(); marker.unlink(); c.reconcile(); assert repo.list_received_restore_points(NODE)[0]["status"]=="MISSING"
+
+
+def test_received_delete_contract_is_exposed_in_application_source():
+    source = open("src/vmbackupd/application.py", encoding="utf-8").read()
+    assert '"received.delete": self.received_delete' in source
+    assert "delete_published_replica" in source
+    assert "source_bundle_object_id" in open("src/vmbackupd/repository_v2.py", encoding="utf-8").read()

@@ -3033,6 +3033,22 @@ function setNotice(message, kind) {
         }
     }
 
+    async function deleteReceivedBackup(point) {
+        const relation = String(point.kind || "").toUpperCase() === "FULL"
+            ? "This removes the FULL and all received incrementals in this chain."
+            : "This removes this restore point and all received descendants.";
+        if (!window.confirm(
+            `Delete received backup permanently?\n\n${point.vm_name || "received-vm"}\n${relation}`
+        )) return;
+        try {
+            await api.request("received.delete", { restore_point_id: point.id });
+            setNotice("Received backup deleted.", "success");
+            await refresh();
+        } catch (exc) {
+            setNotice(failureMessage(exc), "error");
+        }
+    }
+
     function renderReceived(model) {
         const values = Array.isArray(model.received) ? model.received : [];
         const rows = values.map(point => {
@@ -3041,6 +3057,7 @@ function setNotice(message, kind) {
             actions.className = "row-actions";
             const canRestore = point.status === "AVAILABLE";
             actions.append(actionButton("Restore", () => openReceivedRestore(point), !canRestore));
+            actions.append(actionButton("Delete", () => deleteReceivedBackup(point), point.status !== "AVAILABLE"));
             if (operation) {
                 actions.append(badge(
                     operation.state || "—",
