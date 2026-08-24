@@ -85,61 +85,36 @@ def _staging(tmp_path):
 
     (metadata / "domain.xml").write_bytes(domain)
 
-    restore = {
-        "application_consistency": "crash-consistent",
-        "backup_completed_at": COMPLETED,
-        "backup_kind": "FULL",
-        "bundle_id": RUN_ID,
-        "chain_id": CHAIN_ID,
-        "disks": [{
-            "format": "qcow2",
-            "planned_capacity": 8192,
-            "relative_path": "disks/vda.qcow2",
-            "target": "vda",
-            "verified_size": 4096,
-        }],
-        "format_version": 1,
-        "job_run_id": RUN_ID,
-        "metadata_paths": {
-            "domain_xml": "metadata/domain.xml",
-            "manifest": "metadata/manifest.json",
-            "restore_point": "metadata/restore-point.json",
-        },
-        "parent_restore_point_id": None,
-        "run_created_at": RUN_CREATED,
-        "sequence": 0,
-        "storage_destination_id": SOURCE_STORAGE_ID,
-        "verification_level": "structural",
-        "vm": {
-            "external_id": "vm",
-            "id": VM_ID,
-            "libvirt_domain_uuid": DOMAIN_UUID,
-            "name": "vm",
-        },
+    disk = {
+        "target": "vda",
+        "relative_path": "disks/vda.qcow2",
+        "format": "qcow2",
+        "virtual_size": 8192,
+        "size_bytes": 4096,
     }
 
     manifest = {
-        "application_consistency": "crash-consistent",
-        "backup_kind": "FULL",
-        "checkpoint_name": None,
-        "completed_at": COMPLETED,
-        "created_at": RUN_CREATED,
-        "disks": [{
-            "artifact_path": "disks/vda.qcow2",
-            "image_format": "qcow2",
-            "size_bytes": 4096,
-            "source": {
-                "format": "qcow2",
-                "path": "/source/vda.qcow2",
-                "type": "file",
-            },
-            "target": "vda",
-        }],
-        "libvirt_domain_uuid": DOMAIN_UUID,
+        "format_version": 1,
         "run_id": RUN_ID,
-        "verification_level": "structural",
+        "job_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         "vm_id": VM_ID,
+        "storage_destination_id": SOURCE_STORAGE_ID,
+        "backup_kind": "FULL",
+        "chain_id": CHAIN_ID,
+        "sequence": 0,
+        "parent_restore_point_id": None,
+        "libvirt_checkpoint_name": None,
+        "libvirt_domain_uuid": DOMAIN_UUID,
+        "disks": [disk],
     }
+
+    restore = {
+        **manifest,
+        "id": POINT_ID,
+        "job_run_id": RUN_ID,
+        "status": "AVAILABLE",
+    }
+
 
     _write_json(
         metadata / "restore-point.json",
@@ -240,7 +215,7 @@ def test_full_publish_is_atomic_idempotent_and_crash_reconcilable(
         VM_ID,
         RUN_ID,
         datetime.fromisoformat(
-            RUN_CREATED
+            POINT_CREATED
         ),
     )
 
@@ -612,3 +587,66 @@ def test_resolver_helper_dispatches_publish_to_privileged_handler(
         ["receiver_namespace"]
         == str(namespace)
     )
+
+
+def test_compact_v2_incremental_publish_accepts_published_parent(tmp_path):
+    root, _, staging, storage = _staging(tmp_path)
+
+    parent_object = f"vms/{VM_ID}/2026/08/parent"
+    (root / parent_object).mkdir(parents=True)
+    published = root / ".vmbackupd-replica-state" / "published"
+    published.mkdir(parents=True)
+    _write_json(
+        published / f"{PARENT_ID}.json",
+        {
+            "version": 1,
+            "state": "PUBLISHED",
+            "transfer_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "storage_id": STORAGE_ID,
+            "restore_point_id": PARENT_ID,
+            "vm_id": VM_ID,
+            "job_run_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "chain_id": CHAIN_ID,
+            "kind": "FULL",
+            "sequence": 0,
+            "parent_restore_point_id": None,
+            "bundle_object_id": parent_object,
+        },
+    )
+
+    transfer_path = staging / "transfer.json"
+    transfer = json.loads(transfer_path.read_text())
+    transfer["restore_point"].update({
+        "kind": "INCREMENTAL",
+        "sequence": 1,
+        "parent_restore_point_id": PARENT_ID,
+    })
+
+    metadata = staging / "bundle" / "metadata"
+    for filename in ("manifest.json", "restore-point.json"):
+        path = metadata / filename
+        value = json.loads(path.read_text())
+        value.update({
+            "backup_kind": "INCREMENTAL",
+            "sequence": 1,
+            "parent_restore_point_id": PARENT_ID,
+            "libvirt_checkpoint_name": "checkpoint-1",
+        })
+        _write_json(path, value)
+        relative = f"metadata/{filename}"
+        for item in transfer["files"]:
+            if item["path"] == relative:
+                size = path.stat().st_size
+                item["logical_size"] = size
+                item["payload_bytes"] = size
+
+    _write_json(transfer_path, transfer)
+    receipt_path = staging / "receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    receipt["payload_bytes"] = sum(item["payload_bytes"] for item in transfer["files"])
+    _write_json(receipt_path, receipt)
+
+    result = publish_staged_replica(
+        storage, TRANSFER_ID, POINT_ID, runner=_fake_qemu
+    )
+    assert result["status"] == "PUBLISHED"

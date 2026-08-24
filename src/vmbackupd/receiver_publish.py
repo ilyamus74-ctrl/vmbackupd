@@ -291,6 +291,7 @@ def _qcow2(path: Path, file_size: int, capacity: int, runner) -> None:
 
 
 def _bundle(bundle: Path, declaration, runner) -> dict:
+    """Validate a staged Compact V2 bundle against its transfer declaration."""
     _real_dir(bundle, "replica bundle")
     metadata, disks = bundle / "metadata", bundle / "disks"
     _real_dir(metadata, "metadata directory")
@@ -325,25 +326,22 @@ def _bundle(bundle: Path, declaration, runner) -> dict:
 
     restore = _json(metadata / "restore-point.json", "restore-point metadata")
     manifest = _json(metadata / "manifest.json", "manifest")
-    vm = restore.get("vm")
     restore_disks = restore.get("disks")
+    manifest_disks = manifest.get("disks")
 
+    # Compact V2 is authoritative.  Do not require the retired rich/legacy
+    # fields (bundle_id, metadata_paths, vm{}, run_created_at, ...).
     if (
         restore.get("format_version") != 1
-        or restore.get("backup_kind") != declaration.kind
-        or restore.get("bundle_id") != declaration.job_run_id
+        or restore.get("id") != declaration.restore_point_id
+        or restore.get("run_id") != declaration.job_run_id
         or restore.get("job_run_id") != declaration.job_run_id
+        or restore.get("vm_id") != declaration.vm_id
+        or restore.get("backup_kind") != declaration.kind
         or restore.get("chain_id") != declaration.chain_id
         or restore.get("sequence") != declaration.sequence
-        or restore.get("parent_restore_point_id")
-        != declaration.parent_restore_point_id
-        or restore.get("metadata_paths") != {
-            "domain_xml": "metadata/domain.xml",
-            "manifest": "metadata/manifest.json",
-            "restore_point": "metadata/restore-point.json",
-        }
-        or not isinstance(vm, dict)
-        or vm.get("id") != declaration.vm_id
+        or restore.get("parent_restore_point_id") != declaration.parent_restore_point_id
+        or restore.get("status") != "AVAILABLE"
         or not isinstance(restore_disks, list)
         or not restore_disks
     ):
@@ -352,31 +350,46 @@ def _bundle(bundle: Path, declaration, runner) -> dict:
             "restore-point metadata does not match transfer",
         )
 
-    domain_uuid = _uuid(vm.get("libvirt_domain_uuid"), "libvirt domain UUID")
-    run_created_at = _timestamp(restore.get("run_created_at"), "run_created_at")
-    _timestamp(restore.get("backup_completed_at"), "backup_completed_at")
+    domain_uuid = _uuid(
+        restore.get("libvirt_domain_uuid"), "libvirt domain UUID"
+    )
+    run_created_at = _timestamp(declaration.created_at, "restore point created_at")
 
+    compact_keys = (
+        "format_version", "run_id", "job_id", "vm_id",
+        "storage_destination_id", "backup_kind", "chain_id", "sequence",
+        "parent_restore_point_id", "libvirt_checkpoint_name",
+        "libvirt_domain_uuid",
+    )
     if (
-        manifest.get("run_id") != declaration.job_run_id
-        or manifest.get("vm_id") != declaration.vm_id
-        or manifest.get("backup_kind") != declaration.kind
-        or manifest.get("created_at") != restore.get("run_created_at")
-        or manifest.get("completed_at") != restore.get("backup_completed_at")
-        or manifest.get("libvirt_domain_uuid") != domain_uuid
-        or manifest.get("application_consistency")
-        != restore.get("application_consistency")
-        or manifest.get("verification_level")
-        != restore.get("verification_level")
-        or not isinstance(manifest.get("disks"), list)
+        any(manifest.get(key) != restore.get(key) for key in compact_keys)
+        or not isinstance(manifest_disks, list)
+        or manifest_disks != restore_disks
     ):
         raise ReceiverPublishError(
             "PUBLISH_METADATA_MISMATCH",
             "manifest does not match restore-point metadata",
         )
-    if declaration.kind == "FULL" and manifest.get("checkpoint_name") is not None:
-        raise ReceiverPublishError(
-            "PUBLISH_METADATA_INVALID", "FULL manifest references a checkpoint"
-        )
+
+    checkpoint = restore.get("libvirt_checkpoint_name")
+    if declaration.kind == "FULL":
+        if declaration.sequence != 0 or declaration.parent_restore_point_id is not None:
+            raise ReceiverPublishError(
+                "PUBLISH_METADATA_INVALID", "FULL lineage metadata is invalid"
+            )
+        if checkpoint is not None:
+            raise ReceiverPublishError(
+                "PUBLISH_METADATA_INVALID", "FULL metadata references a checkpoint"
+            )
+    else:
+        if declaration.sequence <= 0 or declaration.parent_restore_point_id is None:
+            raise ReceiverPublishError(
+                "PUBLISH_METADATA_INVALID", "incremental lineage metadata is invalid"
+            )
+        if not isinstance(checkpoint, str) or not checkpoint:
+            raise ReceiverPublishError(
+                "PUBLISH_METADATA_INVALID", "incremental checkpoint metadata is invalid"
+            )
 
     try:
         xml = ET.fromstring(_read(metadata / "domain.xml", "domain XML"))
@@ -401,6 +414,8 @@ def _bundle(bundle: Path, declaration, runner) -> dict:
         target = item.get("target")
         relative = item.get("relative_path")
         declared_file = declared.get(relative) if isinstance(relative, str) else None
+        logical_size = item.get("size_bytes")
+        virtual_size = item.get("virtual_size")
         if (
             not isinstance(target, str)
             or not target
@@ -408,10 +423,13 @@ def _bundle(bundle: Path, declaration, runner) -> dict:
             or relative != f"disks/{target}.qcow2"
             or item.get("format") != "qcow2"
             or declared_file is None
-            or item.get("verified_size") != declared_file.logical_size
-            or not isinstance(item.get("planned_capacity"), int)
-            or isinstance(item.get("planned_capacity"), bool)
-            or item["planned_capacity"] <= 0
+            or not isinstance(logical_size, int)
+            or isinstance(logical_size, bool)
+            or logical_size <= 0
+            or logical_size != declared_file.logical_size
+            or not isinstance(virtual_size, int)
+            or isinstance(virtual_size, bool)
+            or virtual_size <= 0
         ):
             raise ReceiverPublishError(
                 "PUBLISH_METADATA_MISMATCH",
@@ -419,37 +437,16 @@ def _bundle(bundle: Path, declaration, runner) -> dict:
             )
         by_target[target] = item
 
-    manifest_by_target = {}
-    for item in manifest["disks"]:
-        if not isinstance(item, dict) or not isinstance(item.get("target"), str):
-            raise ReceiverPublishError(
-                "PUBLISH_METADATA_INVALID", "manifest disk metadata is invalid"
-            )
-        if item["target"] in manifest_by_target:
-            raise ReceiverPublishError(
-                "PUBLISH_METADATA_INVALID", "manifest disk target is duplicated"
-            )
-        manifest_by_target[item["target"]] = item
-
-    if set(by_target) != set(manifest_by_target):
+    if len(by_target) != len(disk_names):
         raise ReceiverPublishError(
             "PUBLISH_METADATA_MISMATCH", "manifest disk set mismatch"
         )
 
     for target, item in by_target.items():
-        manifest_disk = manifest_by_target[target]
-        if (
-            manifest_disk.get("artifact_path") != item["relative_path"]
-            or manifest_disk.get("image_format") != "qcow2"
-            or manifest_disk.get("size_bytes") != item["verified_size"]
-        ):
-            raise ReceiverPublishError(
-                "PUBLISH_METADATA_MISMATCH", "manifest disk metadata mismatch"
-            )
         _qcow2(
             disks / f"{target}.qcow2",
-            item["verified_size"],
-            item["planned_capacity"],
+            item["size_bytes"],
+            item["virtual_size"],
             runner,
         )
 
