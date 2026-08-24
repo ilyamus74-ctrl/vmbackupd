@@ -283,3 +283,100 @@ def test_seeded_full_persists_actual_delta_transport_bytes(tmp_path):
     assert status["bytes_processed"] == 25
     assert status["seed_restore_point_id"] == "33333333-3333-4333-8333-333333333333"
     repo.close()
+
+
+def _prepare_remote_delete(repo, ssh):
+    from vmbackupd.backup_catalog_v2 import LocalBackupCatalogService
+    repo.update_replica_v2(
+        "rp", ssh.id, state="SUCCESS", updated_at=NOW,
+        remote_bundle_object_id="vms/test/rp", verified_at=NOW,
+    )
+    run_id = repo.connection.execute(
+        "SELECT job_run_id FROM restore_points WHERE id='rp'"
+    ).fetchone()[0]
+    LocalBackupCatalogService(repo).delete_restore_point("rp")
+    return run_id
+
+
+class DeleteClient:
+    def __init__(self, *, fail=False):
+        self.fail = fail
+        self.calls = []
+
+    def delete(self, destination, *, storage_id, restore_point_id, bundle_object_id):
+        self.calls.append((destination.id, storage_id, restore_point_id, bundle_object_id))
+        if self.fail:
+            raise RuntimeError("receiver offline")
+        return {
+            "storage_id": storage_id,
+            "restore_point_id": restore_point_id,
+            "bundle_object_id": bundle_object_id,
+            "already_absent": False,
+        }
+
+
+def test_local_retention_enqueues_remote_delete_without_preserving_local_point(tmp_path):
+    repo, node, ssh = base(tmp_path)
+    run_id = _prepare_remote_delete(repo, ssh)
+    assert repo.get_restore_point_v2("rp") is None
+    context = repo.get_run_context(run_id)
+    task = context["replica_delete_tasks"][ssh.id]
+    assert task["state"] == "PENDING"
+    assert task["attempts"] == 0
+    assert task["max_attempts"] == 3
+    assert task["restore_point_id"] == "rp"
+    assert task["remote_bundle_object_id"] == "vms/test/rp"
+    assert repo.get_run(run_id).state.value == "SUCCESS"
+    repo.close()
+
+
+def test_remote_delete_success_completes_tombstone_after_local_retention(tmp_path):
+    from vmbackupd.replica_v2 import CompactReplicaDeleteExecutor
+    repo, node, ssh = base(tmp_path)
+    run_id = _prepare_remote_delete(repo, ssh)
+    client = DeleteClient()
+    from datetime import datetime
+    queued_at = datetime.fromisoformat(
+        repo.get_run_context(run_id)["replica_delete_tasks"][ssh.id]["created_at"]
+    )
+    result = CompactReplicaDeleteExecutor(
+        repo, node.id, client, clock=lambda: queued_at
+    ).run_once()
+    assert result["state"] == "COMPLETED"
+    assert result["attempts"] == 1
+    assert client.calls == [(
+        ssh.id, ssh.remote_storage_id, "rp", "vms/test/rp"
+    )]
+    task = repo.get_run_context(run_id)["replica_delete_tasks"][ssh.id]
+    assert task["state"] == "COMPLETED"
+    repo.close()
+
+
+def test_remote_delete_failure_retries_three_times_without_affecting_backup_run(tmp_path):
+    from datetime import timedelta
+    from vmbackupd.replica_v2 import CompactReplicaDeleteExecutor
+    repo, node, ssh = base(tmp_path)
+    run_id = _prepare_remote_delete(repo, ssh)
+    from datetime import datetime
+    queued_at = datetime.fromisoformat(
+        repo.get_run_context(run_id)["replica_delete_tasks"][ssh.id]["created_at"]
+    )
+    moments = iter((queued_at, queued_at,
+                    queued_at + timedelta(seconds=31), queued_at + timedelta(seconds=31),
+                    queued_at + timedelta(seconds=62), queued_at + timedelta(seconds=62)))
+    client = DeleteClient(fail=True)
+    executor = CompactReplicaDeleteExecutor(
+        repo, node.id, client, clock=lambda: next(moments)
+    )
+    first = executor.run_once()
+    second = executor.run_once()
+    third = executor.run_once()
+    assert [first["state"], second["state"], third["state"]] == [
+        "PENDING", "PENDING", "FAILED"
+    ]
+    assert third["attempts"] == 3
+    assert "receiver offline" in third["last_error"]
+    assert len(client.calls) == 3
+    assert repo.get_run(run_id).state.value == "SUCCESS"
+    assert repo.get_restore_point_v2("rp") is None
+    repo.close()

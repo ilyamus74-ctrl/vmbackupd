@@ -1892,9 +1892,14 @@ class VmbackupApplication:
         )
 
     def received_list(self):
-        catalog=getattr(self,"received_catalog",None)
-        if catalog is not None: return catalog.reconcile()
-        return self.repository.list_received_restore_points(self.node.id)
+        catalog = getattr(self, "received_catalog", None)
+        values = (
+            catalog.reconcile() if catalog is not None
+            else self.repository.list_received_restore_points(self.node.id)
+        )
+        # Keep MISSING imports in RepositoryV2 for diagnostics/history, but do
+        # not present physically deleted replicas as restorable backups.
+        return [value for value in values if value.get("status") == "AVAILABLE"]
 
     def received_restore_create(self, restore_point_id, target_vm_name, target_root=None,
                                 start_after_restore=False, target_destination_id=None,

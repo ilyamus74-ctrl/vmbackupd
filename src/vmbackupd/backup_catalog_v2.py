@@ -54,6 +54,18 @@ class LocalBackupCatalogService:
                 "manual physical deletion currently supports LOCAL backups only",
             )
         target = self._validated_bundle_path(destination, candidate["bundle_object_id"])
+        # Remote replica cleanup is deliberately best-effort.  Persist a
+        # tombstone before deleting the LOCAL catalog row, but never let a
+        # receiver outage stop retention or the next backup in the chain.
+        try:
+            self.repository.enqueue_replica_deletes_v2(candidate["id"])
+        except Exception as exc:
+            try:
+                self.repository.merge_run_context(candidate["job_run_id"], {
+                    "replica_delete_enqueue_error": f"{type(exc).__name__}: {exc}",
+                })
+            except Exception:
+                pass
         if target.exists():
             if not target.is_dir():
                 raise BackupCatalogError("BACKUP_BUNDLE_NOT_DIRECTORY", f"backup bundle is not a directory: {target}")

@@ -2175,6 +2175,173 @@ class RepositoryV2:
             })
         return result
 
+    def enqueue_replica_deletes_v2(self, restore_point_id, *, updated_at=None):
+        """Persist best-effort remote-delete tombstones before LOCAL retention.
+
+        The LOCAL restore point may be removed immediately after this call.  The
+        durable tombstones live in the owning job_run.context_json so receiver
+        outages never block normal retention or the next backup run.
+        """
+        stamp = (
+            updated_at.isoformat() if hasattr(updated_at, "isoformat")
+            else str(updated_at or now())
+        )
+        row = self.connection.execute(
+            "SELECT job_run_id,kind,metadata_json FROM restore_points WHERE id=?",
+            (restore_point_id,),
+        ).fetchone()
+        if row is None:
+            return 0
+        metadata = self._json_object(
+            row["metadata_json"], "RESTORE_POINT_METADATA_INVALID"
+        )
+        replicas = metadata.get("replicas", {})
+        if not isinstance(replicas, dict):
+            return 0
+        context = self.get_run_context(row["job_run_id"])
+        tasks = context.get("replica_delete_tasks", {})
+        if not isinstance(tasks, dict):
+            tasks = {}
+        created = 0
+        for destination_id, value in replicas.items():
+            if not isinstance(destination_id, str) or not isinstance(value, dict):
+                continue
+            if str(value.get("state") or "").upper() != "SUCCESS":
+                continue
+            remote_object = value.get("remote_bundle_object_id")
+            if not isinstance(remote_object, str) or not remote_object:
+                continue
+            destination = self.connection.execute(
+                "SELECT storage_type,config_json FROM storage_destinations WHERE id=?",
+                (destination_id,),
+            ).fetchone()
+            if destination is None or destination["storage_type"] != StorageType.SSH.value:
+                continue
+            config = self._json_object(
+                destination["config_json"], "STORAGE_CONFIG_INVALID"
+            )
+            remote_storage_id = config.get("remote_storage_id")
+            if not isinstance(remote_storage_id, str) or not remote_storage_id:
+                continue
+            current = tasks.get(destination_id)
+            if isinstance(current, dict) and current.get("state") in {
+                "PENDING", "RUNNING", "COMPLETED", "FAILED"
+            }:
+                continue
+            tasks[destination_id] = {
+                "restore_point_id": restore_point_id,
+                "destination_id": destination_id,
+                "remote_storage_id": remote_storage_id,
+                "remote_bundle_object_id": remote_object,
+                "kind": row["kind"],
+                "sequence": int(metadata.get("sequence") or 0),
+                "chain_id": metadata.get("chain_id"),
+                "state": "PENDING",
+                "attempts": 0,
+                "max_attempts": 3,
+                "last_error": None,
+                "next_attempt_at": stamp,
+                "created_at": stamp,
+                "updated_at": stamp,
+            }
+            created += 1
+        if created:
+            context["replica_delete_tasks"] = tasks
+            self.connection.execute(
+                "UPDATE job_runs SET context_json=?,updated_at=? WHERE id=?",
+                (json.dumps(context), stamp, row["job_run_id"]),
+            )
+            self.connection.commit()
+        return created
+
+    def claim_next_replica_delete_v2(self, node_id, updated_at):
+        """Claim one due remote-delete tombstone, descendants before FULL base."""
+        stamp = updated_at.isoformat() if hasattr(updated_at, "isoformat") else str(updated_at)
+        rows = self.connection.execute(
+            """
+            SELECT r.id,r.context_json,r.created_at
+            FROM job_runs r
+            JOIN backup_jobs j ON j.id=r.job_id
+            JOIN vms v ON v.id=j.vm_id
+            WHERE v.node_id=?
+              AND json_type(r.context_json,'$.replica_delete_tasks')='object'
+            """,
+            (node_id,),
+        ).fetchall()
+        candidates = []
+        for row in rows:
+            context = self._json_object(row["context_json"], "RUN_CONTEXT_INVALID")
+            tasks = context.get("replica_delete_tasks", {})
+            if not isinstance(tasks, dict):
+                continue
+            for destination_id, task in tasks.items():
+                if not isinstance(task, dict):
+                    continue
+                state = str(task.get("state") or "PENDING").upper()
+                if state not in {"PENDING", "RUNNING"}:
+                    continue
+                due = str(task.get("next_attempt_at") or task.get("updated_at") or row["created_at"])
+                if due > stamp:
+                    continue
+                candidates.append((
+                    -int(task.get("sequence") or 0),
+                    str(task.get("created_at") or row["created_at"]),
+                    row["id"], destination_id, context, task,
+                ))
+        if not candidates:
+            return None
+        _, _, run_id, destination_id, context, task = sorted(candidates)[0]
+        tasks = context["replica_delete_tasks"]
+        value = dict(task)
+        value["state"] = "RUNNING"
+        value["attempts"] = int(value.get("attempts") or 0) + 1
+        value["updated_at"] = stamp
+        tasks[destination_id] = value
+        context["replica_delete_tasks"] = tasks
+        self.connection.execute(
+            "UPDATE job_runs SET context_json=?,updated_at=? WHERE id=?",
+            (json.dumps(context), stamp, run_id),
+        )
+        self.connection.commit()
+        return {"run_id": run_id, **value}
+
+    def finish_replica_delete_v2(self, run_id, destination_id, *, success, error=None,
+                                 updated_at=None, retry_delay_seconds=30):
+        from datetime import timedelta
+        moment = updated_at if hasattr(updated_at, "isoformat") else datetime.now(timezone.utc)
+        stamp = moment.isoformat()
+        context = self.get_run_context(run_id)
+        tasks = context.get("replica_delete_tasks", {})
+        task = dict(tasks.get(destination_id) or {})
+        if not task:
+            raise DomainInvariantError("REPLICA_DELETE_TASK_NOT_FOUND")
+        attempts = int(task.get("attempts") or 0)
+        maximum = int(task.get("max_attempts") or 3)
+        if success:
+            task.update({
+                "state": "COMPLETED", "last_error": None,
+                "completed_at": stamp, "updated_at": stamp,
+            })
+        else:
+            terminal = attempts >= maximum
+            task.update({
+                "state": "FAILED" if terminal else "PENDING",
+                "last_error": str(error or "remote replica delete failed"),
+                "updated_at": stamp,
+                "next_attempt_at": (
+                    stamp if terminal else
+                    (moment + timedelta(seconds=max(1, int(retry_delay_seconds)))).isoformat()
+                ),
+            })
+        tasks[destination_id] = task
+        context["replica_delete_tasks"] = tasks
+        self.connection.execute(
+            "UPDATE job_runs SET context_json=?,updated_at=? WHERE id=?",
+            (json.dumps(context), stamp, run_id),
+        )
+        self.connection.commit()
+        return dict(task)
+
     def delete_local_restore_point_catalog(self, restore_point_id, job_run_id):
         try:
             self.connection.execute("BEGIN IMMEDIATE")

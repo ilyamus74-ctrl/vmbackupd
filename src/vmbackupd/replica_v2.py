@@ -184,6 +184,52 @@ class CompactReplicaExecutor:
             )
 
 
+class CompactReplicaDeleteExecutor:
+    """Best-effort remote retention cleanup with a durable 3-attempt cap."""
+
+    def __init__(self, repository, node_id, client, *, clock=utcnow):
+        self.repository = repository
+        self.node_id = node_id
+        self.client = client
+        self.clock = clock
+
+    def run_once(self):
+        moment = self.clock()
+        work = self.repository.claim_next_replica_delete_v2(self.node_id, moment)
+        if work is None:
+            return None
+        destination_id = work["destination_id"]
+        try:
+            destination = self.repository.get_storage_destination(
+                self.node_id, destination_id
+            )
+            if destination.storage_type is not StorageType.SSH:
+                raise DomainInvariantError("REPLICA_DELETE_DESTINATION_NOT_SSH")
+            if not destination.remote_storage_id:
+                raise DomainInvariantError("REPLICA_DELETE_REMOTE_STORAGE_ID_MISSING")
+            # Keep the snapshotted remote storage identity authoritative for a
+            # tombstone created before the destination may later be edited.
+            if destination.remote_storage_id != work.get("remote_storage_id"):
+                raise DomainInvariantError("REPLICA_DELETE_REMOTE_STORAGE_CHANGED")
+            self.client.delete(
+                destination,
+                storage_id=work["remote_storage_id"],
+                restore_point_id=work["restore_point_id"],
+                bundle_object_id=work["remote_bundle_object_id"],
+            )
+            result = self.repository.finish_replica_delete_v2(
+                work["run_id"], destination_id, success=True,
+                updated_at=self.clock(),
+            )
+            return {"run_id": work["run_id"], "destination_id": destination_id, **result}
+        except Exception as exc:
+            result = self.repository.finish_replica_delete_v2(
+                work["run_id"], destination_id, success=False,
+                error=f"{type(exc).__name__}: {exc}", updated_at=self.clock(),
+            )
+            return {"run_id": work["run_id"], "destination_id": destination_id, **result}
+
+
 class ReplicaWorkerV2:
     """Background compact-schema replica sender with an independent DB handle."""
 
@@ -240,6 +286,9 @@ class ReplicaWorkerV2:
             executor = CompactReplicaExecutor(
                 repository, self.node_id, client, stop_event=self._stop
             )
+            delete_executor = CompactReplicaDeleteExecutor(
+                repository, self.node_id, client
+            )
         except BaseException as exc:
             self._startup_error = exc
             self._last_error = f"{type(exc).__name__}: {exc}"
@@ -250,8 +299,13 @@ class ReplicaWorkerV2:
         self._started.set()
         try:
             while not self._stop.is_set():
-                progressed = executor.run_once()
-                if progressed is None:
+                # Remote retention cleanup is independent from backup/replica
+                # execution.  A failed receiver delete is persisted and retried
+                # later, but it never stops the worker from processing new
+                # backup replicas.
+                delete_progress = delete_executor.run_once()
+                replica_progress = executor.run_once()
+                if delete_progress is None and replica_progress is None:
                     self._stop.wait(self.tick_seconds)
         except BaseException as exc:
             self._last_error = f"{type(exc).__name__}: {exc}"
