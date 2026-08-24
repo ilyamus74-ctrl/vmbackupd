@@ -120,16 +120,73 @@ class ReceivedRestoreRuntimeV2:
         return chain, disk_targets
 
     @staticmethod
-    def _safe_target(operation):
+    def _within(path: Path, root: Path) -> bool:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            return False
+
+    def _safe_target(self, operation):
         target = Path(operation.target_root)
         if not target.is_absolute() or target == Path("/") or ".." in target.parts:
             raise ReceivedRestoreError("RESTORE_TARGET_INVALID", "target folder must be an absolute safe path")
         if target.exists():
             raise ReceivedRestoreError("RESTORE_TARGET_EXISTS", "target folder already exists")
-        parent = target.parent
-        if not parent.is_dir():
-            raise ReceivedRestoreError("RESTORE_TARGET_PARENT_MISSING", "target parent folder does not exist")
-        if not os.access(parent, os.W_OK | os.X_OK):
+
+        local_roots = []
+        for destination in self.repository.list_storage_destinations(self.node_id):
+            storage_type = getattr(destination.storage_type, "value", destination.storage_type)
+            if str(storage_type).upper() != "LOCAL":
+                continue
+            root = Path(destination.backup_data_root)
+            if not root.is_absolute() or not root.is_dir():
+                continue
+            try:
+                local_roots.append(root.resolve(strict=True))
+            except OSError:
+                continue
+        if not local_roots:
+            raise ReceivedRestoreError("RESTORE_TARGET_STORAGE_UNAVAILABLE", "no writable LOCAL storage root is available")
+
+        # Walk through already-existing ancestors so a symlink cannot escape the
+        # selected/registered storage root.  Missing subdirectories are allowed
+        # and are created below that root.
+        matching_root = None
+        lexical = target.absolute()
+        for root in local_roots:
+            try:
+                lexical.relative_to(root)
+            except ValueError:
+                continue
+            matching_root = root
+            break
+        if matching_root is None:
+            raise ReceivedRestoreError("RESTORE_TARGET_OUTSIDE_LOCAL_STORAGE", "target folder must be inside a registered LOCAL storage")
+
+        probe = target.parent
+        while not probe.exists() and probe != matching_root:
+            probe = probe.parent
+        try:
+            resolved_probe = probe.resolve(strict=True)
+        except OSError as exc:
+            raise ReceivedRestoreError("RESTORE_TARGET_PARENT_MISSING", "restore target parent cannot be resolved") from exc
+        if not self._within(resolved_probe, matching_root):
+            raise ReceivedRestoreError("RESTORE_TARGET_SYMLINK_ESCAPE", "restore target parent escapes the selected storage root")
+        if not os.access(resolved_probe, os.W_OK | os.X_OK):
+            raise ReceivedRestoreError("RESTORE_TARGET_NOT_WRITABLE", "vmbackupd cannot write to target storage")
+
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ReceivedRestoreError("RESTORE_TARGET_CREATE_FAILED", f"cannot create target parent: {exc}") from exc
+        try:
+            resolved_parent = target.parent.resolve(strict=True)
+        except OSError as exc:
+            raise ReceivedRestoreError("RESTORE_TARGET_PARENT_MISSING", "restore target parent cannot be resolved") from exc
+        if not self._within(resolved_parent, matching_root):
+            raise ReceivedRestoreError("RESTORE_TARGET_SYMLINK_ESCAPE", "restore target parent escapes the selected storage root")
+        if not os.access(resolved_parent, os.W_OK | os.X_OK):
             raise ReceivedRestoreError("RESTORE_TARGET_NOT_WRITABLE", "vmbackupd cannot write to target parent folder")
         return target
 

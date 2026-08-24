@@ -598,9 +598,13 @@
         <input id="received-restore-name" required autocomplete="off" placeholder="win10-restored">
       </label>
       <label>
-        Target folder
-        <input id="received-restore-root" required autocomplete="off" placeholder="/NVME_1/vms/win10-restored">
-        <small>The parent folder must already exist and be writable by vmbackupd. The target folder itself must not exist.</small>
+        Restore storage
+        <select id="received-restore-storage" required></select>
+      </label>
+      <label>
+        New folder inside storage
+        <input id="received-restore-subfolder" required autocomplete="off" placeholder="restored-vms/win10-restored">
+        <small>Choose a registered LOCAL storage, then enter a new relative folder. Missing subfolders are created automatically; the final VM folder itself must not already exist.</small>
       </label>
       <label class="checkbox-label">
         <input id="received-restore-start" type="checkbox">

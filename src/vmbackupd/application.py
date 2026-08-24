@@ -1896,20 +1896,48 @@ class VmbackupApplication:
         if catalog is not None: return catalog.reconcile()
         return self.repository.list_received_restore_points(self.node.id)
 
-    def received_restore_create(self, restore_point_id, target_vm_name, target_root,
-                                start_after_restore=False):
+    def received_restore_create(self, restore_point_id, target_vm_name, target_root=None,
+                                start_after_restore=False, target_destination_id=None,
+                                target_subfolder=None):
         for label, value in (("restore_point_id", restore_point_id),
-                             ("target_vm_name", target_vm_name),
-                             ("target_root", target_root)):
+                             ("target_vm_name", target_vm_name)):
             if not isinstance(value, str) or not value.strip():
                 raise ApplicationError("INVALID_PARAMS", f"{label} must be a non-empty string")
         if not isinstance(start_after_restore, bool):
             raise ApplicationError("INVALID_PARAMS", "start_after_restore must be boolean")
         if not self.config.libvirt.allow_mutation:
             raise ApplicationError("MUTATION_DISABLED", "restore mutation is disabled")
+
+        # Preferred V2 contract: select a registered LOCAL storage and provide a
+        # relative folder below it.  The folder may be new; the restore runtime
+        # creates missing parents inside the selected storage root.  Keep the
+        # legacy absolute target_root input for CLI/API compatibility, but the
+        # runtime still constrains it to a registered LOCAL storage root.
+        if target_destination_id is not None or target_subfolder is not None:
+            if not isinstance(target_destination_id, str) or not target_destination_id.strip():
+                raise ApplicationError("INVALID_PARAMS", "target_destination_id must be a non-empty string")
+            if not isinstance(target_subfolder, str) or not target_subfolder.strip():
+                raise ApplicationError("INVALID_PARAMS", "target_subfolder must be a non-empty relative path")
+            try:
+                destination = self.repository.get_storage_destination(
+                    self.node.id, target_destination_id.strip()
+                )
+            except KeyError as exc:
+                raise ApplicationError("RESTORE_TARGET_STORAGE_NOT_FOUND", "target storage not found") from exc
+            if destination.storage_type is not StorageType.LOCAL:
+                raise ApplicationError("RESTORE_TARGET_STORAGE_NOT_LOCAL", "restore target storage must be LOCAL")
+            relative = Path(target_subfolder.strip())
+            if relative.is_absolute() or relative == Path(".") or ".." in relative.parts:
+                raise ApplicationError("RESTORE_TARGET_SUBFOLDER_INVALID", "target subfolder must be a safe relative path")
+            target = Path(destination.backup_data_root).joinpath(relative)
+        else:
+            if not isinstance(target_root, str) or not target_root.strip():
+                raise ApplicationError("INVALID_PARAMS", "target_root must be a non-empty string")
+            target = Path(target_root.strip())
+
         operation = self.repository.create_received_restore_operation_v2(
             restore_point_id.strip(), self.node.id, target_vm_name.strip(),
-            target_root.strip(), self.clock.now(),
+            str(target), self.clock.now(),
             start_after_restore=start_after_restore,
         )
         return serialization.restore_operation(operation)

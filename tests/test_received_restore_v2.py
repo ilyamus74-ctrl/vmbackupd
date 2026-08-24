@@ -71,7 +71,7 @@ def test_received_incremental_restore_materializes_chain_defines_registers_and_s
     full_path=bundle(root,"full",FULL,"FULL",0,None); inc_path=bundle(root,"inc",INC,"INCREMENTAL",1,FULL)
     import_point(repo,root,"local-full",FULL,"FULL",0,None,"local-run1",full_path)
     import_point(repo,root,"local-inc",INC,"INCREMENTAL",1,"local-full","local-run2",inc_path)
-    target=tmp_path/"vms"/"restored"; target.parent.mkdir()
+    target=root/"restored-vms"/"restored"
     op=repo.create_received_restore_operation_v2("local-inc",NODE,"restored",str(target),Clock().now(),start_after_restore=True)
     read=ReadDriver(); mutation=MutationDriver(read); runtime=Runtime(repo,NODE,Runner(),read,mutation,Clock(),True)
     result=runtime.advance(op.id)
@@ -83,8 +83,33 @@ def test_received_incremental_restore_materializes_chain_defines_registers_and_s
 def test_received_restore_requires_full_ancestor(tmp_path):
     repo,root=setup(tmp_path); inc_path=bundle(root,"inc",INC,"INCREMENTAL",1,FULL)
     import_point(repo,root,"local-inc",INC,"INCREMENTAL",1,"missing-full","local-run2",inc_path)
-    target=tmp_path/"vms"/"restored"; target.parent.mkdir()
+    target=root/"restored-vms"/"restored"
     op=repo.create_received_restore_operation_v2("local-inc",NODE,"restored",str(target),Clock().now())
     runtime=Runtime(repo,NODE,Runner(),ReadDriver(),MutationDriver(ReadDriver()),Clock(),True)
     result=runtime.advance(op.id)
     assert result.state.value=="FAILED"; assert "PARENT_MISSING" in (result.error or "") or "parent" in (result.error or "").lower()
+
+
+def test_received_restore_creates_new_nested_folder_inside_registered_storage(tmp_path):
+    repo,root=setup(tmp_path)
+    full_path=bundle(root,"full-new-folder",FULL,"FULL",0,None)
+    import_point(repo,root,"local-full-new",FULL,"FULL",0,None,"local-run-new",full_path)
+    target=root/"new"/"nested"/"vm-restored"
+    op=repo.create_received_restore_operation_v2("local-full-new",NODE,"restored-new",str(target),Clock().now())
+    read=ReadDriver(); mutation=MutationDriver(read)
+    runtime=Runtime(repo,NODE,Runner(),read,mutation,Clock(),True)
+    result=runtime.advance(op.id)
+    assert result.state.value=="SUCCESS"
+    assert target.joinpath("disks/vda.qcow2").is_file()
+
+
+def test_received_restore_rejects_target_outside_registered_local_storage(tmp_path):
+    repo,root=setup(tmp_path)
+    full_path=bundle(root,"full-outside",FULL,"FULL",0,None)
+    import_point(repo,root,"local-full-outside",FULL,"FULL",0,None,"local-run-outside",full_path)
+    target=tmp_path/"outside"/"restored"
+    op=repo.create_received_restore_operation_v2("local-full-outside",NODE,"restored-outside",str(target),Clock().now())
+    runtime=Runtime(repo,NODE,Runner(),ReadDriver(),MutationDriver(ReadDriver()),Clock(),True)
+    result=runtime.advance(op.id)
+    assert result.state.value=="FAILED"
+    assert "OUTSIDE_LOCAL_STORAGE" in (result.error or "")

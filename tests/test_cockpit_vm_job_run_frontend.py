@@ -435,20 +435,25 @@ views.renderModel({
         created_at: "2026-08-24T07:00:00+00:00", bundle_object_id: "/STOR_HDD/vmbackupd/vms/x",
         origin: { received_via: "SSH_REPLICA" },
     }],
-    restores: [], discoveredVms: [], registeredVms: [], storage: [], jobs: [], runs: [], recovery: [],
+    restores: [], discoveredVms: [], registeredVms: [], storage: [{
+        id: "restore-storage", name: "NVME_1", storage_type: "LOCAL", type: "Local",
+        backup_data_root: "/NVME_1/vms", is_default: true,
+    }], jobs: [], runs: [], recovery: [],
     runPage: { total: 0, limit: 5, offset: 0 }, vmById: new Map(), jobById: new Map(), now: new Date(),
 });
 const restore = buttons.find(button => button.textContent === "Restore");
 if (!restore) throw new Error("received Restore action missing");
 restore.listeners.click();
 nodes.get("received-restore-name").value = "win10-recovered";
-nodes.get("received-restore-root").value = "/NVME_1/vms/win10-recovered";
+nodes.get("received-restore-storage").value = "restore-storage";
+nodes.get("received-restore-subfolder").value = "restored/win10-recovered";
 nodes.get("received-restore-start").checked = true;
 await nodes.get("received-restore-form").listeners.submit({ preventDefault() {} });
 const call = calls.find(([method]) => method === "received.restore.create");
 if (!call) throw new Error("received.restore.create missing");
 if (call[1].restore_point_id !== "received-1" || call[1].target_vm_name !== "win10-recovered" ||
-    call[1].target_root !== "/NVME_1/vms/win10-recovered" || call[1].start_after_restore !== true)
+    call[1].target_destination_id !== "restore-storage" || call[1].target_subfolder !== "restored/win10-recovered" ||
+    call[1].start_after_restore !== true)
     throw new Error(`restore payload mismatch: ${JSON.stringify(call[1])}`);
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """)

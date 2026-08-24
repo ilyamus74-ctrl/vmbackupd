@@ -2985,8 +2985,23 @@ function setNotice(message, kind) {
         selectedReceivedRestorePoint = point;
         document.getElementById("received-restore-source").textContent =
             `${point.vm_name || "received-vm"} · ${point.kind || "—"} · ${point.storage_name || point.storage_destination_id}`;
-        document.getElementById("received-restore-name").value = `${point.vm_name || "received-vm"}-restored`;
-        document.getElementById("received-restore-root").value = "";
+        const restoreName = `${point.vm_name || "received-vm"}-restored`;
+        document.getElementById("received-restore-name").value = restoreName;
+        const storageSelect = document.getElementById("received-restore-storage");
+        storageSelect.replaceChildren();
+        const localStorage = (Array.isArray(currentModel.storage) ? currentModel.storage : [])
+            .filter(item => String(item.storage_type || item.type || "").toUpperCase() === "LOCAL" || String(item.type || "").toLowerCase() === "local");
+        for (const destination of localStorage) {
+            const option = document.createElement("option");
+            option.value = destination.id;
+            option.textContent = `${destination.name} — ${destination.backup_data_root || ""}`;
+            storageSelect.append(option);
+        }
+        const preferred = localStorage.find(item => item.id === point.storage_destination_id) ||
+            localStorage.find(item => item.is_default) || localStorage[0];
+        if (preferred)
+            storageSelect.value = preferred.id;
+        document.getElementById("received-restore-subfolder").value = `restored-vms/${restoreName}`;
         document.getElementById("received-restore-start").checked = false;
         document.getElementById("received-restore-error").textContent = "";
         document.getElementById("received-restore-dialog").showModal();
@@ -3004,7 +3019,8 @@ function setNotice(message, kind) {
             await api.request("received.restore.create", {
                 restore_point_id: selectedReceivedRestorePoint.id,
                 target_vm_name: document.getElementById("received-restore-name").value.trim(),
-                target_root: document.getElementById("received-restore-root").value.trim(),
+                target_destination_id: document.getElementById("received-restore-storage").value,
+                target_subfolder: document.getElementById("received-restore-subfolder").value.trim(),
                 start_after_restore: document.getElementById("received-restore-start").checked,
             });
             document.getElementById("received-restore-dialog").close();
