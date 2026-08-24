@@ -40,8 +40,6 @@ The current production entry path is:
     ↓ vmbackupd.daemon:main
 bootstrap.compose()
     ↓
-SQLiteRepository (BRIDGE)
-    ↓ __getattr__ delegation
 RepositoryV2 (NEW)
     ↓
 schema_v2.ensure_schema() (NEW)
@@ -122,6 +120,7 @@ registry. The registry is descriptive and is not imported by runtime code.
 | `executor_v2.py` | NEW | yes | NEW execution result contract | retain |
 | `libvirt_backend.py` | SHARED | yes | low-level virsh discovery and inspection | retain; separate persistence later |
 | `libvirt_execution.py` | LEGACY | yes | first-generation backup execution pipeline | port without behavior loss |
+| `local_backup_v2.py` | NEW | yes | compact-schema LOCAL FULL backup orchestration using shared libvirt safety helpers | retain and extend by functional slice |
 | `local_api.py` | SHARED | yes | bounded JSON-lines Unix API | retain |
 | `models.py` | LEGACY | yes | wide first-generation domain records | introduce NEW contracts slice by slice |
 | `physical_delete_adapter_v2.py` | NEW | yes | NEW physical deletion adapter | retain |
@@ -172,22 +171,41 @@ No tracked Python production module is currently `UNKNOWN`.
 
 ## Repository boundary
 
-`SQLiteRepository` implements only construction, schema activation, delegation,
-and close. Its operational methods are resolved through `__getattr__` on its
-`RepositoryV2` instance.
+`SQLiteRepository` remains a BRIDGE for legacy tests and callers outside the
+installed daemon graph. Production composition, its runtime worker, and the
+replica worker open `RepositoryV2` directly.
 
 | Caller | Method family | Current owner | Target owner |
 |---|---|---|---|
-| `bootstrap.py` | node/storage bootstrap | `RepositoryV2` through facade | `RepositoryV2` |
+| `bootstrap.py` | node/storage bootstrap | `RepositoryV2` | `RepositoryV2` |
 | `application.py` | storage list/show/create/update/delete/default | explicit `storage_repository` bound to `RepositoryV2` | `RepositoryV2` (migrated in Stage 2.1) |
-| `application.py` | VM/job/run and remaining API | `RepositoryV2` through facade | NEW repositories/services |
+| `application.py` | VM/job/run and remaining API | `RepositoryV2` | NEW repositories/services |
 | legacy planner/scheduler/engine | planning and scheduling | compatibility methods in `RepositoryV2` | NEW services + `RepositoryV2` |
 | legacy libvirt execution | run/artifact/publication/recovery | compatibility methods in `RepositoryV2` | NEW execution services + `RepositoryV2` |
 | reclaim/retention/restore/replica orchestration | durable operation methods | compatibility methods in `RepositoryV2` | corresponding NEW slice |
-| `RuntimeWorker` composition | background execution connection | `SQLiteRepository` facade | NEW runtime repository contract |
+| `RuntimeWorker` composition | background execution connection | `RepositoryV2` | NEW runtime repository contract |
 
 This table records ownership; it does not assert that every remaining
 compatibility method is complete.
+
+## VM / Job / Run boundary — Stage 2.3 candidate
+
+This slice is awaiting real RPM browser acceptance and is not CLOSED.
+
+| Caller | Previous incompatible contract | RepositoryV2 contract selected | Semantics |
+|---|---|---|---|
+| `vm_register` | `register_vm(node_id, name, **kwargs)` | `register_vm(node_id, external_id, name, domain_uuid)` | stable external ID and libvirt UUID; idempotent registration |
+| VM reads | raw SQLite rows | `VM` domain records | serializers and node ownership use typed identity |
+| `job_create` | `add_job(vm_id, storage_id, name)` | `add_job(BackupJob, replica_destination_ids=None)` | job snapshots the selected local destination object ID, including an SSH destination ID |
+| `job_update` | placeholder `True` | explicit node-scoped policy/destination patch | destination identity and compact `policy_json` persist |
+| `backup_run` | node ID treated as storage ID | `create_manual_run(job_id, local_node_id, created_at)` | atomically snapshots the job destination into the run |
+| Run reads | raw SQLite rows | `JobRun` domain records | state, error, timestamps and destination identity come from row + `context_json` |
+
+The compact runtime does not yet execute the legacy libvirt backup pipeline.
+Until that later execution slice is migrated, LOCAL runs terminate explicitly
+with `LOCAL_BACKUP_EXECUTION_NOT_MIGRATED`. Catalog-backed SSH runs first probe
+their selected receiver storage ID, then terminate explicitly with
+`SSH_BACKUP_TRANSFER_NOT_IMPLEMENTED`. Neither boundary reports false success.
 
 ## Storage boundary — Stage 2.1
 

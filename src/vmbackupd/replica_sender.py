@@ -44,6 +44,12 @@ from .receiver_transfer import (
     TRANSFER_COMMAND,
     TRANSFER_PROTOCOL_VERSION,
 )
+from .receiver_seed import (
+    SEED_COMMAND,
+    SEED_PROTOCOL_VERSION,
+    SEED_BLOCK_BYTES,
+    MAX_BATCH as SEED_MAX_BATCH,
+)
 from .receiver_reclaim_delete import (
     RECLAIM_DELETE_COMMAND,
     RECLAIM_DELETE_PROTOCOL_VERSION,
@@ -95,6 +101,7 @@ class ReplicaSourceFile:
     device: int
     inode: int
     mtime_ns: int
+    holes: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +119,7 @@ class ReplicaTransferPlan:
     created_at: str
 
     files: tuple[ReplicaSourceFile, ...]
+    seed_restore_point_id: str | None = None
 
 
 def _canonical_uuid(
@@ -523,6 +531,69 @@ def inspect_published_bundle(
     )
 
 
+def _source_block_signature(item: ReplicaSourceFile, offset: int, length: int) -> str:
+    descriptor, before = _open_regular(item.path)
+    try:
+        if before.st_size != item.logical_size:
+            raise ReplicaSenderError("source bundle file changed during seed comparison")
+        data_present = False
+        for start, span in item.extents:
+            if start < offset + length and start + span > offset:
+                data_present = True
+                break
+        if not data_present:
+            return "HOLE"
+        digest = hashlib.sha256()
+        position = offset
+        remaining = length
+        while remaining:
+            chunk = os.pread(descriptor, min(1024 * 1024, remaining), position)
+            if not chunk:
+                raise ReplicaSenderError("source bundle ended during seed comparison")
+            digest.update(chunk)
+            position += len(chunk)
+            remaining -= len(chunk)
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def _clip_extents(extents, start, length):
+    end = start + length
+    result = []
+    for offset, span in extents:
+        a, b = max(start, offset), min(end, offset + span)
+        if b > a:
+            result.append((a, b - a))
+    return result
+
+
+def _hole_ranges(extents, start, length):
+    data = _clip_extents(extents, start, length)
+    end = start + length
+    holes = []
+    cursor = start
+    for offset, span in data:
+        if offset > cursor:
+            holes.append((cursor, offset - cursor))
+        cursor = max(cursor, offset + span)
+    if cursor < end:
+        holes.append((cursor, end - cursor))
+    return holes
+
+
+def _delta_file(item: ReplicaSourceFile, changed_blocks: list[tuple[int, int]]) -> ReplicaSourceFile:
+    if item.relative_path.startswith("metadata/"):
+        return item
+    extents = []
+    holes = []
+    for offset, length in changed_blocks:
+        extents.extend(_clip_extents(item.extents, offset, length))
+        holes.extend(_hole_ranges(item.extents, offset, length))
+    payload = sum(length for _, length in extents)
+    return replace(item, payload_bytes=payload, extents=tuple(extents), holes=tuple(holes))
+
+
 def build_transfer_plan(
     task: ReplicaTask,
     point: RestorePoint,
@@ -831,46 +902,30 @@ class SSHReplicaTransferClient:
     def _begin(
         plan: ReplicaTransferPlan,
     ) -> dict:
-        return {
-            "protocol_version":
-                TRANSFER_PROTOCOL_VERSION,
-            "operation":
-                "BEGIN",
-            "transfer_id":
-                plan.transfer_id,
-            "storage_id":
-                plan.storage_id,
-            "vm_id":
-                plan.vm_id,
+        value = {
+            "protocol_version": TRANSFER_PROTOCOL_VERSION,
+            "operation": "BEGIN",
+            "transfer_id": plan.transfer_id,
+            "storage_id": plan.storage_id,
+            "vm_id": plan.vm_id,
             "restore_point": {
-                "id":
-                    plan.restore_point_id,
-                "chain_id":
-                    plan.chain_id,
-                "job_run_id":
-                    plan.job_run_id,
-                "kind":
-                    plan.kind,
-                "sequence":
-                    plan.sequence,
-                "parent_restore_point_id":
-                    plan.parent_restore_point_id,
-                "created_at":
-                    plan.created_at,
+                "id": plan.restore_point_id,
+                "chain_id": plan.chain_id,
+                "job_run_id": plan.job_run_id,
+                "kind": plan.kind,
+                "sequence": plan.sequence,
+                "parent_restore_point_id": plan.parent_restore_point_id,
+                "created_at": plan.created_at,
             },
             "files": [
-                {
-                    "path":
-                        item.relative_path,
-                    "logical_size":
-                        item.logical_size,
-                    "payload_bytes":
-                        item.payload_bytes,
-                }
-                for item
-                in plan.files
+                {"path": item.relative_path, "logical_size": item.logical_size,
+                 "payload_bytes": item.payload_bytes}
+                for item in plan.files
             ],
         }
+        if plan.seed_restore_point_id is not None:
+            value["seed_restore_point_id"] = plan.seed_restore_point_id
+        return value
 
     @staticmethod
     def _read_exact(
@@ -918,6 +973,7 @@ class SSHReplicaTransferClient:
         item: ReplicaSourceFile,
         *,
         stop_event=None,
+        progress_callback=None,
     ) -> None:
         self._check_cancel(
             stop_event
@@ -1015,6 +1071,8 @@ class SSHReplicaTransferClient:
                         payload
                     )
                     stdin.flush()
+                    if progress_callback is not None:
+                        progress_callback(len(payload))
 
                     position += len(
                         payload
@@ -1022,6 +1080,18 @@ class SSHReplicaTransferClient:
                     remaining -= len(
                         payload
                     )
+
+            for offset, length in item.holes:
+                self._check_cancel(stop_event)
+                self._write_control(
+                    stdin,
+                    {
+                        "protocol_version": TRANSFER_PROTOCOL_VERSION,
+                        "operation": "HOLE",
+                        "offset": offset,
+                        "length": length,
+                    },
+                )
 
             after = os.fstat(
                 descriptor
@@ -1379,6 +1449,78 @@ class SSHReplicaTransferClient:
                     pass
                 raise
 
+    def _seeded_full_plan(self, plan, destination):
+        if plan.kind != "FULL":
+            return plan
+        argv = self._ssh_argv(destination, SEED_COMMAND)
+        with tempfile.TemporaryFile(mode="w+b") as stderr:
+            try:
+                process = self.process_factory(
+                    argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
+                    bufsize=0, env={**os.environ, "LC_ALL":"C", "LANG":"C"},
+                )
+            except OSError:
+                return plan
+            if process.stdin is None or process.stdout is None:
+                process.kill(); return plan
+            try:
+                disk_files = [item for item in plan.files if item.relative_path.startswith("disks/")]
+                self._write_control(process.stdin, {
+                    "protocol_version": SEED_PROTOCOL_VERSION,
+                    "operation": "BEGIN", "storage_id": plan.storage_id,
+                    "vm_id": plan.vm_id,
+                    "files": [{"path": i.relative_path, "logical_size": i.logical_size} for i in disk_files],
+                })
+                response = self._read_publish_response(process.stdout)
+                if response.get("status") != "SEED_READY":
+                    process.stdin.close(); process.wait(timeout=10)
+                    return plan
+                seed_id = response.get("restore_point_id")
+                block_bytes = response.get("block_bytes")
+                if not isinstance(seed_id, str) or not isinstance(block_bytes, int) or block_bytes <= 0:
+                    return plan
+                changed_by_path = {}
+                for item in disk_files:
+                    blocks = []
+                    offset = 0
+                    while offset < item.logical_size:
+                        length = min(block_bytes, item.logical_size - offset)
+                        blocks.append({"offset": offset, "length": length,
+                                       "signature": _source_block_signature(item, offset, length)})
+                        offset += length
+                    changed = []
+                    for start in range(0, len(blocks), SEED_MAX_BATCH):
+                        batch = blocks[start:start + SEED_MAX_BATCH]
+                        self._write_control(process.stdin, {
+                            "protocol_version": SEED_PROTOCOL_VERSION,
+                            "operation": "COMPARE", "path": item.relative_path,
+                            "blocks": batch,
+                        })
+                        result = self._read_publish_response(process.stdout)
+                        same = result.get("same")
+                        if result.get("status") != "COMPARE_RESULT" or not isinstance(same, list) or len(same) != len(batch):
+                            raise ReplicaSenderError("receiver seed comparison response is invalid")
+                        changed.extend((b["offset"], b["length"]) for b, equal in zip(batch, same) if equal is not True)
+                    changed_by_path[item.relative_path] = changed
+                self._write_control(process.stdin, {"protocol_version":SEED_PROTOCOL_VERSION,"operation":"FINISH"})
+                done = self._read_publish_response(process.stdout)
+                process.stdin.close()
+                if process.wait(timeout=20) != 0 or done.get("status") != "DONE":
+                    return plan
+                files = tuple(
+                    _delta_file(item, changed_by_path[item.relative_path])
+                    if item.relative_path.startswith("disks/") else item
+                    for item in plan.files
+                )
+                return replace(plan, files=files, seed_restore_point_id=seed_id)
+            except Exception:
+                try: process.stdin.close()
+                except Exception: pass
+                try:
+                    if process.poll() is None: process.kill(); process.wait()
+                except Exception: pass
+                return plan
+
     def publish(
         self,
         transfer_id: str,
@@ -1535,10 +1677,12 @@ class SSHReplicaTransferClient:
         destination: StorageDestination,
         *,
         stop_event=None,
+        progress_callback=None,
     ) -> dict:
         self._check_cancel(
             stop_event
         )
+        plan = self._seeded_full_plan(plan, destination)
         argv = self._ssh_argv(
             destination
         )
@@ -1592,6 +1736,7 @@ class SSHReplicaTransferClient:
                         process.stdout,
                         item,
                         stop_event=stop_event,
+                        progress_callback=progress_callback,
                     )
 
                 self._write_control(

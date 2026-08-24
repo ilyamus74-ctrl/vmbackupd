@@ -33,6 +33,14 @@
                     ? data.recovery
                     : [],
 
+                received: Array.isArray(data.received)
+                    ? data.received
+                    : [],
+
+                restores: Array.isArray(data.restores)
+                    ? data.restores
+                    : [],
+
 
                 jobById: new Map(
                     (Array.isArray(data.jobs) ? data.jobs : [])
@@ -40,7 +48,7 @@
                 ),
 
                 vmById: new Map(
-                    (Array.isArray(data.inventory) ? data.inventory : [])
+                    (Array.isArray(data.registeredVms) ? data.registeredVms : [])
                         .map(vm => [vm.id || vm.uuid, vm])
                 ),
 
@@ -49,18 +57,18 @@
 
                 successfulToday:
                     (Array.isArray(data.runs) ? data.runs : [])
-                        .filter(run => run.status === "SUCCESS")
+                        .filter(run => (run.state || run.status) === "SUCCESS")
                         .length,
 
                 failedToday:
                     (Array.isArray(data.runs) ? data.runs : [])
-                        .filter(run => run.status === "FAILED")
+                        .filter(run => (run.state || run.status) === "FAILED")
                         .length,
 
                 active:
                     (Array.isArray(data.runs) ? data.runs : [])
                         .filter(run =>
-                            !["SUCCESS", "FAILED"].includes(run.status)
+                            !["SUCCESS", "FAILED"].includes(run.state || run.status)
                         )
                         .length,
 

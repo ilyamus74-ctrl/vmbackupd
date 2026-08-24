@@ -20,6 +20,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import uuid
 from dataclasses import dataclass
@@ -93,6 +94,7 @@ class TransferDeclaration:
     created_at: str
 
     files: tuple[DeclaredFile, ...]
+    seed_restore_point_id: str | None = None
 
     @property
     def total_payload_bytes(self) -> int:
@@ -421,114 +423,66 @@ def _parse_restore_point(value) -> dict:
 def _parse_begin(
     value,
 ) -> TransferDeclaration:
-    request = _strict_object(
-        value,
-        keys={
-            "protocol_version",
-            "operation",
-            "transfer_id",
-            "storage_id",
-            "vm_id",
-            "restore_point",
-            "files",
-        },
-        label="BEGIN",
-    )
-
+    if not isinstance(value, dict):
+        raise ReceiverTransferError(
+            "TRANSFER_PROTOCOL_INVALID", "BEGIN must be an object"
+        )
+    allowed = {
+        "protocol_version", "operation", "transfer_id", "storage_id",
+        "vm_id", "restore_point", "files", "seed_restore_point_id",
+    }
+    required = allowed - {"seed_restore_point_id"}
+    if not required.issubset(value) or set(value) - allowed:
+        raise ReceiverTransferError(
+            "TRANSFER_PROTOCOL_INVALID", "BEGIN has an invalid field set"
+        )
+    request = value
     if (
-        request["protocol_version"]
-        != TRANSFER_PROTOCOL_VERSION
-        or request["operation"]
-        != "BEGIN"
+        request["protocol_version"] != TRANSFER_PROTOCOL_VERSION
+        or request["operation"] != "BEGIN"
     ):
         raise ReceiverTransferError(
-            "TRANSFER_PROTOCOL_INVALID",
-            "expected transfer protocol BEGIN",
+            "TRANSFER_PROTOCOL_INVALID", "expected transfer protocol BEGIN"
         )
-
-    transfer_id = _canonical_uuid(
-        request["transfer_id"],
-        "transfer ID",
-    )
-
-    storage_id = _canonical_uuid(
-        request["storage_id"],
-        "storage ID",
-    )
-
-    vm_id = _canonical_uuid(
-        request["vm_id"],
-        "VM ID",
-    )
-
-    point = _parse_restore_point(
-        request["restore_point"]
-    )
-
+    transfer_id = _canonical_uuid(request["transfer_id"], "transfer ID")
+    storage_id = _canonical_uuid(request["storage_id"], "storage ID")
+    vm_id = _canonical_uuid(request["vm_id"], "VM ID")
+    point = _parse_restore_point(request["restore_point"])
+    seed_restore_point_id = request.get("seed_restore_point_id")
+    if seed_restore_point_id is not None:
+        seed_restore_point_id = _canonical_uuid(
+            seed_restore_point_id, "seed Restore Point ID"
+        )
+        if point["kind"] != "FULL":
+            raise ReceiverTransferError(
+                "TRANSFER_SEED_INVALID", "only FULL transfers may use a seed"
+            )
     raw_files = request["files"]
-
-    if (
-        not isinstance(raw_files, list)
-        or not raw_files
-        or len(raw_files) > MAX_FILES
-    ):
+    if not isinstance(raw_files, list) or not raw_files or len(raw_files) > MAX_FILES:
         raise ReceiverTransferError(
-            "TRANSFER_FILE_SET_INVALID",
-            "declared file set is invalid",
+            "TRANSFER_FILE_SET_INVALID", "declared file set is invalid"
         )
-
-    files = tuple(
-        _parse_file(item)
-        for item in raw_files
-    )
-
-    paths = [
-        item.path
-        for item in files
-    ]
-
+    files = tuple(_parse_file(item) for item in raw_files)
+    paths = [item.path for item in files]
     if len(paths) != len(set(paths)):
         raise ReceiverTransferError(
-            "TRANSFER_FILE_SET_INVALID",
-            "declared file paths are not unique",
+            "TRANSFER_FILE_SET_INVALID", "declared file paths are not unique"
         )
-
-    metadata = {
-        path
-        for path in paths
-        if path.startswith("metadata/")
-    }
-
-    disks = [
-        path
-        for path in paths
-        if path.startswith("disks/")
-    ]
-
-    if (
-        metadata != _REQUIRED_METADATA
-        or not disks
-    ):
+    metadata = {path for path in paths if path.startswith("metadata/")}
+    disks = [path for path in paths if path.startswith("disks/")]
+    if metadata != _REQUIRED_METADATA or not disks:
         raise ReceiverTransferError(
             "TRANSFER_FILE_SET_INVALID",
             "bundle requires canonical metadata and at least one disk",
         )
-
     return TransferDeclaration(
-        transfer_id=transfer_id,
-        storage_id=storage_id,
-        vm_id=vm_id,
-        restore_point_id=point["id"],
-        chain_id=point["chain_id"],
-        job_run_id=point["job_run_id"],
-        kind=point["kind"],
+        transfer_id=transfer_id, storage_id=storage_id, vm_id=vm_id,
+        restore_point_id=point["id"], chain_id=point["chain_id"],
+        job_run_id=point["job_run_id"], kind=point["kind"],
         sequence=point["sequence"],
-        parent_restore_point_id=(
-            point[
-                "parent_restore_point_id"
-            ]
-        ),
+        parent_restore_point_id=point["parent_restore_point_id"],
         created_at=point["created_at"],
+        seed_restore_point_id=seed_restore_point_id,
         files=files,
     )
 
@@ -869,6 +823,9 @@ class ReceiverStagingSession:
                 label=label,
             )
 
+        if self.declaration.seed_restore_point_id is not None:
+            self._seed_disks()
+
         _fsync_directory(
             self.staging
         )
@@ -880,6 +837,42 @@ class ReceiverStagingSession:
                 "RECEIVING"
             ),
         )
+
+    def _seed_disks(self) -> None:
+        storage_root = self.namespace.parent
+        marker = (storage_root / ".vmbackupd-replica-state" / "published"
+                  / f"{self.declaration.seed_restore_point_id}.json")
+        try:
+            record = json.loads(marker.read_text())
+            if (record.get("state") != "PUBLISHED"
+                    or record.get("storage_id") != self.declaration.storage_id
+                    or record.get("vm_id") != self.declaration.vm_id
+                    or record.get("kind") != "FULL"):
+                raise ValueError("seed marker mismatch")
+            relative = PurePosixPath(record.get("bundle_object_id"))
+            if (relative.is_absolute() or ".." in relative.parts or not relative.parts
+                    or relative.parts[0] != "vms"):
+                raise ValueError("seed object ID unsafe")
+            source_disks = storage_root.joinpath(*relative.parts) / "disks"
+            for declared in self.declaration.files:
+                if declared.is_metadata:
+                    continue
+                name = PurePosixPath(declared.path).name
+                source = source_disks / name
+                target = self.disks / name
+                if (source.is_symlink() or not source.is_file()
+                        or source.stat().st_size != declared.logical_size):
+                    raise ValueError("seed disk incompatible")
+                result = subprocess.run(
+                    ["cp", "--reflink=auto", "--sparse=always", str(source), str(target)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+                )
+                if result.returncode != 0:
+                    raise ValueError("seed disk clone failed")
+        except Exception as exc:
+            raise ReceiverTransferError(
+                "TRANSFER_SEED_UNAVAILABLE", "receiver FULL seed is unavailable"
+            ) from exc
 
     def _state_record(
         self,
@@ -914,6 +907,7 @@ class ReceiverStagingSession:
                 self.declaration.vm_id,
             "restore_point":
                 point,
+            "seed_restore_point_id": self.declaration.seed_restore_point_id,
             "files": [
                 {
                     "path":
@@ -951,71 +945,37 @@ class ReceiverStagingSession:
     ) -> None:
         if self.current is not None:
             raise ReceiverTransferError(
-                "TRANSFER_FILE_STATE_INVALID",
-                "another file is already open",
+                "TRANSFER_FILE_STATE_INVALID", "another file is already open"
             )
-
-        relative = _bundle_path(
-            relative
-        )
-
+        relative = _bundle_path(relative)
         if relative in self.completed:
             raise ReceiverTransferError(
-                "TRANSFER_FILE_DUPLICATE",
-                "file was already completed",
+                "TRANSFER_FILE_DUPLICATE", "file was already completed"
             )
-
-        declared = self.declaration.file(
-            relative
-        )
-
-        path = self._filesystem_path(
-            relative
-        )
-
-        if (
-            path.exists()
-            or path.is_symlink()
-        ):
+        declared = self.declaration.file(relative)
+        path = self._filesystem_path(relative)
+        seeded = self.declaration.seed_restore_point_id is not None and not declared.is_metadata
+        if path.is_symlink() or (path.exists() and not seeded):
             raise ReceiverTransferError(
-                "TRANSFER_FILE_EXISTS",
-                "staging file already exists",
+                "TRANSFER_FILE_EXISTS", "staging file already exists"
             )
-
         try:
-            descriptor = os.open(
-                path,
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | getattr(
-                    os,
-                    "O_NOFOLLOW",
-                    0,
-                ),
-                0o660,
-            )
-
-            os.fchmod(
-                descriptor,
-                0o660,
-            )
-
-            os.ftruncate(
-                descriptor,
-                declared.logical_size,
-            )
-
+            if seeded:
+                descriptor = os.open(path, os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0))
+                if os.fstat(descriptor).st_size != declared.logical_size:
+                    raise OSError("seeded disk size changed")
+            else:
+                descriptor = os.open(
+                    path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0), 0o660
+                )
+                os.fchmod(descriptor, 0o660)
+                os.ftruncate(descriptor, declared.logical_size)
         except OSError as exc:
             raise ReceiverTransferError(
-                "TRANSFER_FILE_CREATE_FAILED",
-                "cannot create staging file",
+                "TRANSFER_FILE_CREATE_FAILED", "cannot create staging file"
             ) from exc
-
-        self.current = OpenFile(
-            declared=declared,
-            descriptor=descriptor,
-        )
+        self.current = OpenFile(declared=declared, descriptor=descriptor)
 
     def write_extent(
         self,
@@ -1138,6 +1098,30 @@ class ReceiverStagingSession:
                 end,
             )
         )
+
+    def write_hole(self, *, offset: int, length: int) -> None:
+        current = self.current
+        if current is None or current.declared.is_metadata:
+            raise ReceiverTransferError(
+                "TRANSFER_FILE_STATE_INVALID", "HOLE requires an open disk file"
+            )
+        offset = _integer(offset, "hole offset")
+        length = _integer(length, "hole length", minimum=1)
+        if offset + length > current.declared.logical_size:
+            raise ReceiverTransferError(
+                "TRANSFER_EXTENT_RANGE_INVALID", "hole is outside logical file size"
+            )
+        zero = b"\0" * min(1024 * 1024, length)
+        pos, remaining = offset, length
+        while remaining:
+            chunk = zero[:min(len(zero), remaining)]
+            written = os.pwrite(current.descriptor, chunk, pos)
+            if written <= 0:
+                raise ReceiverTransferError(
+                    "TRANSFER_WRITE_FAILED", "staging hole clear made no progress"
+                )
+            pos += written
+            remaining -= written
 
     def end_file(self) -> str:
         current = self.current
@@ -1552,6 +1536,18 @@ def run_receiver_transfer(
                     sha256=sha256,
                     payload=payload,
                 )
+                continue
+
+            if operation == "HOLE":
+                if set(command) != {"protocol_version", "operation", "offset", "length"}:
+                    raise ReceiverTransferError(
+                        "TRANSFER_PROTOCOL_INVALID", "HOLE has an invalid field set"
+                    )
+                if command.get("protocol_version") != TRANSFER_PROTOCOL_VERSION:
+                    raise ReceiverTransferError(
+                        "TRANSFER_PROTOCOL_INVALID", "HOLE protocol version mismatch"
+                    )
+                session.write_hole(offset=command["offset"], length=command["length"])
                 continue
 
             if operation == "FILE_END":

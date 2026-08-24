@@ -127,7 +127,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .nowrap { white-space: nowrap; }
 .path-cell, .identifier-cell, .error-cell { overflow-wrap: anywhere; min-width: 10rem; }
 .path-cell { max-width: 28rem; }
-.error-cell { max-width: 24rem; }
+.error-cell { max-width: 24rem; white-space: pre-line; }
 .empty-state { padding: 1.5rem; text-align: center; color: #6a6e73; }
 .table-note { margin: 0.5rem 0 0; color: #6a6e73; font-size: 0.9rem; }
 
@@ -357,4 +357,83 @@ summary { cursor: pointer; font-size: 1.1rem; font-weight: 700; }
     margin-top: 0.25rem;
     color: #6a6e73;
     font-size: 0.9rem;
+}
+
+.health-line .compact-action {
+    padding: 0.2rem 0.55rem;
+    font-size: 0.82rem;
+}
+
+.replica-status-list > div + div { margin-top: 0.25rem; }
+.replica-status-error { margin-top: 0.15rem; max-width: 28rem; white-space: normal; font-size: 0.9em; }
+
+/* Compact V2 backup-chain hierarchy. */
+.backup-chain-header td {
+    font-weight: 600;
+    padding-top: 0.8rem;
+    padding-bottom: 0.45rem;
+    border-top: 3px solid var(--pf-v6-global--BorderColor--100, #d2d2d2);
+}
+.backup-chain-relation {
+    white-space: nowrap;
+}
+
+.replica-retry-action {
+    margin-top: 0.35rem;
+}
+
+
+/* Active backup/replica operations: blue striped live bar. */
+.active-status {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 8.5rem;
+    min-height: 1.55rem;
+    overflow: hidden;
+    border: 1px solid #0066cc;
+    border-radius: 0.3rem;
+    background: #e7f1fa;
+    color: #102a43;
+    font-size: 0.78rem;
+    font-weight: 600;
+    line-height: 1;
+    vertical-align: middle;
+}
+
+.active-status-fill {
+    position: absolute;
+    inset: 0;
+    width: 45%;
+    background: repeating-linear-gradient(
+        -45deg,
+        #2b9af3 0,
+        #2b9af3 0.55rem,
+        #73bcf7 0.55rem,
+        #73bcf7 1.1rem
+    );
+    animation: vmbackupd-progress-slide 0.85s linear infinite;
+    opacity: 0.9;
+}
+
+.active-status-fill.determinate {
+    right: auto;
+    animation: vmbackupd-progress-slide 0.85s linear infinite;
+}
+
+.active-status-label {
+    position: relative;
+    z-index: 1;
+    padding: 0.25rem 0.5rem;
+    text-shadow: 0 1px 0 rgba(255, 255, 255, 0.65);
+}
+
+@keyframes vmbackupd-progress-slide {
+    from { background-position: 0 0; }
+    to { background-position: 2.2rem 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .active-status-fill { animation: none; }
 }

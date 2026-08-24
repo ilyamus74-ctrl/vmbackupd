@@ -69,6 +69,16 @@ class DaemonRuntimeV2:
 
         progressed = []
 
+        # Scheduling is part of the NEW controller loop. Persisted cursors are
+        # consumed before active-run recovery so a newly due run can begin in
+        # this same daemon tick.
+        if self.clock is not None:
+            from .scheduler_v2 import SchedulerV2
+            scheduled = SchedulerV2(
+                self.repository, self.clock, self.node_id
+            ).tick(self.instance_id)
+            progressed.extend(run.id for run in scheduled)
+
         recovery_results = (
             self.process_recovery_tasks()
         )
@@ -92,36 +102,24 @@ class DaemonRuntimeV2:
         progressed = []
 
         for run_id, state in self.repository.list_active_runs():
-
-            if state == "SCHEDULED":
-
-                new_state = self.state_machine.transition(
-                    state,
-                    "PREPARING",
-                )
-
-                self.repository.set_state(
-                    run_id,
-                    new_state,
-                )
-
-                self.repository.record_transition(
-                    run_id,
-                    state,
-                    new_state,
-                )
-
-                progressed.append(run_id)
-
-            elif state == "PREPARING":
-
-                self.repository.record_recovery(
-                    run_id,
-                    "resume_preparing",
-                    previous_state=state,
-                )
-
-                progressed.append(run_id)
+            if self.executor is None:
+                continue
+            try:
+                self.executor.advance_run(run_id)
+            except Exception as exc:
+                message = f"{type(exc).__name__}: {exc}"
+                context = self.repository.get_run_context(run_id)
+                execution = context.get("local_execution", {})
+                uncertain = execution.get("phase") in {
+                    "START_REQUESTED", "RUNNING",
+                }
+                if uncertain:
+                    self.repository.merge_run_context(run_id, {
+                        "recovery_required": True,
+                        "recovery_reason": message,
+                    })
+                self.repository.transition_run(run_id, "FAILED", message)
+            progressed.append(run_id)
 
         return progressed
 

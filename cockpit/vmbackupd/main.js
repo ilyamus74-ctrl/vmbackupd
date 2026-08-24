@@ -4,6 +4,8 @@
     console.log("MAIN CONTROLLER START");
 
     let loading = false;
+    let recentRunOffset = 0;
+    let recentRunFilter = "ALL";
 
 
     async function safeRequest(method, params) {
@@ -53,7 +55,9 @@
             storage,
             jobs,
             runPage,
-            recovery
+            recovery,
+            received,
+            restores
         ] = await Promise.all([
             safeRequest("vm.inventory"),
             safeRequest("vm.registered.list"),
@@ -61,9 +65,12 @@
             safeRequest("job.list"),
             safeRequest("run.list", {
                 limit: 5,
-                offset: 0
+                offset: recentRunOffset,
+                result: recentRunFilter
             }),
-            safeRequest("recovery.list")
+            safeRequest("recovery.list"),
+            safeRequest("received.list"),
+            safeRequest("restore.list")
         ]);
 
         const model =
@@ -74,9 +81,11 @@
                     registeredVms: registeredVms,
                     storage: storage,
                     jobs: jobs,
-                    runs: runPage.runs || [],
+                    runs: runPage.items || runPage.runs || [],
                     runPage: runPage,
-                    recovery: recovery
+                    recovery: recovery,
+                    received: received,
+                    restores: restores
                 },
                 new Date()
             );
@@ -108,7 +117,15 @@
         }
     }
 
-    VmbackupViews.configure({ refresh: start });
+    async function changeRunPage({ offset, result }) {
+        if (Number.isInteger(offset) && offset >= 0)
+            recentRunOffset = offset;
+        if (["ALL", "SUCCESS", "FAILED"].includes(result))
+            recentRunFilter = result;
+        return start();
+    }
+
+    VmbackupViews.configure({ refresh: start, changeRunPage });
 
     start().catch(
         e => console.error(
@@ -124,7 +141,7 @@
                 e
             )
         ),
-        5000
+        2000
     );
 
 })();

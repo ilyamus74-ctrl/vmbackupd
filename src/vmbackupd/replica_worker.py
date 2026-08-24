@@ -22,10 +22,7 @@ from .replica_sender import (
     SSHReplicaTransferClient,
     build_transfer_plan,
 )
-from .repository import (
-    DomainInvariantError,
-    SQLiteRepository,
-)
+from .repository_v2 import DomainInvariantError, RepositoryV2
 from .ssh_identity import SSHIdentityManager
 from .ssh_known_hosts import SSHKnownHostsManager
 
@@ -35,7 +32,7 @@ class ReplicaTaskExecutor:
 
     def __init__(
         self,
-        repository: SQLiteRepository,
+        repository: RepositoryV2,
         node_id: str,
         client,
         *,
@@ -584,7 +581,7 @@ class ReplicaWorker:
         repository = None
 
         try:
-            repository = SQLiteRepository(
+            repository = RepositoryV2.open(
                 self.database_path
             )
 

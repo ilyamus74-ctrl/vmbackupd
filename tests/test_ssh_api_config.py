@@ -526,7 +526,7 @@ def test_ssh_discovery_save_list_and_test_preserve_selected_remote_identity(tmp_
     assert tested["free_bytes"] == 3_238_327_898_112
     repository.close()
 
-def test_api_job_create_refuses_ssh_destination_without_creating_job(tmp_path):
+def test_api_job_create_preserves_ssh_destination_identity(tmp_path):
     repository, node, _, ssh = catalog(tmp_path)
     app = application_for(repository, node)
 
@@ -537,24 +537,20 @@ def test_api_job_create_refuses_ssh_destination_without_creating_job(tmp_path):
     )
     repository.add_vm(vm)
 
-    with pytest.raises(ApplicationError) as caught:
-        app.dispatch(
-            "job.create",
-            {
-                "vm_id": vm.id,
-                "name": "remote",
-                "storage_destination_id": ssh.id,
-            },
-        )
+    created = app.dispatch("job.create", {
+        "vm_id": vm.id,
+        "name": "remote",
+        "storage_destination_id": ssh.id,
+    })
 
-    assert caught.value.code == "REMOTE_TRANSPORT_NOT_IMPLEMENTED"
-    assert repository.list_jobs_for_node(node.id) == []
+    assert created["storage_destination_id"] == ssh.id
+    assert repository.get_job(created["id"]).storage_destination_id == ssh.id
     assert repository.list_runs() == []
 
     repository.close()
 
 
-def test_api_job_update_refuses_switch_to_ssh_destination(tmp_path):
+def test_api_job_update_preserves_switch_to_ssh_destination(tmp_path):
     repository, node, local, ssh = catalog(tmp_path)
     app = application_for(repository, node)
 
@@ -574,22 +570,18 @@ def test_api_job_update_refuses_switch_to_ssh_destination(tmp_path):
         },
     )
 
-    with pytest.raises(ApplicationError) as caught:
-        app.dispatch(
-            "job.update",
-            {
-                "id": created["id"],
-                "storage_destination_id": ssh.id,
-            },
-        )
+    updated = app.dispatch("job.update", {
+        "id": created["id"],
+        "storage_destination_id": ssh.id,
+    })
 
-    assert caught.value.code == "REMOTE_TRANSPORT_NOT_IMPLEMENTED"
-    assert repository.get_job(created["id"]).storage_destination_id == local.id
+    assert updated["storage_destination_id"] == ssh.id
+    assert repository.get_job(created["id"]).storage_destination_id == ssh.id
 
     repository.close()
 
 
-def test_repository_refuses_ssh_job_assignment(tmp_path):
+def test_repository_preserves_ssh_job_assignment(tmp_path):
     repository, node, _, ssh = catalog(tmp_path)
 
     vm = VM(
@@ -605,13 +597,9 @@ def test_repository_refuses_ssh_job_assignment(tmp_path):
         storage_destination_id=ssh.id,
     )
 
-    with pytest.raises(
-        DomainInvariantError,
-        match="REMOTE_TRANSPORT_NOT_IMPLEMENTED",
-    ):
-        repository.add_job(job)
+    repository.add_job(job)
 
-    assert repository.list_jobs_for_node(node.id) == []
+    assert repository.get_job(job.id).storage_destination_id == ssh.id
 
     repository.close()
 

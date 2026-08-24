@@ -18,12 +18,13 @@ from pathlib import Path
 
 from . import serialization
 from .clock import Clock
+from .backup_catalog_v2 import BackupCatalogError, LocalBackupCatalogService
 from .libvirt_backend import DomainJobState
 from .models import (
-    BackupJob, BackupPolicy, RetentionPolicy, SchedulePolicy, StorageDestination,
-    StorageType,
+    BackupJob, BackupPolicy, RetentionPolicy, RunState, SchedulePolicy,
+    StorageDestination, StorageType,
 )
-from .repository import DomainInvariantError, SQLiteRepository
+from .repository_v2 import DomainInvariantError, RepositoryV2
 from .ssh_identity import SSHIdentityError
 from .ssh_known_hosts import SSHKnownHostsError
 from .ssh_preflight import SSHPreflightError
@@ -45,14 +46,15 @@ class ApplicationError(RuntimeError):
 
 
 class VmbackupApplication:
-    def __init__(self, repository: SQLiteRepository, runtime, driver, config, node, clock: Clock,
+    def __init__(self, repository: RepositoryV2, runtime, driver, config, node, clock: Clock,
                  version: str, storage_tester=None, storage_preparer=None,
                  ssh_identity_manager=None, ssh_known_hosts_manager=None,
-                 ssh_receiver_manager=None, reclaim_recover_handler=None) -> None:
+                 ssh_receiver_manager=None, reclaim_recover_handler=None,
+                 backup_catalog=None) -> None:
         self.repository, self.runtime, self.driver = repository, runtime, driver
         # Storage is the first migrated slice: bypass the facade's generic
         # __getattr__ compatibility path and use the explicit NEW contract.
-        self.storage_repository = getattr(repository, "v2", repository)
+        self.storage_repository = repository
         self.config, self.node, self.clock, self.version = config, node, clock, version
         self.storage_tester = storage_tester or LocalStorageTester()
         self.storage_preparer = storage_preparer
@@ -62,6 +64,7 @@ class VmbackupApplication:
         self.ssh_storage_discovery_client = None
         self.ssh_receiver_manager = ssh_receiver_manager
         self.reclaim_recover_handler = reclaim_recover_handler
+        self.backup_catalog = backup_catalog or LocalBackupCatalogService(repository)
 
     def dispatch(self, method: str, params: dict) -> object:
         handlers = {
@@ -98,6 +101,10 @@ class VmbackupApplication:
             "run.list": self.run_list, "run.show": self.run_show,
             "restore_point.list": self.restore_point_list,
             "restore_point.show": self.restore_point_show,
+            "restore_point.delete": self.restore_point_delete,
+            "replica.retry": self.replica_retry,
+            "received.list": self.received_list,
+            "received.restore.create": self.received_restore_create,
             "restore.create": self.restore_create,
             "restore.list": self.restore_list,
             "restore.show": self.restore_show,
@@ -124,6 +131,8 @@ class VmbackupApplication:
         except SSHKnownHostsError as exc:
             raise ApplicationError(exc.code, str(exc)) from None
         except SSHReceiverError as exc:
+            raise ApplicationError(exc.code, str(exc)) from None
+        except BackupCatalogError as exc:
             raise ApplicationError(exc.code, str(exc)) from None
         except TypeError as exc:
             raise ApplicationError("INVALID_PARAMS", str(exc)) from None
@@ -1324,6 +1333,7 @@ class VmbackupApplication:
             )
             if replica.enabled
         ]
+        result["chain_schedule"] = self.repository.get_chain_schedule(value.id)
         return result
 
     @staticmethod
@@ -1433,9 +1443,12 @@ class VmbackupApplication:
                    schedule_timezone=None,
                    storage_destination_id=None, storage_destination=None,
                    replica_destination_ids=None,
-                   schedule_enabled=False, enabled=True):
-        if not isinstance(schedule_enabled, bool) or not isinstance(enabled, bool):
-            raise ApplicationError("INVALID_PARAMS", "schedule_enabled and enabled must be boolean")
+                   schedule_enabled=False, enabled=True,
+                   chain_schedule_enabled=False, chain_schedule_timezone=None,
+                   full_weekday=None, full_time=None, incremental_times=None):
+        if (not isinstance(schedule_enabled, bool) or not isinstance(enabled, bool)
+                or not isinstance(chain_schedule_enabled, bool)):
+            raise ApplicationError("INVALID_PARAMS", "schedule flags and enabled must be boolean")
         if not isinstance(name, str) or not name.strip():
             raise ApplicationError("INVALID_PARAMS", "job name must not be empty")
         vm = self.repository.get_vm(vm_id)
@@ -1451,13 +1464,6 @@ class VmbackupApplication:
                 raise ApplicationError("NOT_FOUND", "storage destination not found")
         else:
             destination = self.storage_repository.get_default_storage_destination(self.node.id)
-
-        if destination.storage_type is StorageType.SSH:
-            raise ApplicationError(
-                "REMOTE_TRANSPORT_NOT_IMPLEMENTED",
-                "SSH destinations cannot be assigned as the primary "
-                "backup destination",
-            )
 
         replicas = self._replica_destination_ids(
             replica_destination_ids,
@@ -1500,6 +1506,16 @@ class VmbackupApplication:
             value,
             replica_destination_ids=replicas,
         )
+        if chain_schedule_enabled:
+            try:
+                value = self.repository.configure_chain_schedule(
+                    value.id, self.clock.now(), enabled=True,
+                    timezone_name=chain_schedule_timezone,
+                    full_weekday=full_weekday, full_time=full_time,
+                    incremental_times=incremental_times,
+                )
+            except (ValueError, DomainInvariantError) as exc:
+                raise ApplicationError("INVALID_PARAMS", str(exc)) from exc
         return self._serialize_job(value)
 
     def job_update(self, id, name=None, enabled=None,
@@ -1512,11 +1528,15 @@ class VmbackupApplication:
                    schedule_timezone=None,
                    schedule_enabled=None,
                    max_incrementals_per_chain=None,
-                   replica_destination_ids=None):
+                   replica_destination_ids=None,
+                   chain_schedule_enabled=None, chain_schedule_timezone=None,
+                   full_weekday=None, full_time=None, incremental_times=None):
         if enabled is not None and not isinstance(enabled, bool):
             raise ApplicationError("INVALID_PARAMS", "enabled must be boolean")
         if schedule_enabled is not None and not isinstance(schedule_enabled, bool):
             raise ApplicationError("INVALID_PARAMS", "schedule_enabled must be boolean")
+        if chain_schedule_enabled is not None and not isinstance(chain_schedule_enabled, bool):
+            raise ApplicationError("INVALID_PARAMS", "chain_schedule_enabled must be boolean")
         if name is not None and (not isinstance(name, str) or not name.strip()):
             raise ApplicationError("INVALID_PARAMS", "job name must not be empty")
         if storage_destination_id and storage_destination:
@@ -1526,12 +1546,6 @@ class VmbackupApplication:
             candidate = self.storage_repository.get_storage_destination(
                 self.node.id, storage_destination_id
             )
-            if candidate.storage_type is StorageType.SSH:
-                raise ApplicationError(
-                    "REMOTE_TRANSPORT_NOT_IMPLEMENTED",
-                    "SSH destinations cannot be assigned as the primary "
-                    "backup destination",
-                )
         elif storage_destination:
             candidate = self.storage_repository.get_storage_destination_by_name(
                 self.node.id, storage_destination
@@ -1539,12 +1553,6 @@ class VmbackupApplication:
             if candidate is None:
                 raise ApplicationError(
                     "NOT_FOUND", "storage destination not found"
-                )
-            if candidate.storage_type is StorageType.SSH:
-                raise ApplicationError(
-                    "REMOTE_TRANSPORT_NOT_IMPLEMENTED",
-                    "SSH destinations cannot be assigned as the primary "
-                    "backup destination",
                 )
 
         replicas = self._replica_destination_ids(
@@ -1587,9 +1595,19 @@ class VmbackupApplication:
             replica_destination_ids=replicas,
         )
 
+        if chain_schedule_enabled is not None:
+            try:
+                updated = self.repository.configure_chain_schedule(
+                    id, self.clock.now(), enabled=chain_schedule_enabled,
+                    timezone_name=chain_schedule_timezone,
+                    full_weekday=full_weekday, full_time=full_time,
+                    incremental_times=incremental_times,
+                )
+            except (ValueError, DomainInvariantError) as exc:
+                raise ApplicationError("INVALID_PARAMS", str(exc)) from exc
         return self._serialize_job(updated)
 
-    def backup_run(self, job_id):
+    def backup_run(self, job_id, kind="AUTO"):
         runtime_state = getattr(self.runtime, "runtime_state", "RUNNING")
         runtime_state = getattr(runtime_state, "value", runtime_state)
         if runtime_state != "RUNNING":
@@ -1607,15 +1625,33 @@ class VmbackupApplication:
         destination = self.storage_repository.get_storage_destination(
             self.node.id, job.storage_destination_id
         )
-        if destination.storage_type is StorageType.SSH:
-            raise ApplicationError(
-                "REMOTE_TRANSPORT_NOT_IMPLEMENTED",
-                "SSH backup execution is not implemented yet",
+        try:
+            value = self.repository.create_manual_run(
+                job_id, self.node.id, self.clock.now(), requested_kind=kind
             )
+        except DomainInvariantError as exc:
+            raise ApplicationError("INVALID_PARAMS", str(exc)) from exc
 
-        value = self.repository.create_manual_run(
-            job_id, self.node.id, self.clock.now()
-        )
+        if destination.storage_type is StorageType.SSH:
+            try:
+                probe = self.storage_test(id=destination.id)
+                if not probe.get("ok"):
+                    raise ApplicationError(
+                        "SSH_PREFLIGHT_FAILED",
+                        "selected receiver storage is not ready",
+                    )
+            except ApplicationError as exc:
+                value = self.repository.transition_run(
+                    value.id, RunState.FAILED,
+                    f"{exc.code}: {exc}",
+                )
+                return {"run_id": value.id, "state": value.state.value}
+
+            value = self.repository.transition_run(
+                value.id, RunState.FAILED,
+                "SSH_BACKUP_TRANSFER_NOT_IMPLEMENTED: "
+                "receiver preflight passed; payload transfer is not enabled",
+            )
         return {"run_id": value.id, "state": value.state.value}
 
     def run_list(
@@ -1724,19 +1760,6 @@ class VmbackupApplication:
             )
 
         try:
-            import logging
-
-            logging.error(
-                "DEBUG RUN LIST REPOSITORY %s %r",
-                type(self.repository),
-                self.repository,
-            )
-
-            logging.error(
-                "DEBUG RUN LIST METHOD %r",
-                self.repository.list_runs_page_for_node,
-            )
-
             values, total = self.repository.list_runs_page_for_node(
                 self.node.id,
                 limit=limit,
@@ -1770,11 +1793,12 @@ class VmbackupApplication:
         self,
         job_id=None,
         include_locations=False,
+        details=False,
     ):
-        if not isinstance(include_locations, bool):
+        if not isinstance(include_locations, bool) or not isinstance(details, bool):
             raise ApplicationError(
                 "INVALID_PARAMS",
-                "include_locations must be boolean",
+                "include_locations and details must be boolean",
             )
 
         # Preserve the original Phase 3C response for existing callers.
@@ -1809,6 +1833,13 @@ class VmbackupApplication:
 
         self._require_local_job(job)
 
+        if details:
+            # Compact V2 job history: return the published bundle and storage
+            # facts needed by the Cockpit job spoiler.
+            return self.repository.list_local_backup_entries_for_job(
+                self.node.id, job.id
+            )
+
         points = self.repository.list_restore_points_for_job(
             self.node.id,
             job.id,
@@ -1831,6 +1862,58 @@ class VmbackupApplication:
             result.append(item)
 
         return result
+    def restore_point_delete(self, id, job_id=None):
+        if not isinstance(id, str) or not id.strip():
+            raise ApplicationError("INVALID_PARAMS", "restore point id must be a non-empty string")
+        if job_id is not None and (not isinstance(job_id, str) or not job_id.strip()):
+            raise ApplicationError("INVALID_PARAMS", "job_id must be a non-empty string")
+        if job_id is not None:
+            job = self.repository.get_job(job_id.strip())
+            self._require_local_job(job)
+        return self.backup_catalog.delete_restore_point(
+            id.strip(), expected_job_id=job_id.strip() if job_id is not None else None
+        )
+
+    def replica_retry(self, restore_point_id, destination_id):
+        for label, value in (("restore_point_id", restore_point_id), ("destination_id", destination_id)):
+            if not isinstance(value, str) or not value.strip():
+                raise ApplicationError("INVALID_PARAMS", f"{label} must be a non-empty string")
+        point = self.repository.get_restore_point_v2(restore_point_id.strip())
+        if point is None:
+            raise ApplicationError("NOT_FOUND", "restore point not found")
+        run = self.repository.get_run(point.job_run_id)
+        job = self.repository.get_job(run.job_id)
+        self._require_local_job(job)
+        destination = self.repository.get_storage_destination(self.node.id, destination_id.strip())
+        if destination.storage_type is not StorageType.SSH:
+            raise ApplicationError("INVALID_PARAMS", "replica destination must be SSH")
+        return self.repository.retry_replica_chain_v2(
+            point.id, destination.id, utcnow()
+        )
+
+    def received_list(self):
+        catalog=getattr(self,"received_catalog",None)
+        if catalog is not None: return catalog.reconcile()
+        return self.repository.list_received_restore_points(self.node.id)
+
+    def received_restore_create(self, restore_point_id, target_vm_name, target_root,
+                                start_after_restore=False):
+        for label, value in (("restore_point_id", restore_point_id),
+                             ("target_vm_name", target_vm_name),
+                             ("target_root", target_root)):
+            if not isinstance(value, str) or not value.strip():
+                raise ApplicationError("INVALID_PARAMS", f"{label} must be a non-empty string")
+        if not isinstance(start_after_restore, bool):
+            raise ApplicationError("INVALID_PARAMS", "start_after_restore must be boolean")
+        if not self.config.libvirt.allow_mutation:
+            raise ApplicationError("MUTATION_DISABLED", "restore mutation is disabled")
+        operation = self.repository.create_received_restore_operation_v2(
+            restore_point_id.strip(), self.node.id, target_vm_name.strip(),
+            target_root.strip(), self.clock.now(),
+            start_after_restore=start_after_restore,
+        )
+        return serialization.restore_operation(operation)
+
     def restore_point_show(self, id):
         value = self.repository.get_restore_point(id)
         chain = self.repository.get_chain(value.chain_id)

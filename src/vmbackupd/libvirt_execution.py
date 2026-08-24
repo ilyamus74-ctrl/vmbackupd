@@ -150,10 +150,13 @@ class VirshBackupDriver:
 
         self._require_success(result)
 
-    def begin_backup(self, domain: str, backup_xml_file: str) -> CommandResult:
+    def begin_backup(self, domain: str, backup_xml_file: str, checkpoint_xml_file: str | None = None) -> CommandResult:
+        command = ["virsh", "--connect", self.connection_uri, "backup-begin", domain, backup_xml_file]
+        if checkpoint_xml_file is not None:
+            command.append(checkpoint_xml_file)
+        command.append("--reuse-external")
         result = self.runner.run(
-            ("virsh", "--connect", self.connection_uri, "backup-begin", domain,
-             backup_xml_file, "--reuse-external"),
+            tuple(command),
             timeout=self.timeout,
         )
 

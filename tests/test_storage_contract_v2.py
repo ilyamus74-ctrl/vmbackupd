@@ -7,7 +7,7 @@ import pytest
 
 from vmbackupd.application import ApplicationError, VmbackupApplication
 from vmbackupd.clock import SystemClock
-from vmbackupd.models import Node, StorageDestination, StorageType
+from vmbackupd.models import BackupJob, Node, StorageDestination, StorageType, VM
 from vmbackupd.repository import SQLiteRepository
 from vmbackupd.repository_v2 import DomainInvariantError, RepositoryV2
 from vmbackupd.schema_v2 import ensure_schema
@@ -136,8 +136,11 @@ def test_repository_v2_storage_ownership_duplicates_delete_safety_and_bad_json(t
     with pytest.raises(DomainInvariantError, match="STORAGE_NAME_EXISTS"):
         repo.create_storage_destination(destination(node, tmp_path / "two"))
 
-    vm_id = repo.add_vm(node.id, "vm")
-    repo.add_job(vm_id, value.id, "job")
+    vm = VM(node_id=node.id, name="vm", external_id="vm")
+    repo.add_vm(vm)
+    repo.add_job(BackupJob(
+        vm_id=vm.id, name="job", storage_destination_id=value.id,
+    ))
     with pytest.raises(DomainInvariantError, match="STORAGE_IN_USE"):
         repo.delete_storage_destination(node.id, value.id)
 

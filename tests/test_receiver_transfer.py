@@ -651,3 +651,34 @@ def test_transfer_internal_failure_does_not_expose_local_path(
     assert str(tmp_path) not in encoded
     assert "/private/" not in encoded
     assert "Traceback" not in encoded
+
+
+def test_seeded_transfer_clones_full_and_applies_delta(tmp_path, monkeypatch):
+    import json, uuid
+    from vmbackupd.receiver_transfer import DeclaredFile, TransferDeclaration, ReceiverStagingSession
+    storage = tmp_path / "storage"; namespace = storage / ".vmbackupd-receiver"; namespace.mkdir(parents=True)
+    vm_id, storage_id, seed_id = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+    seed_bundle = storage / "vms" / vm_id / "seed"; (seed_bundle / "disks").mkdir(parents=True)
+    seed_disk = seed_bundle / "disks" / "vda.qcow2"; seed_disk.write_bytes(b"A" * 8192)
+    published = storage / ".vmbackupd-replica-state" / "published"; published.mkdir(parents=True)
+    (published / f"{seed_id}.json").write_text(json.dumps({
+        "state":"PUBLISHED", "storage_id":storage_id, "vm_id":vm_id, "kind":"FULL",
+        "bundle_object_id":seed_bundle.relative_to(storage).as_posix(),
+    }))
+    decl = TransferDeclaration(
+        transfer_id=str(uuid.uuid4()), storage_id=storage_id, vm_id=vm_id,
+        restore_point_id=str(uuid.uuid4()), chain_id=str(uuid.uuid4()), job_run_id=str(uuid.uuid4()),
+        kind="FULL", sequence=0, parent_restore_point_id=None,
+        created_at="2026-08-24T00:00:00+00:00",
+        files=(DeclaredFile("metadata/domain.xml",1,1), DeclaredFile("metadata/manifest.json",1,1),
+               DeclaredFile("metadata/restore-point.json",1,1), DeclaredFile("disks/vda.qcow2",8192,4)),
+        seed_restore_point_id=seed_id,
+    )
+    session=ReceiverStagingSession(decl, namespace); session.prepare(); session.begin_file("disks/vda.qcow2")
+    session.write_extent(offset=0,length=4,sha256=__import__('hashlib').sha256(b"BBBB").hexdigest(),payload=b"BBBB")
+    session.write_hole(offset=4096,length=4096)
+    session.end_file()
+    result=(session.disks/"vda.qcow2").read_bytes()
+    assert result[:4] == b"BBBB"
+    assert result[4:4096] == b"A" * (4096-4)
+    assert result[4096:] == b"\0" * 4096

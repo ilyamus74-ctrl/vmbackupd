@@ -12,7 +12,7 @@ COCKPIT = ROOT / "cockpit" / "vmbackupd"
 
 def test_authoritative_boundary_documents_production_path_and_schema():
     text = BOUNDARY.read_text()
-    assert "SQLiteRepository (BRIDGE)" in text
+    assert "Production composition, its runtime worker" in text
     assert "RepositoryV2 (NEW)" in text
     assert "schema_v2.ensure_schema() (NEW)" in text
     assert "schema_version = 1" in text
@@ -71,3 +71,16 @@ def test_rpm_spec_owns_every_active_cockpit_asset():
     )
     for name in ("index.html", "api.js", "model.js", "views.js", "main.js", "vmbackupd.css"):
         assert name in install_line
+
+
+def test_installed_daemon_composition_uses_repository_v2_directly():
+    for relative in (
+        "src/vmbackupd/application.py",
+        "src/vmbackupd/bootstrap.py",
+        "src/vmbackupd/replica_worker.py",
+    ):
+        source = (ROOT / relative).read_text()
+        assert "SQLiteRepository(" not in source
+    assert "RepositoryV2.open(" in (
+        ROOT / "src/vmbackupd/bootstrap.py"
+    ).read_text()

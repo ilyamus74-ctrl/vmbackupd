@@ -36,6 +36,11 @@
         "job.list",
         "run.list",
         "restore_point.list",
+        "restore_point.delete",
+        "replica.retry",
+        "received.list",
+        "received.restore.create",
+        "restore.list",
         "recovery.list",
         "vm.register",
         "job.create",
@@ -43,6 +48,19 @@
         "backup.run",
     ]);
     let requestSequence = 0;
+    let forcePrivilegedTransport = false;
+    const adminPermission = global.cockpit && typeof global.cockpit.permission === "function" ?
+        global.cockpit.permission({ admin: true }) : null;
+    const adminChangedListeners = new Set();
+
+    if (adminPermission && typeof adminPermission.addEventListener === "function") {
+        adminPermission.addEventListener("changed", () => {
+            if (!adminPermission.allowed)
+                forcePrivilegedTransport = false;
+            for (const listener of adminChangedListeners)
+                listener(Boolean(adminPermission.allowed));
+        });
+    }
 
     class TransportError extends Error {}
     class ProtocolError extends Error {}
@@ -84,7 +102,7 @@
         return { result: undefined, error: new ApiError(error.code, error.message) };
     }
 
-    function request(method, params = {}) {
+    function directRequest(method, params = {}) {
         if (!ALLOWED_METHODS.includes(method))
             return Promise.reject(new ApiError("METHOD_NOT_ALLOWED", "Frontend method is not allowed"));
 
@@ -196,8 +214,113 @@
         });
     }
 
+    function adminAllowed() {
+        return Boolean(adminPermission && adminPermission.allowed);
+    }
+
+    function privilegedSpawn(args, input = null, superuser = "require", requireAdmin = true) {
+        if (requireAdmin && !adminAllowed())
+            return Promise.reject(new ApiError(
+                "ADMIN_REQUIRED",
+                "Cockpit Administrative access is required",
+            ));
+        const process = global.cockpit.spawn(args, {
+            superuser: superuser,
+            err: "message",
+        });
+        if (input !== null)
+            process.input(input);
+        return process;
+    }
+
+    async function privilegedRequest(method, params = {}) {
+        if (!ALLOWED_METHODS.includes(method))
+            throw new ApiError("METHOD_NOT_ALLOWED", "Frontend method is not allowed");
+        const id = requestId();
+        const requestLine = JSON.stringify({
+            version: PROTOCOL_VERSION,
+            id: id,
+            method: method,
+            params: params,
+        }) + "\n";
+        let output;
+        try {
+            output = await privilegedSpawn(
+                ["/usr/libexec/vmbackupd-cockpit-helper", "relay"],
+                requestLine,
+                "try",
+                false,
+            );
+        } catch (error) {
+            const detail = error && error.message ? `: ${error.message}` : "";
+            throw new TransportError(`privileged API relay failed${detail}`);
+        }
+        const lines = String(output).split("\n");
+        if (lines.length < 2 || lines.slice(1).some(line => line.trim() !== ""))
+            throw new ProtocolError("privileged API relay returned an invalid record");
+        let response;
+        try {
+            response = JSON.parse(lines[0]);
+        } catch (_error) {
+            throw new ProtocolError("privileged API relay returned malformed JSON");
+        }
+        const validated = validatedEnvelope(response, id);
+        if (validated.error)
+            throw validated.error;
+        return validated.result;
+    }
+
+    async function request(method, params = {}) {
+        if (forcePrivilegedTransport && adminAllowed())
+            return privilegedRequest(method, params);
+        try {
+            return await directRequest(method, params);
+        } catch (error) {
+            if (!(error instanceof TransportError))
+                throw error;
+            forcePrivilegedTransport = true;
+            return privilegedRequest(method, params);
+        }
+    }
+
+    async function setMutation(enabled) {
+        if (typeof enabled !== "boolean")
+            throw new ApiError("INVALID_PARAMS", "Mutation state must be boolean");
+        let output;
+        try {
+            output = await privilegedSpawn([
+                "/usr/libexec/vmbackupd-cockpit-helper",
+                "mutation-set",
+                enabled ? "true" : "false",
+            ]);
+        } catch (error) {
+            if (error instanceof ApiError)
+                throw error;
+            const detail = error && error.message ? `: ${error.message}` : "";
+            throw new TransportError(`mutation update failed${detail}`);
+        }
+        try {
+            const result = JSON.parse(String(output).trim());
+            if (!result || result.libvirt_mutation_enabled !== enabled)
+                throw new Error("state mismatch");
+            return result;
+        } catch (_error) {
+            throw new ProtocolError("mutation helper returned malformed state");
+        }
+    }
+
+    function onAdminChanged(listener) {
+        if (typeof listener !== "function")
+            return () => {};
+        adminChangedListeners.add(listener);
+        return () => adminChangedListeners.delete(listener);
+    }
+
     global.VmbackupApi = Object.freeze({
         request: request,
+        setMutation: setMutation,
+        adminAllowed: adminAllowed,
+        onAdminChanged: onAdminChanged,
         methods: ALLOWED_METHODS,
         ApiError: ApiError,
         ProtocolError: ProtocolError,

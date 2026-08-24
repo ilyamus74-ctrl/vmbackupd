@@ -1,0 +1,86 @@
+#!/usr/bin/python3 -sP
+"""Narrow privileged bridge for the vmbackupd Cockpit page."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import socket
+import subprocess
+import sys
+
+from vmbackupd.admin_config import set_libvirt_mutation
+
+
+SOCKET_PATH = "/run/vmbackupd/vmbackupd.sock"
+CONFIG_PATH = Path("/etc/vmbackupd/vmbackupd.toml")
+MAX_REQUEST_BYTES = 64 * 1024
+MAX_RESPONSE_BYTES = 1024 * 1024
+
+
+def fail(message: str, code: int = 2) -> "NoReturn":
+    print(f"vmbackupd-cockpit-helper: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def relay() -> None:
+    payload = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
+    if len(payload) > MAX_REQUEST_BYTES:
+        fail("request too large")
+    if not payload.endswith(b"\n"):
+        fail("request must contain exactly one newline-terminated record")
+    lines = payload.splitlines()
+    if len(lines) != 1:
+        fail("request must contain exactly one record")
+    try:
+        envelope = json.loads(lines[0])
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        fail("request is not valid JSON")
+    if not isinstance(envelope, dict) or not isinstance(envelope.get("method"), str):
+        fail("request envelope is invalid")
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(45)
+        connection.connect(SOCKET_PATH)
+        connection.sendall(payload)
+        response = bytearray()
+        while b"\n" not in response:
+            chunk = connection.recv(65536)
+            if not chunk:
+                fail("daemon closed before a complete response", 3)
+            response.extend(chunk)
+            if len(response) > MAX_RESPONSE_BYTES:
+                fail("daemon response too large", 3)
+
+    line, separator, trailing = bytes(response).partition(b"\n")
+    if not separator or trailing.strip():
+        fail("daemon returned an invalid response record", 3)
+    sys.stdout.buffer.write(line + b"\n")
+
+
+def mutation_set(value: str) -> None:
+    if value not in {"true", "false"}:
+        fail("mutation-set expects true or false")
+    enabled = value == "true"
+    set_libvirt_mutation(CONFIG_PATH, enabled)
+    subprocess.run(
+        ["/usr/bin/systemctl", "restart", "vmbackupd.service"],
+        check=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+    )
+    print(json.dumps({"libvirt_mutation_enabled": enabled}, separators=(",", ":")))
+
+
+def main() -> None:
+    if len(sys.argv) == 2 and sys.argv[1] == "relay":
+        relay()
+        return
+    if len(sys.argv) == 3 and sys.argv[1] == "mutation-set":
+        mutation_set(sys.argv[2])
+        return
+    fail("usage: vmbackupd-cockpit-helper relay | mutation-set {true|false}")
+
+
+if __name__ == "__main__":
+    main()

@@ -150,7 +150,7 @@ const message = context.window.VmbackupViews.failureMessage(
 if (!message.includes("INVALID_PARAMS") || !message.includes("bad storage"))
     throw new Error(`API error detail lost: ${message}`);
 """)
-    assert "VmbackupViews.configure({ refresh: start })" in MAIN.read_text()
+    assert "VmbackupViews.configure({ refresh: start, changeRunPage });" in MAIN.read_text()
 
 
 def test_persisted_ssh_destination_renders_without_probe_result():
@@ -215,7 +215,7 @@ function visibleText(value) {
     request = async () => { throw new ApiError("SSH_TEST_FAILED", "receiver denied"); };
     await views.testStoredDestination(destination);
     rendered = visibleText(nodes.get("storage"));
-    if (!rendered.includes("Probe failed"))
+    if (!rendered.includes("Connection error"))
         throw new Error(`failed probe state missing: ${rendered}`);
     const result = nodes.get("storage-test-result");
     if (!result.textContent.includes("SSH_TEST_FAILED") ||
@@ -255,7 +255,9 @@ function visibleText(value) {
     });
     await views.testStoredDestination(destination);
     const rendered = visibleText(nodes.get("storage"));
-    for (const expected of ["2.9 TiB", "300 GiB", "5%"])
+    if (!rendered.includes("2.9 TiB") && !rendered.includes("2,9 TiB"))
+        throw new Error(`missing localized 2.9 TiB: ${rendered}`);
+    for (const expected of ["300 GiB", "5%"])
         if (!rendered.includes(expected)) throw new Error(`missing ${expected}: ${rendered}`);
     if (rendered.includes("/srv/vmbackupd"))
         throw new Error(`receiver root leaked into destination: ${rendered}`);
@@ -264,3 +266,54 @@ function visibleText(value) {
     source = VIEWS.read_text()
     assert "name: result.remote_storage_name" in source
     assert "path: result.remote_storage_path" in source
+
+
+def test_ssh_storage_auto_probe_updates_free_space_and_connection_error():
+    run_node(r"""
+(async () => {
+    const views = context.window.VmbackupViews;
+    let calls = 0;
+    request = async (method, params) => {
+        if (method !== "storage.test") throw new Error(`unexpected method ${method}`);
+        calls += 1;
+        return {
+            ok: true, probe_type: "SSH", ready: true,
+            remote_storage_id: "remote-1", remote_storage_name: "STOR_HDD",
+            remote_storage_path: "/STOR_HDD/vmbackupd",
+            free_bytes: 123456789, total_bytes: 999999999,
+            remote_minimum_free_bytes: 0, remote_minimum_free_percent: 5,
+            remote_required_reserve_bytes: 0, remote_usable_after_reserve_bytes: 123456789,
+        };
+    };
+    const model = {
+        status: { node_name: "node" },
+        storage: [{
+            id: "ssh-auto-1", name: "receiver", storage_type: "SSH",
+            ssh_host: "receiver.example", ssh_port: 22022,
+            remote_storage_id: "remote-1", minimum_free_bytes: 0,
+            minimum_free_percent: 5, is_default: false,
+        }],
+    };
+    views.renderStorage(model);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    if (calls !== 1) throw new Error(`expected one automatic probe, got ${calls}`);
+
+    function visibleText(value) {
+        if (!value) return "";
+        if (Array.isArray(value)) return value.map(visibleText).join(" ");
+        return `${value.textContent || ""} ${visibleText(value.children || [])}`;
+    }
+    let rendered = visibleText(nodes.get("storage"));
+    if (rendered.includes("Not tested"))
+        throw new Error(`automatic success did not replace Not tested: ${rendered}`);
+
+    // Force a distinct SSH destination so throttle state cannot hide the failure probe.
+    request = async () => { throw new ApiError("SSH_STORAGE_DISCOVERY_CONNECT_FAILED", "receiver offline"); };
+    model.storage[0] = {...model.storage[0], id: "ssh-auto-2"};
+    views.renderStorage(model);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    rendered = visibleText(nodes.get("storage"));
+    if (!rendered.includes("Connection error"))
+        throw new Error(`connection error state missing: ${rendered}`);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")

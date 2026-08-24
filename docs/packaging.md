@@ -119,10 +119,12 @@ permissions.
 ## Configuration and activation
 
 The packaged configuration resolves `node_name = "auto"` once per startup from
-the stable local hostname, uses production state/socket paths, and leaves
-`libvirt.allow_mutation = false`. Installation therefore cannot start a real
-backup. Review the hostname, storage roots, reserves, QEMU group, and mutation
-setting before explicitly enabling the service:
+the stable local hostname, uses production state/socket paths, and enables
+`libvirt.allow_mutation = true` for a fresh installation. Existing administrator
+configuration remains protected by RPM `%config(noreplace)`. Cockpit exposes an
+administrative Mutation toggle that persists this setting and restarts the daemon;
+non-administrative sessions cannot use that privileged helper. Review the hostname,
+storage roots, reserves, and QEMU group before explicitly enabling the service:
 
 ```text
 systemctl enable --now vmbackupd

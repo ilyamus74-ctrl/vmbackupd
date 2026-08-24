@@ -65,6 +65,8 @@ install -Dpm 0644 packaging/vmbackupd-libvirt.rules \
 
 install -Dpm 0755 packaging/vmbackupd-storage-helper \
     %{buildroot}%{_libexecdir}/vmbackupd-storage-helper
+install -Dpm 0755 packaging/vmbackupd-cockpit-helper \
+    %{buildroot}%{_libexecdir}/vmbackupd-cockpit-helper
 install -Dpm 0644 packaging/vmbackupd-storage-helper.socket \
     %{buildroot}%{_unitdir}/vmbackupd-storage-helper.socket
 install -Dpm 0644 packaging/vmbackupd-storage-helper@.service \
@@ -158,6 +160,7 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-resolver@.service \
 %{_tmpfilesdir}/vmbackupd-receiver.conf
 
 %{_libexecdir}/vmbackupd-storage-helper
+%{_libexecdir}/vmbackupd-cockpit-helper
 %{_libexecdir}/vmbackupd-authorized-keys
 %{_libexecdir}/vmbackupd-transfer-shell
 %{_libexecdir}/vmbackupd-receiver-session

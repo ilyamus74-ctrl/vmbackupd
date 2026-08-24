@@ -178,8 +178,12 @@ function visibleText(value) {
         }],
     });
     const rendered = visibleText(nodes.get("storage"));
-    for (const expected of ["2.9 TiB", "300 GiB", "5%"])
-        if (!rendered.includes(expected)) throw new Error(`missing ${expected}: ${rendered}`);
+        if (!(rendered.includes("2.9 TiB") || rendered.includes("2,9 TiB")))
+    throw new Error(`missing 2.9/2,9 TiB: ${rendered}`);
+
+for (const expected of ["300 GiB", "5%"])
+    if (!rendered.includes(expected))
+        throw new Error(`missing ${expected}: ${rendered}`);
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """)
     views = (ROOT / "cockpit/vmbackupd/views.js").read_text()

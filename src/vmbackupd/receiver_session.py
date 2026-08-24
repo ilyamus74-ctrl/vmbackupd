@@ -33,6 +33,10 @@ from .receiver_transfer import (
     TRANSFER_COMMAND,
     run_receiver_transfer,
 )
+from .receiver_seed import (
+    SEED_COMMAND,
+    run_receiver_seed,
+)
 from .receiver_reclaim_delete import (
     RECLAIM_DELETE_COMMAND,
     run_receiver_reclaim_delete,
@@ -147,6 +151,7 @@ def main(
     receiver_root=None,
     catalog_client=None,
     transfer_runner=None,
+    seed_runner=None,
     publish_runner=None,
     restore_manifest_runner=None,
     reclaim_delete_runner=None,
@@ -185,6 +190,10 @@ def main(
             if transfer_runner is None
             else transfer_runner
         )
+        return runner()
+
+    if original == SEED_COMMAND:
+        runner = run_receiver_seed if seed_runner is None else seed_runner
         return runner()
 
     if original == PUBLISH_COMMAND:

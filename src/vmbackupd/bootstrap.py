@@ -16,13 +16,16 @@ from .command import SubprocessCommandRunner
 from .config import AppConfig
 from .libvirt_backend import VirshLibvirtDriver
 from .libvirt_execution import (
-    LibvirtBackupExecutor, QemuImageInspector, QemuOutputImagePreparer,
+    QemuImageInspector, QemuOutputImagePreparer,
     StagingFilesystem, VirshBackupDriver,
 )
+from .local_backup_v2 import CompactLocalBackupExecutor
 from .local_api import ApiServer
 from .models import StorageDestination, StorageType
-from .repository import DomainInvariantError, SQLiteRepository
-from .replica_worker import ReplicaWorker
+from .repository_v2 import DomainInvariantError, RepositoryV2
+from .received_catalog_v2 import ReceivedCatalogV2
+from .received_restore_v2 import ReceivedRestoreRuntimeV2
+from .replica_v2 import ReplicaWorkerV2
 from .replica_sender import SSHReplicaTransferClient
 from .reclaim_execution import ReclaimExecutor
 from .restore_libvirt import (
@@ -66,7 +69,7 @@ def _system_ssh_identity_id(node_id: str) -> str:
 @dataclass(slots=True)
 class Components:
     config: AppConfig
-    repository: SQLiteRepository
+    repository: RepositoryV2
     runtime: "RuntimeWorker"
     application: VmbackupApplication
     api_server: ApiServer
@@ -180,7 +183,7 @@ class RuntimeWorker:
         runtime = None
         replica_worker = None
         try:
-            repository = SQLiteRepository(self.config.daemon.database_path)
+            repository = RepositoryV2.open(self.config.daemon.database_path)
             self.repository_connection_id = id(repository.connection)
             self.repository_thread_id = threading.get_ident()
             clock = SystemClock()
@@ -262,20 +265,12 @@ class RuntimeWorker:
                     backup_data_mode=destination.backup_data_mode,
                 )
                 inspector = QemuImageInspector(runner)
-                return LibvirtBackupExecutor(
+                return CompactLocalBackupExecutor(
                     repository, read_driver, backup_mutation_driver, staging,
                     inspector,
-                    output_preparer=QemuOutputImagePreparer(runner, staging, inspector),
+                    QemuOutputImagePreparer(runner, staging, inspector),
                     allow_libvirt_mutation=self.config.libvirt.allow_mutation,
-                    minimum_free_bytes=destination.minimum_free_bytes,
-                    minimum_free_percent=destination.minimum_free_percent,
                     clock=clock,
-                    reclaim_destination_resolver=(
-                        reclaim_destination_resolver
-                    ),
-                    remote_reclaim_delete=(
-                        remote_reclaim_delete
-                    ),
                 )
 
             capacity_adapter = CapacityAdapter(
@@ -351,8 +346,15 @@ class RuntimeWorker:
                 ),
             )
 
+            received_restore_runtime = ReceivedRestoreRuntimeV2(
+                repository, self.node_id, runner, read_driver,
+                restore_mutation_driver, clock,
+                allow_mutation=self.config.libvirt.allow_mutation,
+            )
+
             # MATERIALIZING / DEFINING / STARTING left by a previous
             # process are never automatically replayed.
+            received_restore_runtime.recover_startup()
             restore_runtime.recover_startup()
 
             database_path = (
@@ -361,7 +363,7 @@ class RuntimeWorker:
 
             if str(database_path) != ":memory:":
                 try:
-                    replica_worker = ReplicaWorker(
+                    replica_worker = ReplicaWorkerV2(
                         database_path,
                         self.node_id,
                         database_path.parent / "ssh",
@@ -431,6 +433,7 @@ class RuntimeWorker:
                     self.before_tick()
 
                 runtime.tick()
+                received_restore_runtime.tick()
                 restore_runtime.tick()
 
                 self._stop.wait(
@@ -494,7 +497,7 @@ def compose(
     storage_preparer=_DEFAULT_STORAGE_PREPARER,
 ) -> Components:
     config.daemon.database_path.parent.mkdir(parents=True, exist_ok=True)
-    repository = SQLiteRepository(config.daemon.database_path)
+    repository = RepositoryV2.open(config.daemon.database_path)
     clock = SystemClock()
     node = repository.get_or_create_node(config.daemon.node_name)
     intended = [StorageDestination(
@@ -580,7 +583,7 @@ def compose(
         storage_preparer = StoragePrepareClient()
 
     # `reclaim.recover` is served from the API/compose thread, which owns
-    # its own SQLiteRepository connection distinct from the one used by
+    # its own RepositoryV2 connection distinct from the one used by
     # RuntimeWorker's background thread. It therefore cannot reach into
     # RuntimeWorker._run's local `executor_for` closure (that closure is
     # bound to a different thread's connection and isn't in scope here
@@ -635,6 +638,7 @@ def compose(
         ssh_receiver_manager=ssh_receiver_manager,
         reclaim_recover_handler=reclaim_recover,
     )
+    application.received_catalog = ReceivedCatalogV2(repository, node.id)
     application.ssh_preflight_client = ssh_preflight_client
     application.ssh_storage_discovery_client = (
         ssh_storage_discovery_client

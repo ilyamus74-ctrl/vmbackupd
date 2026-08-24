@@ -32,7 +32,12 @@ class RunStateMachineV2:
         },
 
         "VERIFYING": {
-            "COMPLETED",
+            "FINALIZING",
+            "FAILED",
+        },
+
+        "FINALIZING": {
+            "SUCCESS",
             "FAILED",
         },
 
@@ -51,7 +56,7 @@ class RunStateMachineV2:
             "PREPARING",
         },
 
-        "COMPLETED": set(),
+        "SUCCESS": set(),
     }
 
 

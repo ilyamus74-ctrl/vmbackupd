@@ -10,7 +10,7 @@ execution_lease_seconds = 300
 
 [libvirt]
 uri = "qemu:///system"
-allow_mutation = false
+allow_mutation = true
 
 [storage]
 default_destination = "local-root"

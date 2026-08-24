@@ -30,6 +30,7 @@
         <div class="health-line">
           <span id="daemon-health" class="badge status-neutral">Unavailable</span>
           <span id="mutation-state" class="badge status-neutral">Mutation state unknown</span>
+          <button id="mutation-toggle" type="button" class="compact-action" disabled title="Administrative access required">Mutation</button>
         </div>
       </div>
       <div class="summary-grid">
@@ -95,11 +96,21 @@
       <p class="table-note">Local free space is measured by this node. SSH staging is managed automatically. SSH Test performs authenticated receiver preflight and remote capacity checks. SSH backup transfer is not enabled yet.</p>
     </section>
 
+
+    <section aria-labelledby="received-title">
+      <div class="section-heading"><h2 id="received-title">Received backups</h2></div>
+      <p class="table-note">Published SSH replicas discovered on this node. They are local restore sources on the receiver.</p>
+      <div class="table-scroll"><table class="operational-table">
+        <thead><tr><th>VM</th><th>Created</th><th>Type</th><th>Storage</th><th>Status</th><th>Origin</th><th>Path</th><th>Restore</th></tr></thead>
+        <tbody id="received-backups"></tbody>
+      </table></div>
+    </section>
+
     <section aria-labelledby="vms-title">
       <h2 id="vms-title">Discovered virtual machines</h2>
       <div class="table-scroll">
         <table class="operational-table">
-          <thead><tr><th>Name</th><th>External ID</th><th>UUID</th><th>State</th></tr></thead>
+          <thead><tr><th>Name</th><th>External ID</th><th>UUID</th><th>State</th><th>Registration</th></tr></thead>
           <tbody id="vms"></tbody>
         </table>
       </div>
@@ -162,7 +173,7 @@
       </fieldset>
 
       <label class="check-label"><input id="job-enabled" type="checkbox" checked> Enabled</label>
-      <label>Schedule mode<select id="job-schedule"><option value="manual">Manual</option><option value="interval">Interval</option><option value="daily">Daily</option></select></label>
+      <label>Schedule mode<select id="job-schedule"><option value="manual">Manual</option><option value="interval">Interval</option><option value="daily">Daily</option><option value="chain">Weekly FULL + daily incrementals</option></select></label>
       <div id="interval-fields" class="inline-fields" hidden>
         <label>Every<input id="job-interval" type="number" min="1" value="60"></label>
         <label>Unit<select id="job-interval-unit"><option value="1">seconds</option><option value="60">minutes</option><option value="3600">hours</option><option value="86400">days</option></select></label>
@@ -171,11 +182,35 @@
         <label>Time<input id="job-daily-time" type="time" value="01:00"></label>
         <label>Timezone<input id="job-schedule-timezone" list="job-timezone-options" value="Europe/Berlin" autocomplete="off"></label>
       </div>
+      <fieldset id="chain-schedule-fields" hidden>
+        <legend>FULL / Incremental schedule</legend>
+        <label>Timezone<input id="job-chain-timezone" list="job-timezone-options" value="Europe/Berlin" autocomplete="off"></label>
+        <div class="inline-fields">
+          <label>FULL day<select id="job-full-weekday">
+            <option value="0">Monday</option><option value="1">Tuesday</option>
+            <option value="2">Wednesday</option><option value="3">Thursday</option>
+            <option value="4">Friday</option><option value="5">Saturday</option>
+            <option value="6" selected>Sunday</option>
+          </select></label>
+          <label>FULL time<input id="job-full-time" type="time" value="02:00"></label>
+        </div>
+        <label>Incrementals per day<select id="job-incremental-frequency">
+          <option value="1">Once per day</option>
+          <option value="2">Twice per day</option>
+        </select></label>
+        <div class="inline-fields">
+          <label>Incremental time 1<input id="job-incremental-time-1" type="time" value="02:00"></label>
+          <label id="job-incremental-time-2-label" hidden>Incremental time 2<input id="job-incremental-time-2" type="time" value="14:00"></label>
+        </div>
+        <p class="form-note">FULL wins if FULL and incremental are due at the same time. Missed weekly FULL also wins over missed incrementals.</p>
+      </fieldset>
       <datalist id="job-timezone-options">
         <option value="Europe/Berlin"></option>
         <option value="UTC"></option>
       </datalist>
       <p id="job-next-run" class="form-note" hidden></p>
+      <label>Max incrementals per chain<input id="job-max-incrementals" type="number" min="0" value="0" required></label>
+      <p class="form-note">0 = FULL only. A value greater than 0 makes scheduled/manual runs continue the current chain with incrementals until the limit is reached; the next run starts a new FULL chain.</p>
       <label id="job-retain-field" hidden>
         Incremental restore points to retain
         <input id="job-retain" type="number" min="0" value="7" required>
@@ -552,6 +587,32 @@
         <button id="receiver-close" type="button">Close</button>
       </div>
     </div>
+  </dialog>
+
+  <dialog id="received-restore-dialog" aria-labelledby="received-restore-title">
+    <form id="received-restore-form">
+      <h2 id="received-restore-title">Restore received backup</h2>
+      <p id="received-restore-source" class="table-note"></p>
+      <label>
+        Target VM name
+        <input id="received-restore-name" required autocomplete="off" placeholder="win10-restored">
+      </label>
+      <label>
+        Target folder
+        <input id="received-restore-root" required autocomplete="off" placeholder="/NVME_1/vms/win10-restored">
+        <small>The parent folder must already exist and be writable by vmbackupd. The target folder itself must not exist.</small>
+      </label>
+      <label class="checkbox-label">
+        <input id="received-restore-start" type="checkbox">
+        Start VM after restore
+      </label>
+      <p class="table-note">Network interfaces are restored disconnected. A new libvirt UUID is generated and the VM is registered locally after virsh define succeeds.</p>
+      <p id="received-restore-error" class="form-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button id="received-restore-cancel" type="button">Cancel</button>
+        <button id="received-restore-submit" type="submit">Restore</button>
+      </div>
+    </form>
   </dialog>
 
 </body>

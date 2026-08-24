@@ -29,9 +29,16 @@ function setNotice(message, kind) {
     let editingStorageId = null;
     let sshSetupDestination = null;
     let refreshCallback = async () => {};
+    let runPageCallback = async () => {};
     // Presentation-only state. A persisted SSH destination is valid before any
     // probe has run, so an absent entry is an ordinary "not tested" state.
     const sshStorageProbeResults = new Map();
+    const sshStorageProbeLastStarted = new Map();
+    const sshStorageProbeInflight = new Set();
+    const SSH_STORAGE_AUTO_PROBE_INTERVAL_MS = 30000;
+    const jobBackupState = new Map();
+    let mutationToggleBusy = false;
+    let selectedReceivedRestorePoint = null;
 
 
     function failureMessage(error) {
@@ -52,9 +59,11 @@ function setNotice(message, kind) {
 
 
     window.VmbackupViews = {
-        configure({ refresh: configuredRefresh }) {
+        configure({ refresh: configuredRefresh, changeRunPage }) {
             if (typeof configuredRefresh === "function")
                 refreshCallback = configuredRefresh;
+            if (typeof changeRunPage === "function")
+                runPageCallback = changeRunPage;
         },
         renderModel(model) {
             currentModel = model;
@@ -62,6 +71,8 @@ function setNotice(message, kind) {
 
             renderDiscoveredVms(model);
             renderStorage(model);
+            renderReceived(model);
+            renderJobs(model);
 
             try {
                 renderRecentRuns(model);
@@ -687,6 +698,46 @@ function setNotice(message, kind) {
 
 
 
+    const ACTIVE_STATES = new Set([
+        "PREPARING", "BACKING_UP", "VERIFYING", "FINALIZING", "TRANSFERRING"
+    ]);
+
+    function activeStatus(value, progress = null) {
+        const state = String(value || "UNKNOWN").toUpperCase();
+        if (!ACTIVE_STATES.has(state))
+            return badge(value, "status-neutral");
+
+        const processed = Number(progress && (progress.bytes_processed ?? progress.processed));
+        const total = Number(progress && (progress.bytes_total ?? progress.total));
+        const determinate = Number.isFinite(processed) && Number.isFinite(total) && total > 0;
+        const percent = determinate ? Math.max(0, Math.min(100, processed / total * 100)) : null;
+
+        const wrapper = document.createElement("span");
+        wrapper.className = "active-status";
+        wrapper.title = determinate
+            ? `${state}: ${bytes(processed)} of ${bytes(total)} (${percent.toFixed(1)}%)`
+            : `${state}: operation is active`;
+
+        const fill = document.createElement("span");
+        fill.className = `active-status-fill${determinate ? " determinate" : ""}`;
+        if (determinate)
+            fill.style.width = `${percent}%`;
+
+        const label = document.createElement("span");
+        label.className = "active-status-label";
+        label.textContent = determinate ? `${state} ${Math.round(percent)}%` : state;
+
+        wrapper.append(fill, label);
+        return wrapper;
+    }
+
+    function statusNode(value, className, progress = null) {
+        const state = String(value || "UNKNOWN").toUpperCase();
+        if (ACTIVE_STATES.has(state))
+            return activeStatus(state, progress);
+        return badge(value, className);
+    }
+
     function tableCell(value, className) {
         const cell = document.createElement("td");
         if (value instanceof Node)
@@ -758,6 +809,50 @@ function setNotice(message, kind) {
 
 
 
+    async function autoProbeStoredSSHDestination(destination) {
+        if (!destination || storageType(destination) !== "SSH" || !destination.id)
+            return;
+
+        const now = Date.now();
+        const lastStarted = sshStorageProbeLastStarted.get(destination.id) || 0;
+        if (sshStorageProbeInflight.has(destination.id) ||
+            now - lastStarted < SSH_STORAGE_AUTO_PROBE_INTERVAL_MS)
+            return;
+
+        sshStorageProbeLastStarted.set(destination.id, now);
+        sshStorageProbeInflight.add(destination.id);
+        try {
+            const result = await api.request(
+                "storage.test",
+                { id: destination.id },
+            );
+            sshStorageProbeResults.set(
+                destination.id,
+                { status: "success", result },
+            );
+        } catch (error) {
+            sshStorageProbeResults.set(
+                destination.id,
+                {
+                    status: "failed",
+                    error: failureMessage(error),
+                },
+            );
+        } finally {
+            sshStorageProbeInflight.delete(destination.id);
+            if (currentModel)
+                renderStorage(currentModel);
+        }
+    }
+
+    function scheduleStoredSSHStorageProbes(destinations) {
+        for (const destination of destinations || []) {
+            if (storageType(destination) === "SSH")
+                void autoProbeStoredSSHDestination(destination);
+        }
+    }
+
+
     function storageFreeText(destination) {
         if (storageType(destination) !== "SSH")
             return bytes(destination.free_bytes);
@@ -771,7 +866,7 @@ function setNotice(message, kind) {
         }
 
         if (probe.status === "failed")
-            return "Probe failed";
+            return "Connection error";
 
         const result = probe.result;
 
@@ -847,11 +942,15 @@ function setNotice(message, kind) {
         container.append(primary);
 
         if (storageType(destination) === "SSH") {
+            const probe = sshStorageProbeResults.get(destination.id);
+            const secondary = probe && probe.status === "failed" ?
+                "Connection error" :
+                (destination.remote_storage_id ?
+                    `Destination path: ${remote ? remote.path : "unknown until catalog refresh"}` :
+                    "Staging managed automatically");
             container.append(element(
                 "div",
-                destination.remote_storage_id ?
-                    `Destination path: ${remote ? remote.path : "unknown until catalog refresh"}` :
-                    "Staging managed automatically",
+                secondary,
                 "storage-secondary",
             ));
         }
@@ -861,6 +960,7 @@ function setNotice(message, kind) {
 
     function renderStorage(model) {
         currentModel = model;
+        scheduleStoredSSHStorageProbes(model.storage);
         const rows = model.storage.map(destination => {
             const type = storageType(destination);
             const isSSH = type === "SSH";
@@ -2299,18 +2399,671 @@ function setNotice(message, kind) {
         }
     }
 
-    function renderDiscoveredVms(model) {
-        console.log(
-            "RENDER DISCOVERED VMS",
-            model.discoveredVms,
-        );
-
-        const rows = model.discoveredVms.map(vm => tableRow([
-            vm.name, vm.external_id, [vm.uuid, "identifier-cell"], badge(vm.state, "status-neutral"),
-        ]));
-        replaceRows("vms", rows, 4, "No libvirt virtual machines discovered");
+    async function registerVM(vm) {
+        try {
+            setNotice(`Registering ${vm.name}…`, "loading");
+            await api.request("vm.register", {
+                external_id: vm.external_id,
+                name: vm.name,
+            });
+            await refresh();
+            setNotice(`Virtual machine ${vm.name} registered`, "success");
+        } catch (error) {
+            setNotice(failureMessage(error), "error");
+        }
     }
 
+    function renderDiscoveredVms(model) {
+        const registeredExternalIds = new Set(
+            model.registeredVms.map(vm => vm.external_id)
+        );
+        const rows = model.discoveredVms.map(vm => {
+            const registered = registeredExternalIds.has(vm.external_id);
+            return tableRow([
+                vm.name, vm.external_id, [vm.uuid, "identifier-cell"],
+                badge(
+                    vm.state,
+                    String(vm.state || "").toLowerCase() === "running" ?
+                        "status-success" : "status-neutral",
+                ),
+                registered ? badge("Registered", "status-success") :
+                    actionButton("Register", () => registerVM(vm), false),
+            ]);
+        });
+        replaceRows("vms", rows, 5, "No libvirt virtual machines discovered");
+    }
+
+    let editingJobId = null;
+
+    function populateJobSelect(select, values, selectedId, label) {
+        select.replaceChildren(...values.map(value => {
+            const option = document.createElement("option");
+            option.value = value.id;
+            option.textContent = label(value);
+            option.selected = value.id === selectedId;
+            return option;
+        }));
+        select.value = selectedId || (values[0] ? values[0].id : "");
+    }
+
+    function isJobDestination(destination) {
+        return destination.name !== "__vmbackupd_ssh_identity__";
+    }
+
+    function selectedJobReplicaIds() {
+        const result = [];
+        for (const label of document.getElementById("job-replicas").children) {
+            const checkbox = label.children[0];
+            if (checkbox && checkbox.checked && !checkbox.disabled)
+                result.push(checkbox.value);
+        }
+        return result;
+    }
+
+    function renderJobReplicaOptions(selectedIds = null) {
+        const primaryId = document.getElementById("job-storage").value;
+        const selected = new Set(selectedIds || selectedJobReplicaIds());
+        const candidates = currentModel.storage.filter(destination =>
+            isJobDestination(destination) && destination.id !== primaryId
+        );
+        document.getElementById("job-replicas").replaceChildren(
+            ...candidates.map(destination => {
+                const label = document.createElement("label");
+                label.className = "replica-option";
+                const checkbox = document.createElement("input");
+                checkbox.type = "checkbox";
+                checkbox.value = destination.id;
+                checkbox.checked = selected.has(destination.id);
+                const description = document.createElement("span");
+                const remote = destination.remote_storage_name ||
+                    destination.remote_storage_id;
+                description.textContent = storageType(destination) === "SSH" ?
+                    `${destination.name} (SSH${remote ? ` → ${remote}` : ""})` :
+                    `${destination.name} (Local)`;
+                label.append(checkbox, description);
+                return label;
+            })
+        );
+    }
+
+    function updateIncrementalFrequencyFields() {
+        const twice = document.getElementById("job-incremental-frequency").value === "2";
+        document.getElementById("job-incremental-time-2-label").hidden = !twice;
+        document.getElementById("job-incremental-time-2").disabled = !twice;
+    }
+
+    function updateScheduleFields() {
+        const mode = document.getElementById("job-schedule").value;
+        const intervalFields = document.getElementById("interval-fields");
+        const dailyFields = document.getElementById("daily-fields");
+        const chainFields = document.getElementById("chain-schedule-fields");
+        const intervalEnabled = mode === "interval";
+        const dailyEnabled = mode === "daily";
+        const chainEnabled = mode === "chain";
+        intervalFields.hidden = !intervalEnabled;
+        dailyFields.hidden = !dailyEnabled;
+        chainFields.hidden = !chainEnabled;
+        document.getElementById("job-interval").disabled = !intervalEnabled;
+        document.getElementById("job-interval-unit").disabled = !intervalEnabled;
+        document.getElementById("job-daily-time").disabled = !dailyEnabled;
+        document.getElementById("job-schedule-timezone").disabled = !dailyEnabled;
+        for (const id of ["job-chain-timezone", "job-full-weekday", "job-full-time",
+                          "job-incremental-frequency", "job-incremental-time-1"])
+            document.getElementById(id).disabled = !chainEnabled;
+        updateIncrementalFrequencyFields();
+        if (!chainEnabled)
+            document.getElementById("job-incremental-time-2").disabled = true;
+    }
+
+    function openJobDialog(job = null) {
+        editingJobId = job ? job.id : null;
+        document.getElementById("job-dialog-title").textContent =
+            job ? "Edit backup job" : "Add backup job";
+        populateJobSelect(
+            document.getElementById("job-vm"), currentModel.registeredVms,
+            job ? job.vm_id : null, vm => vm.name,
+        );
+        populateJobSelect(
+            document.getElementById("job-storage"),
+            currentModel.storage.filter(isJobDestination),
+            job ? job.storage_destination_id : null,
+            destination => `${destination.name} (${storageType(destination)})`,
+        );
+        renderJobReplicaOptions(job ? job.replica_destination_ids : []);
+        document.getElementById("job-vm").disabled = Boolean(job);
+        document.getElementById("job-name").value = job ? job.name : "";
+        document.getElementById("job-enabled").checked = job ? job.enabled : true;
+        const scheduleMode = job && job.chain_schedule ? "chain" :
+            (!job || !job.next_run_at ? "manual" :
+                (job.schedule_type === "DAILY" ? "daily" : "interval"));
+        document.getElementById("job-schedule").value = scheduleMode;
+        const intervalSeconds = Number(job && job.interval_seconds || 3600);
+        let intervalUnit = 1;
+        if (intervalSeconds % 86400 === 0) intervalUnit = 86400;
+        else if (intervalSeconds % 3600 === 0) intervalUnit = 3600;
+        else if (intervalSeconds % 60 === 0) intervalUnit = 60;
+        document.getElementById("job-interval-unit").value = String(intervalUnit);
+        document.getElementById("job-interval").value =
+            String(intervalSeconds / intervalUnit);
+        document.getElementById("job-daily-time").value =
+            job && job.daily_time ? job.daily_time : "01:00";
+        document.getElementById("job-schedule-timezone").value =
+            job && job.schedule_timezone ? job.schedule_timezone :
+                (Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
+        const chain = job && job.chain_schedule || null;
+        document.getElementById("job-chain-timezone").value =
+            chain && chain.timezone ? chain.timezone :
+                (Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
+        document.getElementById("job-full-weekday").value =
+            String(chain && Number.isInteger(chain.full_weekday) ? chain.full_weekday : 6);
+        document.getElementById("job-full-time").value =
+            chain && chain.full_time ? chain.full_time : "02:00";
+        const incrementalTimes = chain && Array.isArray(chain.incremental_times) ?
+            chain.incremental_times : ["02:00"];
+        document.getElementById("job-incremental-frequency").value =
+            incrementalTimes.length > 1 ? "2" : "1";
+        document.getElementById("job-incremental-time-1").value = incrementalTimes[0] || "02:00";
+        document.getElementById("job-incremental-time-2").value = incrementalTimes[1] || "14:00";
+        updateScheduleFields();
+        document.getElementById("job-max-incrementals").value =
+            job ? job.max_incrementals_per_chain : 0;
+        document.getElementById("job-retain").value =
+            job ? job.restore_points_to_retain : 7;
+        document.getElementById("job-full-chains").value =
+            job ? job.full_chains_to_retain : 2;
+        document.getElementById("job-minimum-chains").value =
+            job ? job.minimum_full_chains : 1;
+        document.getElementById("job-reclaim-mode").value =
+            job ? job.space_reclaim_mode : "SAFE";
+        document.getElementById("job-form-error").textContent = "";
+        document.getElementById("job-dialog").showModal();
+    }
+
+    async function saveJob(event) {
+        event.preventDefault();
+        const errorNode = document.getElementById("job-form-error");
+        errorNode.textContent = "";
+        const scheduleMode = document.getElementById("job-schedule").value;
+        const params = {
+            name: document.getElementById("job-name").value.trim(),
+            storage_destination_id: document.getElementById("job-storage").value,
+            enabled: document.getElementById("job-enabled").checked,
+            schedule_enabled: scheduleMode !== "manual" && scheduleMode !== "chain",
+            chain_schedule_enabled: scheduleMode === "chain",
+            max_incrementals_per_chain: Number(document.getElementById("job-max-incrementals").value),
+            restore_points_to_retain: Number(document.getElementById("job-retain").value),
+            full_chains_to_retain: Number(document.getElementById("job-full-chains").value),
+            minimum_full_chains: Number(document.getElementById("job-minimum-chains").value),
+            space_reclaim_mode: document.getElementById("job-reclaim-mode").value,
+            replica_destination_ids: selectedJobReplicaIds(),
+        };
+        if (scheduleMode === "interval") {
+            params.schedule_type = "INTERVAL";
+            params.interval_seconds =
+                Number(document.getElementById("job-interval").value) *
+                Number(document.getElementById("job-interval-unit").value);
+            params.daily_time = null;
+            params.schedule_timezone = null;
+        } else if (scheduleMode === "daily") {
+            params.schedule_type = "DAILY";
+            params.daily_time = document.getElementById("job-daily-time").value;
+            params.schedule_timezone =
+                document.getElementById("job-schedule-timezone").value.trim();
+        } else if (scheduleMode === "chain") {
+            params.chain_schedule_timezone =
+                document.getElementById("job-chain-timezone").value.trim();
+            params.full_weekday = Number(document.getElementById("job-full-weekday").value);
+            params.full_time = document.getElementById("job-full-time").value;
+            params.incremental_times = [
+                document.getElementById("job-incremental-time-1").value,
+            ];
+            if (document.getElementById("job-incremental-frequency").value === "2")
+                params.incremental_times.push(
+                    document.getElementById("job-incremental-time-2").value
+                );
+        }
+        try {
+            if (editingJobId)
+                await api.request("job.update", { id: editingJobId, ...params });
+            else
+                await api.request("job.create", {
+                    vm_id: document.getElementById("job-vm").value,
+                    ...params,
+                });
+            document.getElementById("job-dialog").close();
+            await refresh();
+            setNotice("Backup job saved", "success");
+        } catch (error) {
+            errorNode.textContent = failureMessage(error);
+        }
+    }
+
+    async function updateJob(id, params) {
+        try {
+            await api.request("job.update", { id, ...params });
+            await refresh();
+        } catch (error) {
+            setNotice(failureMessage(error), "error");
+        }
+    }
+
+    async function runNow(job, kind = "AUTO") {
+        try {
+            setNotice(`Requesting backup for ${job.name}…`, "loading");
+            const result = await api.request("backup.run", { job_id: job.id, kind });
+            await refresh();
+            setNotice(`Run ${result.run_id}: ${result.state}`, "success");
+        } catch (error) {
+            setNotice(failureMessage(error), "error");
+        }
+    }
+
+    function jobBackupStateFor(jobId) {
+        if (!jobBackupState.has(jobId)) {
+            jobBackupState.set(jobId, {
+                expanded: false,
+                loading: false,
+                error: null,
+                items: null,
+            });
+        }
+        return jobBackupState.get(jobId);
+    }
+
+    async function loadJobBackups(job) {
+        const state = jobBackupStateFor(job.id);
+        state.loading = true;
+        state.error = null;
+        if (currentModel)
+            renderJobs(currentModel);
+        try {
+            state.items = await api.request(
+                "restore_point.list",
+                { job_id: job.id, details: true },
+            );
+        } catch (error) {
+            state.error = failureMessage(error);
+            state.items = [];
+        } finally {
+            state.loading = false;
+            if (currentModel)
+                renderJobs(currentModel);
+        }
+    }
+
+    async function toggleJobBackups(job) {
+        const state = jobBackupStateFor(job.id);
+        state.expanded = !state.expanded;
+        if (currentModel)
+            renderJobs(currentModel);
+        if (state.expanded && state.items === null && !state.loading)
+            await loadJobBackups(job);
+    }
+
+    async function retryReplicaChain(job, point, replica) {
+        try {
+            setNotice(`Retrying replica chain for ${job.name}…`, "loading");
+            const result = await api.request("replica.retry", {
+                restore_point_id: point.id,
+                destination_id: replica.destination_id,
+            });
+            const state = jobBackupStateFor(job.id);
+            state.items = null;
+            await loadJobBackups(job);
+            await refresh();
+            const count = Array.isArray(result.reset_restore_point_ids)
+                ? result.reset_restore_point_ids.length : 0;
+            setNotice(`Replica retry queued for ${count} restore point${count === 1 ? "" : "s"}.`, "success");
+        } catch (error) {
+            setNotice(failureMessage(error), "error");
+        }
+    }
+
+    async function deleteJobBackup(job, point) {
+        const path = point.bundle_object_id || "unknown";
+        if (!window.confirm(
+            `Delete backup permanently?\n\n` +
+            `Job: ${job.name}\n` +
+            `Created: ${localTimestamp(point.created_at)}\n` +
+            `Storage: ${point.storage_name || point.storage_destination_id}\n` +
+            `Path: ${path}\n\n` +
+            "Backup files will be removed permanently. Run history will be preserved."
+        ))
+            return;
+
+        try {
+            await api.request(
+                "restore_point.delete",
+                { id: point.id, job_id: job.id },
+            );
+            const state = jobBackupStateFor(job.id);
+            state.items = null;
+            await loadJobBackups(job);
+            await refresh();
+            setNotice("Backup deleted. Run history was preserved.", "success");
+        } catch (error) {
+            setNotice(failureMessage(error), "error");
+        }
+    }
+
+    function renderJobBackupsRow(job) {
+        const state = jobBackupStateFor(job.id);
+        const row = document.createElement("tr");
+        row.className = "job-backups-row";
+        const cell = document.createElement("td");
+        cell.colSpan = 9;
+
+        if (state.loading) {
+            cell.textContent = "Loading backups…";
+            row.append(cell);
+            return row;
+        }
+        if (state.error) {
+            cell.textContent = state.error;
+            row.append(cell);
+            return row;
+        }
+        if (!state.items || state.items.length === 0) {
+            cell.textContent = "No available backups for this job.";
+            row.append(cell);
+            return row;
+        }
+
+        const table = document.createElement("table");
+        table.className = "operational-table job-backups-table";
+        const head = document.createElement("thead");
+        const headRow = document.createElement("tr");
+        for (const label of ["Created", "Type / inheritance", "Storage", "Path", "Size", "Status", "Replicas", "Actions"])
+            headRow.append(tableCell(label));
+        head.append(headRow);
+        table.append(head);
+
+        const byId = new Map(state.items.map(point => [point.id, point]));
+
+        // Parent links are the dependency authority.  Older compact V2
+        // incrementals may carry a wrong chain_id from the early migration,
+        // while still pointing at the correct FULL parent.  Group those with
+        // the proven FULL chain instead of showing a false orphan.  If the
+        // parent is genuinely absent, keep the original chain_id and show the
+        // missing-base warning below.
+        function effectiveChainId(point) {
+            let current = point;
+            const seen = new Set();
+            while (current && !seen.has(current.id)) {
+                seen.add(current.id);
+                if (String(current.kind || "").toUpperCase() === "FULL")
+                    return current.chain_id || current.id;
+                if (!current.parent_restore_point_id)
+                    break;
+                current = byId.get(current.parent_restore_point_id) || null;
+            }
+            return point.chain_id || point.id;
+        }
+
+        const chains = new Map();
+        for (const point of state.items) {
+            const chainId = effectiveChainId(point);
+            if (!chains.has(chainId))
+                chains.set(chainId, []);
+            chains.get(chainId).push(point);
+        }
+        const chainGroups = Array.from(chains.entries()).map(([chainId, points]) => {
+            const base = points.find(point =>
+                String(point.kind || "").toUpperCase() === "FULL"
+            ) || null;
+            points.sort((a, b) => {
+                const aFull = String(a.kind || "").toUpperCase() === "FULL";
+                const bFull = String(b.kind || "").toUpperCase() === "FULL";
+                if (aFull !== bFull) return aFull ? -1 : 1;
+                const aSeq = Number.isFinite(Number(a.sequence)) && a.sequence !== null ? Number(a.sequence) : null;
+                const bSeq = Number.isFinite(Number(b.sequence)) && b.sequence !== null ? Number(b.sequence) : null;
+                if (aSeq !== null && bSeq !== null && aSeq !== bSeq) return aSeq - bSeq;
+                return String(a.created_at || "").localeCompare(String(b.created_at || ""));
+            });
+            const anchor = base || points[0];
+            return { chainId, points, base, anchor };
+        });
+        chainGroups.sort((a, b) =>
+            String(b.anchor?.created_at || "").localeCompare(String(a.anchor?.created_at || ""))
+        );
+
+        const body = document.createElement("tbody");
+        for (const group of chainGroups) {
+            const chainHeader = document.createElement("tr");
+            chainHeader.className = "backup-chain-header";
+            const chainCell = document.createElement("td");
+            chainCell.colSpan = 8;
+            const shortChain = String(group.chainId || "").slice(0, 8);
+            const incrementals = group.points.filter(point =>
+                String(point.kind || "").toUpperCase() === "INCREMENTAL"
+            ).length;
+            const baseLabel = group.base
+                ? `FULL ${localTimestamp(group.base.created_at)}`
+                : "base FULL missing";
+            chainCell.textContent = `Chain ${shortChain} · ${baseLabel} · ${incrementals} incremental${incrementals === 1 ? "" : "s"}`;
+            chainHeader.append(chainCell);
+            body.append(chainHeader);
+
+            for (const point of group.points) {
+                const actions = document.createElement("div");
+                actions.className = "row-actions";
+                actions.append(actionButton(
+                    "Delete",
+                    () => deleteJobBackup(job, point),
+                    false,
+                ));
+                const replicaNode = document.createElement("div");
+                replicaNode.className = "replica-status-list";
+                const replicas = Array.isArray(point.replicas) ? point.replicas : [];
+                if (!replicas.length) {
+                    replicaNode.textContent = "—";
+                } else {
+                    for (const replica of replicas) {
+                        const line = document.createElement("div");
+                        const state = replica.state || "PENDING";
+                        line.append(
+                            document.createTextNode(`${replica.destination_name || replica.destination_id}: `),
+                            statusNode(
+                                state,
+                                state === "SUCCESS" ? "status-success" :
+                                state === "FAILED" ? "status-error" : "status-neutral",
+                                {
+                                    bytes_processed: replica.bytes_processed,
+                                    bytes_total: replica.bytes_total,
+                                },
+                            ),
+                        );
+                        if (replica.last_error) {
+                            const error = document.createElement("div");
+                            error.className = "replica-status-error";
+                            error.textContent = replica.last_error;
+                            line.append(error);
+                        }
+                        if (state === "FAILED" || state === "BLOCKED") {
+                            const retry = actionButton(
+                                "Retry chain",
+                                () => retryReplicaChain(job, point, replica),
+                                false,
+                            );
+                            retry.classList.add("replica-retry-action");
+                            line.append(retry);
+                        }
+                        replicaNode.append(line);
+                    }
+                }
+
+                const kind = String(point.kind || "").toUpperCase();
+                let relation;
+                if (kind === "FULL") {
+                    relation = "FULL — Base of chain";
+                } else if (kind === "INCREMENTAL") {
+                    const orderedIncrementals = group.points.filter(item =>
+                        String(item.kind || "").toUpperCase() === "INCREMENTAL"
+                    );
+                    const inferredSequence = orderedIncrementals.indexOf(point) + 1;
+                    const seq = point.sequence !== null && point.sequence !== undefined
+                        ? Number(point.sequence) : inferredSequence;
+                    const parent = point.parent_restore_point_id ? byId.get(point.parent_restore_point_id) : null;
+                    let parentLabel;
+                    if (parent) {
+                        if (String(parent.kind || "").toUpperCase() === "FULL") {
+                            parentLabel = "FULL";
+                        } else {
+                            const parentSequence = parent.sequence !== null && parent.sequence !== undefined
+                                ? Number(parent.sequence)
+                                : Math.max(1, inferredSequence - 1);
+                            parentLabel = `INC #${parentSequence}`;
+                        }
+                    } else if (point.parent_restore_point_id) {
+                        parentLabel = `missing parent ${String(point.parent_restore_point_id).slice(0, 8)}`;
+                    } else if (!group.base) {
+                        parentLabel = "missing FULL base";
+                    } else {
+                        parentLabel = "parent unknown";
+                    }
+                    relation = `↳ INC #${seq} ← ${parentLabel}`;
+                } else {
+                    relation = `${kind || "UNKNOWN"} — inheritance unknown`;
+                }
+
+                body.append(tableRow([
+                    localTimestamp(point.created_at),
+                    relation,
+                    point.storage_name || point.storage_destination_id || "—",
+                    point.bundle_object_id || "—",
+                    bytes(point.size_bytes),
+                    badge(point.status || "—", point.status === "AVAILABLE" ? "status-success" : "status-neutral"),
+                    replicaNode,
+                    actions,
+                ]));
+            }
+        }
+        table.append(body);
+        cell.append(table);
+        row.append(cell);
+        return row;
+    }
+
+    function latestRestoreForPoint(model, pointId) {
+        const values = Array.isArray(model.restores) ? model.restores : [];
+        return values.filter(item => item.restore_point_id === pointId)
+            .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")))[0] || null;
+    }
+
+    function openReceivedRestore(point) {
+        if (typeof api.adminAllowed === "function" && !api.adminAllowed()) {
+            setNotice("Cockpit Administrative access is required to restore a VM.", "error");
+            return;
+        }
+        if (!currentModel || !currentModel.status || !currentModel.status.libvirt_mutation_enabled) {
+            setNotice("Enable Mutation before restoring a VM.", "error");
+            return;
+        }
+        selectedReceivedRestorePoint = point;
+        document.getElementById("received-restore-source").textContent =
+            `${point.vm_name || "received-vm"} · ${point.kind || "—"} · ${point.storage_name || point.storage_destination_id}`;
+        document.getElementById("received-restore-name").value = `${point.vm_name || "received-vm"}-restored`;
+        document.getElementById("received-restore-root").value = "";
+        document.getElementById("received-restore-start").checked = false;
+        document.getElementById("received-restore-error").textContent = "";
+        document.getElementById("received-restore-dialog").showModal();
+    }
+
+    async function submitReceivedRestore(event) {
+        event.preventDefault();
+        if (!selectedReceivedRestorePoint)
+            return;
+        const error = document.getElementById("received-restore-error");
+        const button = document.getElementById("received-restore-submit");
+        button.disabled = true;
+        error.textContent = "";
+        try {
+            await api.request("received.restore.create", {
+                restore_point_id: selectedReceivedRestorePoint.id,
+                target_vm_name: document.getElementById("received-restore-name").value.trim(),
+                target_root: document.getElementById("received-restore-root").value.trim(),
+                start_after_restore: document.getElementById("received-restore-start").checked,
+            });
+            document.getElementById("received-restore-dialog").close();
+            setNotice("Restore queued. The received FULL/INC chain will be materialized locally.", "success");
+            await refresh();
+        } catch (exc) {
+            error.textContent = failureMessage(exc);
+        } finally {
+            button.disabled = false;
+        }
+    }
+
+    function renderReceived(model) {
+        const values = Array.isArray(model.received) ? model.received : [];
+        const rows = values.map(point => {
+            const operation = latestRestoreForPoint(model, point.id);
+            const actions = document.createElement("div");
+            actions.className = "row-actions";
+            const canRestore = point.status === "AVAILABLE";
+            actions.append(actionButton("Restore", () => openReceivedRestore(point), !canRestore));
+            if (operation) {
+                actions.append(badge(
+                    operation.state || "—",
+                    operation.state === "SUCCESS" ? "status-success" :
+                        operation.state === "FAILED" || operation.state === "RECOVERY_REQUIRED" ? "status-error" : "status-warning"
+                ));
+            }
+            return tableRow([
+                point.vm_name || "received-vm",
+                localTimestamp(point.created_at),
+                point.kind || "—",
+                point.storage_name || point.storage_destination_id,
+                badge(point.status || "UNKNOWN", point.status === "AVAILABLE" ? "status-success" : "status-neutral"),
+                (point.origin && point.origin.received_via) || "SSH_REPLICA",
+                point.bundle_object_id || "—",
+                actions,
+            ]);
+        });
+        replaceRows("received-backups", rows, 8, "No received backups discovered");
+    }
+
+    function renderJobs(model) {
+        const rows = [];
+        for (const job of model.jobs) {
+            const vm = model.vmById.get(job.vm_id);
+            const destination = model.storage.find(item =>
+                item.id === job.storage_destination_id
+            );
+            const lastRun = model.runs.find(run => run.job_id === job.id);
+            const backupState = jobBackupStateFor(job.id);
+            const actions = document.createElement("div");
+            actions.className = "row-actions";
+            actions.append(
+                actionButton("Edit", () => openJobDialog(job), false),
+                actionButton(job.enabled ? "Disable" : "Enable",
+                    () => updateJob(job.id, { enabled: !job.enabled }), false),
+                actionButton("Run next", () => runNow(job, "AUTO"), !job.enabled),
+                actionButton("Run FULL", () => runNow(job, "FULL"), !job.enabled),
+                ...(Number(job.max_incrementals_per_chain || 0) > 0 ? [
+                    actionButton("Run INC", () => runNow(job, "INCREMENTAL"), !job.enabled),
+                ] : []),
+                actionButton(
+                    backupState.expanded ? "Hide backups" : "Show backups",
+                    () => toggleJobBackups(job),
+                    false,
+                ),
+            );
+            rows.push(tableRow([
+                vm ? vm.name : job.vm_id, job.name,
+                badge(job.enabled ? "Enabled" : "Disabled",
+                    job.enabled ? "status-success" : "status-neutral"),
+                destination ? destination.name : job.storage_destination_id,
+                lastRun ? localTimestamp(lastRun.created_at) : "Never",
+                lastRun ? statusNode(statusLabel(lastRun), statusClass(lastRun), lastRun.progress) : "—",
+                "—", job.next_run_at ? localTimestamp(job.next_run_at) : "Manual",
+                actions,
+            ]));
+            if (backupState.expanded)
+                rows.push(renderJobBackupsRow(job));
+        }
+        replaceRows("jobs", rows, 9, "No backup jobs configured");
+    }
 
 
 
@@ -2352,6 +3105,51 @@ function setNotice(message, kind) {
 
 
 
+    function renderMutationControl(model) {
+        const enabled = Boolean(model && model.status && model.status.libvirt_mutation_enabled);
+        const mutation = document.getElementById("mutation-state");
+        mutation.textContent = enabled ? "Mutation enabled" : "Mutation disabled";
+        mutation.className = `badge ${enabled ? "status-warning" : "status-neutral"}`;
+
+        const button = document.getElementById("mutation-toggle");
+        if (!button)
+            return;
+        const administrative = typeof api.adminAllowed === "function" && api.adminAllowed();
+        button.textContent = mutationToggleBusy ? "Applying…" : (enabled ? "Disable" : "Enable");
+        button.disabled = mutationToggleBusy || !administrative;
+        button.title = administrative ?
+            (enabled ? "Disable libvirt mutation and restart vmbackupd" : "Enable libvirt mutation and restart vmbackupd") :
+            "Cockpit Administrative access is required";
+    }
+
+
+    async function toggleMutation() {
+        if (!currentModel || mutationToggleBusy)
+            return;
+        if (typeof api.adminAllowed !== "function" || !api.adminAllowed()) {
+            setNotice("Administrative access is required to change Mutation.", "error");
+            renderMutationControl(currentModel);
+            return;
+        }
+        const enabled = !Boolean(currentModel.status && currentModel.status.libvirt_mutation_enabled);
+        mutationToggleBusy = true;
+        renderMutationControl(currentModel);
+        setNotice(`${enabled ? "Enabling" : "Disabling"} Mutation and restarting vmbackupd…`, "loading");
+        try {
+            await api.setMutation(enabled);
+            await new Promise(resolve => window.setTimeout(resolve, 300));
+            await refresh();
+            setNotice(`Mutation ${enabled ? "enabled" : "disabled"}.`, "success");
+        } catch (error) {
+            setNotice(failureMessage(error), "error");
+        } finally {
+            mutationToggleBusy = false;
+            if (currentModel)
+                renderMutationControl(currentModel);
+        }
+    }
+
+
     function renderSummary(model) {
         document.getElementById("successful-today").textContent = String(model.successfulToday);
         document.getElementById("failed-today").textContent = String(model.failedToday);
@@ -2361,9 +3159,7 @@ function setNotice(message, kind) {
         const daemonHealth = document.getElementById("daemon-health");
         daemonHealth.textContent = healthy ? "RUNNING" : text(model.status.runtime_state);
         daemonHealth.className = `badge ${healthy ? "status-success" : "status-failed"}`;
-        const mutation = document.getElementById("mutation-state");
-        mutation.textContent = model.status.libvirt_mutation_enabled ? "Mutation enabled" : "Mutation disabled";
-        mutation.className = `badge ${model.status.libvirt_mutation_enabled ? "status-warning" : "status-neutral"}`;
+        renderMutationControl(model);
     }
 
 
@@ -2405,10 +3201,41 @@ function setNotice(message, kind) {
     }
 
 
-    function runError(run) {
-        return run.error ||
-               run.failure_reason ||
-               "—";
+    function formatBytes(value) {
+        const bytes = Number(value);
+        if (!Number.isFinite(bytes) || bytes < 0)
+            return "unknown";
+        const gib = bytes / (1024 ** 3);
+        return `${gib.toFixed(gib >= 10 ? 1 : 2)} GiB`;
+    }
+
+
+    function runError(run, model) {
+        const raw = run.error || run.failure_reason || "";
+        const match = raw.match(
+            /INSUFFICIENT_STORAGE_CAPACITY:\s*free=(\d+),\s*required=(\d+),\s*reserve=(\d+)/
+        );
+        if (!match)
+            return raw || "—";
+
+        const free = Number(match[1]);
+        const required = Number(match[2]);
+        const reserve = Number(match[3]);
+        const totalRequired = required + reserve;
+        const missing = Math.max(0, totalRequired - free);
+        const destination = (model.storage || []).find(
+            item => item.id === run.storage_destination_id
+        );
+        const name = destination ? destination.name : run.storage_destination_id;
+        return [
+            "Insufficient storage capacity",
+            `Free: ${formatBytes(free)}`,
+            `Estimated backup: ${formatBytes(required)}`,
+            `Required reserve: ${formatBytes(reserve)}`,
+            `Required total: ${formatBytes(totalRequired)}`,
+            `Missing: ${formatBytes(missing)}`,
+            `Destination: ${name || "unknown"}`,
+        ].join("\n");
     }
 
 
@@ -2439,9 +3266,9 @@ function setNotice(message, kind) {
                     `Unknown job (${text(run.job_id)})`,
                 [run.planned_kind || "—", "nowrap"],
                 [localTimestamp(run.created_at), "nowrap"],
-                badge(statusLabel(run), statusClass(run)),
+                statusNode(statusLabel(run), statusClass(run), run.progress),
                 [runDuration(run, model.now), "nowrap"],
-                [runError(run), "error-cell"],
+                [runError(run, model), "error-cell"],
             ]);
         });
 
@@ -2480,8 +3307,56 @@ function setNotice(message, kind) {
     }
 
 
+
+    document.getElementById("recent-run-prev").addEventListener(
+        "click", () => {
+            const page = currentModel && currentModel.runPage || {};
+            const limit = Number(page.limit || RECENT_RUN_LIMIT);
+            const offset = Number(page.offset || 0);
+            void runPageCallback({
+                offset: Math.max(0, offset - limit),
+                result: recentRunFilter,
+            });
+        }
+    );
+    document.getElementById("recent-run-next").addEventListener(
+        "click", () => {
+            const page = currentModel && currentModel.runPage || {};
+            const limit = Number(page.limit || RECENT_RUN_LIMIT);
+            const offset = Number(page.offset || 0);
+            const total = Number(page.total || 0);
+            if (offset + limit < total)
+                void runPageCallback({
+                    offset: offset + limit,
+                    result: recentRunFilter,
+                });
+        }
+    );
+    document.getElementById("recent-run-filter").addEventListener(
+        "change", event => {
+            recentRunFilter = event.target.value || "ALL";
+            void runPageCallback({ offset: 0, result: recentRunFilter });
+        }
+    );
+
     document.getElementById("add-storage").addEventListener(
         "click", () => openStorageDialog()
+    );
+    document.getElementById("add-job").addEventListener(
+        "click", () => openJobDialog()
+    );
+    document.getElementById("job-cancel").addEventListener(
+        "click", () => document.getElementById("job-dialog").close()
+    );
+    document.getElementById("job-form").addEventListener("submit", saveJob);
+    document.getElementById("job-schedule").addEventListener(
+        "change", updateScheduleFields
+    );
+    document.getElementById("job-incremental-frequency").addEventListener(
+        "change", updateIncrementalFrequencyFields
+    );
+    document.getElementById("job-storage").addEventListener(
+        "change", () => renderJobReplicaOptions()
     );
     document.getElementById("storage-cancel").addEventListener(
         "click", () => storageDialog.close()
@@ -2549,5 +3424,29 @@ function setNotice(message, kind) {
         openReceiverSetup,
         refreshReceiverSetup,
         fetchStorageSSHHostKey,
+        openJobDialog,
+        renderJobs,
+        registerVM,
+        runNow,
+        openReceivedRestore,
     });
+
+
+    const receivedRestoreForm = document.getElementById("received-restore-form");
+    if (receivedRestoreForm)
+        receivedRestoreForm.addEventListener("submit", submitReceivedRestore);
+    const receivedRestoreCancel = document.getElementById("received-restore-cancel");
+    if (receivedRestoreCancel)
+        receivedRestoreCancel.addEventListener("click", () => document.getElementById("received-restore-dialog").close());
+
+    const mutationToggle = document.getElementById("mutation-toggle");
+    if (mutationToggle)
+        mutationToggle.addEventListener("click", () => { void toggleMutation(); });
+    if (typeof api.onAdminChanged === "function") {
+        api.onAdminChanged(() => {
+            if (currentModel)
+                renderMutationControl(currentModel);
+        });
+    }
+
 })();
