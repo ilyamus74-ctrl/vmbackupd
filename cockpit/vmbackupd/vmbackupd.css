@@ -437,3 +437,10 @@ summary { cursor: pointer; font-size: 1.1rem; font-weight: 700; }
 @media (prefers-reduced-motion: reduce) {
     .active-status-fill { animation: none; }
 }
+
+.replica-transfer-detail {
+    margin-top: 0.2rem;
+    color: var(--pf-v6-global--Color--200, #6a6e73);
+    font-size: 0.85em;
+    line-height: 1.25;
+}

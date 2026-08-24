@@ -1678,11 +1678,14 @@ class SSHReplicaTransferClient:
         *,
         stop_event=None,
         progress_callback=None,
+        plan_callback=None,
     ) -> dict:
         self._check_cancel(
             stop_event
         )
         plan = self._seeded_full_plan(plan, destination)
+        if plan_callback is not None:
+            plan_callback(plan)
         argv = self._ssh_argv(
             destination
         )

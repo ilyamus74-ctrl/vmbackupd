@@ -96,6 +96,15 @@ function setNotice(message, kind) {
                     model.status.runtime_state || "unknown";
             }
         },
+        async refreshExpandedBackups() {
+            if (!currentModel || !Array.isArray(currentModel.jobs))
+                return;
+            const expanded = currentModel.jobs.filter(job => {
+                const state = jobBackupStateFor(job.id);
+                return state.expanded && !state.loading;
+            });
+            await Promise.all(expanded.map(job => loadJobBackups(job, { silent: true })));
+        },
     };
 
 
@@ -2670,11 +2679,11 @@ function setNotice(message, kind) {
         return jobBackupState.get(jobId);
     }
 
-    async function loadJobBackups(job) {
+    async function loadJobBackups(job, { silent = false } = {}) {
         const state = jobBackupStateFor(job.id);
         state.loading = true;
         state.error = null;
-        if (currentModel)
+        if (!silent && currentModel)
             renderJobs(currentModel);
         try {
             state.items = await api.request(
@@ -2683,7 +2692,8 @@ function setNotice(message, kind) {
             );
         } catch (error) {
             state.error = failureMessage(error);
-            state.items = [];
+            if (state.items === null)
+                state.items = [];
         } finally {
             state.loading = false;
             if (currentModel)
@@ -2878,6 +2888,19 @@ function setNotice(message, kind) {
                             error.className = "replica-status-error";
                             error.textContent = replica.last_error;
                             line.append(error);
+                        }
+                        if (replica.transport_mode === "SEEDED_FULL") {
+                            const sourceBytes = Number(replica.source_payload_bytes);
+                            const transferBytes = Number(replica.bytes_total);
+                            const detail = document.createElement("div");
+                            detail.className = "replica-transfer-detail";
+                            if (Number.isFinite(sourceBytes) && Number.isFinite(transferBytes)) {
+                                const saved = Math.max(0, sourceBytes - transferBytes);
+                                detail.textContent = `Seeded FULL · transfer ${bytes(transferBytes)} / source ${bytes(sourceBytes)} · saved ${bytes(saved)}`;
+                            } else {
+                                detail.textContent = "Seeded FULL";
+                            }
+                            line.append(detail);
                         }
                         if (state === "FAILED" || state === "BLOCKED") {
                             const retry = actionButton(

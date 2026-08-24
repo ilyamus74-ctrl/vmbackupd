@@ -1660,6 +1660,9 @@ class RepositoryV2:
                 "verified_at": value.get("verified_at"),
                 "bytes_processed": value.get("bytes_processed"),
                 "bytes_total": value.get("bytes_total"),
+                "transport_mode": value.get("transport_mode"),
+                "seed_restore_point_id": value.get("seed_restore_point_id"),
+                "source_payload_bytes": value.get("source_payload_bytes"),
             })
         return result
 
@@ -1881,6 +1884,38 @@ class RepositoryV2:
             value["remote_bundle_object_id"] = remote_bundle_object_id
         if verified_at is not None:
             value["verified_at"] = verified_at.isoformat() if hasattr(verified_at, "isoformat") else str(verified_at)
+        replicas[destination_id] = value
+        metadata["replicas"] = replicas
+        self.connection.execute(
+            "UPDATE restore_points SET metadata_json=? WHERE id=?",
+            (json.dumps(metadata), restore_point_id),
+        )
+        self.connection.commit()
+        return {"restore_point_id": restore_point_id, "destination_id": destination_id, **value}
+
+    def update_replica_transfer_plan_v2(self, restore_point_id, destination_id, *,
+                                        transport_mode, source_payload_bytes,
+                                        bytes_total, seed_restore_point_id=None,
+                                        updated_at):
+        """Persist the selected transport plan after seed negotiation."""
+        stamp = updated_at.isoformat() if hasattr(updated_at, "isoformat") else str(updated_at)
+        row = self.connection.execute(
+            "SELECT metadata_json FROM restore_points WHERE id=?", (restore_point_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(restore_point_id)
+        metadata = self._json_object(row[0], "RESTORE_POINT_METADATA_INVALID")
+        replicas = metadata.get("replicas", {})
+        value = replicas.get(destination_id) if isinstance(replicas, dict) else None
+        if not isinstance(value, dict):
+            raise DomainInvariantError("REPLICA_STATUS_NOT_FOUND")
+        value = dict(value)
+        value["transport_mode"] = str(transport_mode)
+        value["source_payload_bytes"] = max(0, int(source_payload_bytes))
+        value["bytes_processed"] = 0
+        value["bytes_total"] = max(0, int(bytes_total))
+        value["seed_restore_point_id"] = seed_restore_point_id
+        value["updated_at"] = stamp
         replicas[destination_id] = value
         metadata["replicas"] = replicas
         self.connection.execute(

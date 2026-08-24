@@ -114,9 +114,27 @@ class CompactReplicaExecutor:
             point, vm, destination = self._context(work)
             plan = self.plan_builder(task, point, vm.id, destination)
             files = getattr(plan, "files", ())
-            total_bytes = sum(max(0, int(item.payload_bytes)) for item in files) if files else 0
+            source_payload_bytes = sum(max(0, int(item.payload_bytes)) for item in files) if files else 0
+            total_bytes = source_payload_bytes
             processed_bytes = 0
             last_persist = 0.0
+
+            def selected_plan(selected):
+                nonlocal total_bytes, processed_bytes, last_persist
+                selected_files = getattr(selected, "files", ())
+                total_bytes = sum(max(0, int(item.payload_bytes)) for item in selected_files) if selected_files else 0
+                processed_bytes = 0
+                last_persist = 0.0
+                seed_id = getattr(selected, "seed_restore_point_id", None)
+                if str(point.kind.value if hasattr(point.kind, "value") else point.kind).upper() == "FULL":
+                    mode = "SEEDED_FULL" if seed_id else "FULL"
+                else:
+                    mode = "INCREMENTAL"
+                self.repository.update_replica_transfer_plan_v2(
+                    point.id, destination.id, transport_mode=mode,
+                    source_payload_bytes=source_payload_bytes, bytes_total=total_bytes,
+                    seed_restore_point_id=seed_id, updated_at=utcnow(),
+                )
 
             def progress(delta):
                 nonlocal processed_bytes, last_persist
@@ -132,11 +150,12 @@ class CompactReplicaExecutor:
                     last_persist = now
 
             transfer_kwargs = {"stop_event": self.stop_event}
-            if total_bytes > 0 and "progress_callback" in inspect.signature(self.client.transfer).parameters:
-                self.repository.update_replica_progress_v2(
-                    point.id, destination.id, bytes_processed=0,
-                    bytes_total=total_bytes, updated_at=utcnow(),
-                )
+            transfer_parameters = inspect.signature(self.client.transfer).parameters
+            if "plan_callback" in transfer_parameters:
+                transfer_kwargs["plan_callback"] = selected_plan
+            else:
+                selected_plan(plan)
+            if "progress_callback" in transfer_parameters:
                 transfer_kwargs["progress_callback"] = progress
 
             receipt = self.client.transfer(plan, destination, **transfer_kwargs)

@@ -465,3 +465,58 @@ def test_active_states_use_blue_live_progress_indicator():
     assert 'bytes_processed: replica.bytes_processed' in source
     assert '.active-status' in css
     assert '@keyframes vmbackupd-progress-slide' in css
+
+
+def test_expanded_backup_list_live_refreshes_without_closing_spoiler():
+    run_node(r"""
+(async () => {
+let generation = 0;
+request = async (method, params) => {
+    if (method === "restore_point.list") {
+        generation += 1;
+        return [{
+            id: `rp-${generation}`, job_run_id: `run-${generation}`, kind: "FULL",
+            status: "AVAILABLE", created_at: "2026-08-24T12:00:00+00:00",
+            storage_destination_id: "local", storage_name: "dir-test",
+            bundle_object_id: `/backup/rp-${generation}`, size_bytes: generation,
+            chain_id: `chain-${generation}`, sequence: 0,
+            parent_restore_point_id: null, replicas: [],
+        }];
+    }
+    if (method === "receiver.key.list") return [];
+    throw new Error(`unexpected method ${method}`);
+};
+const views = context.window.VmbackupViews;
+views.configure({ refresh: async () => {} });
+const model = {
+    status: {}, discoveredVms: [], registeredVms: [],
+    storage: [{ id: "local", name: "dir-test", storage_type: "LOCAL" }],
+    jobs: [{ id: "job-1", vm_id: "vm-1", name: "job", enabled: true,
+             storage_destination_id: "local", next_run_at: null }],
+    runs: [], runPage: { total: 0, limit: 5, offset: 0 }, recovery: [], received: [],
+    vmById: new Map([["vm-1", { id: "vm-1", name: "win10" }]]),
+    jobById: new Map(), now: new Date(),
+};
+views.renderModel(model);
+const show = buttons.find(button => button.textContent === "Show backups");
+await show.listeners.click();
+if (generation !== 1) throw new Error(`initial load count ${generation}`);
+await views.refreshExpandedBackups();
+if (generation !== 2) throw new Error(`live refresh count ${generation}`);
+function allText(node) {
+    if (!node) return "";
+    return String(node.textContent || "") + " " + (node.children || []).map(allText).join(" ");
+}
+const rendered = allText(nodes.get("jobs"));
+if (!rendered.includes("chain-2")) throw new Error(`new backup snapshot missing: ${rendered}`);
+if (!buttons.some(button => button.textContent === "Hide backups"))
+    throw new Error("expanded spoiler closed during live refresh");
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+
+
+def test_seeded_full_replica_renders_network_savings():
+    source = open("cockpit/vmbackupd/views.js", encoding="utf-8").read()
+    assert 'replica.transport_mode === "SEEDED_FULL"' in source
+    assert "Seeded FULL · transfer" in source
+    assert "source_payload_bytes" in source

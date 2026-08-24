@@ -243,3 +243,43 @@ def test_replica_byte_progress_is_persisted_and_exposed(tmp_path):
     assert status["bytes_processed"] == 25
     assert status["bytes_total"] == 100
     repo.close()
+
+
+def test_seeded_full_persists_actual_delta_transport_bytes(tmp_path):
+    repo, node, ssh = base(tmp_path)
+
+    class SeedAwareClient(Client):
+        def transfer(self, plan, destination, stop_event=None, progress_callback=None,
+                     plan_callback=None):
+            selected = SimpleNamespace(
+                **{k: getattr(plan, k) for k in ("transfer_id", "restore_point_id")},
+                files=(SimpleNamespace(payload_bytes=25),),
+                seed_restore_point_id="33333333-3333-4333-8333-333333333333",
+            )
+            if plan_callback:
+                plan_callback(selected)
+            if progress_callback:
+                progress_callback(25)
+            return {"transfer_id": plan.transfer_id,
+                    "storage_id": destination.remote_storage_id,
+                    "restore_point_id": plan.restore_point_id}
+
+    def source_plan(task, point, vm_id, destination):
+        return SimpleNamespace(
+            transfer_id=task.id,
+            restore_point_id=point.id,
+            files=(SimpleNamespace(payload_bytes=100),),
+            seed_restore_point_id=None,
+        )
+
+    CompactReplicaExecutor(
+        repo, node.id, SeedAwareClient(), plan_builder=source_plan
+    ).run_once()
+    status = repo.list_replica_statuses_v2("rp")[0]
+    assert status["state"] == "SUCCESS"
+    assert status["transport_mode"] == "SEEDED_FULL"
+    assert status["source_payload_bytes"] == 100
+    assert status["bytes_total"] == 25
+    assert status["bytes_processed"] == 25
+    assert status["seed_restore_point_id"] == "33333333-3333-4333-8333-333333333333"
+    repo.close()

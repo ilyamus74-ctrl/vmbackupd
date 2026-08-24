@@ -111,6 +111,8 @@
         );
 
         VmbackupViews.renderModel(model);
+        if (typeof VmbackupViews.refreshExpandedBackups === "function")
+            await VmbackupViews.refreshExpandedBackups();
 
         } finally {
             loading = false;
