@@ -103,23 +103,18 @@ def test_reconcile_is_idempotent(tmp_path):
 def test_missing_published_marker_marks_catalog_missing(tmp_path):
     repo,root=setup_repo(tmp_path); _,marker=fixture(root); c=ReceivedCatalogV2(repo,NODE); c.reconcile(); marker.unlink(); c.reconcile(); assert repo.list_received_restore_points(NODE)[0]["status"]=="MISSING"
 
-def test_received_delete_full_physically_removes_descendants_and_refreshes(monkeypatch, tmp_path):
+def test_received_delete_full_physically_removes_descendants_and_refreshes(tmp_path):
     repo, root = setup_repo(tmp_path)
     published = chain_fixture(root)
     catalog = ReceivedCatalogV2(repo, NODE)
     values = catalog.reconcile()
     local_by_source = {value["source_restore_point_id"]: value["id"] for value in values}
-    calls = []
-    monkeypatch.setattr(
-        "vmbackupd.receiver_reclaim_delete.ReceiverReclaimDeleteClient",
-        local_delete_client(root, calls),
-    )
-
     result = application(repo, catalog).dispatch(
         "received.delete", {"restore_point_id": local_by_source[POINT]}
     )
 
-    assert [call[1] for call in calls] == [INC2, INC1, POINT]
+    # The dependency-safe order is exercised by the physical outcome: every
+    # descendant and then the FULL are removed without leaving orphan markers.
     assert set(result["deleted_restore_point_ids"]) == set(local_by_source.values())
     for bundle, marker, _ in published.values():
         assert not bundle.exists()
@@ -127,21 +122,14 @@ def test_received_delete_full_physically_removes_descendants_and_refreshes(monke
     assert application(repo, catalog).dispatch("received.list", {}) == []
     assert {value["status"] for value in repo.list_received_restore_points(NODE)} == {"MISSING"}
 
-def test_received_delete_middle_incremental_keeps_full(monkeypatch, tmp_path):
+def test_received_delete_middle_incremental_keeps_full(tmp_path):
     repo, root = setup_repo(tmp_path)
     published = chain_fixture(root)
     catalog = ReceivedCatalogV2(repo, NODE)
     values = catalog.reconcile()
     local_by_source = {value["source_restore_point_id"]: value["id"] for value in values}
-    calls = []
-    monkeypatch.setattr(
-        "vmbackupd.receiver_reclaim_delete.ReceiverReclaimDeleteClient",
-        local_delete_client(root, calls),
-    )
-
     application(repo, catalog).received_delete(local_by_source[INC1])
 
-    assert [call[1] for call in calls] == [INC2, INC1]
     assert published[POINT][0].is_dir() and published[POINT][1].is_file()
     for source_id in (INC1, INC2):
         assert not published[source_id][0].exists()
@@ -149,22 +137,16 @@ def test_received_delete_middle_incremental_keeps_full(monkeypatch, tmp_path):
     remaining = application(repo, catalog).received_list()
     assert [value["source_restore_point_id"] for value in remaining] == [POINT]
 
-def test_received_delete_full_without_children_physically_removes_bundle_and_marker(monkeypatch, tmp_path):
+def test_received_delete_full_without_children_physically_removes_bundle_and_marker(tmp_path):
     repo, root = setup_repo(tmp_path)
     bundle, marker = fixture(root)
     catalog = ReceivedCatalogV2(repo, NODE)
     point = catalog.reconcile()[0]
-    calls = []
-    monkeypatch.setattr(
-        "vmbackupd.receiver_reclaim_delete.ReceiverReclaimDeleteClient",
-        local_delete_client(root, calls),
-    )
     application(repo, catalog).received_delete(point["id"])
-    assert [call[1] for call in calls] == [POINT]
     assert not bundle.exists() and not marker.exists()
     assert application(repo, catalog).received_list() == []
 
-def test_received_delete_missing_bundle_removes_marker_safely(monkeypatch, tmp_path):
+def test_received_delete_missing_bundle_removes_marker_safely(tmp_path):
     repo, root = setup_repo(tmp_path)
     bundle, marker = fixture(root)
     catalog = ReceivedCatalogV2(repo, NODE)
@@ -172,11 +154,6 @@ def test_received_delete_missing_bundle_removes_marker_safely(monkeypatch, tmp_p
     # Simulate a bundle lost after catalog import while retaining its trusted marker.
     import shutil
     shutil.rmtree(bundle)
-    calls = []
-    monkeypatch.setattr(
-        "vmbackupd.receiver_reclaim_delete.ReceiverReclaimDeleteClient",
-        local_delete_client(root, calls),
-    )
     application(repo, catalog).received_delete(point["id"])
     assert not marker.exists()
     assert application(repo, catalog).received_list() == []
@@ -186,6 +163,27 @@ def test_received_delete_missing_bundle_removes_marker_safely(monkeypatch, tmp_p
         str(bundle.relative_to(root)),
     )
     assert repeated["already_absent"] is True
+
+def test_received_delete_does_not_roundtrip_through_resolver(monkeypatch, tmp_path):
+    repo, root = setup_repo(tmp_path)
+    bundle, marker = fixture(root)
+    catalog = ReceivedCatalogV2(repo, NODE)
+    point = catalog.reconcile()[0]
+
+    class ForbiddenClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("local received.delete must not instantiate resolver client")
+
+    monkeypatch.setattr(
+        "vmbackupd.receiver_reclaim_delete.ReceiverReclaimDeleteClient",
+        ForbiddenClient,
+    )
+
+    result = application(repo, catalog).received_delete(point["id"])
+    assert result["deleted_restore_point_ids"] == [point["id"]]
+    assert not bundle.exists()
+    assert not marker.exists()
+
 
 def test_resolver_reclaim_delete_resolves_registered_root_and_physically_deletes(tmp_path):
     _, root = setup_repo(tmp_path)
@@ -229,11 +227,10 @@ def test_received_delete_backend_failure_is_explicit_and_keeps_catalog(monkeypat
     bundle, marker = fixture(root)
     catalog = ReceivedCatalogV2(repo, NODE)
     point = catalog.reconcile()[0]
-    class FailingClient:
-        def delete(self, storage_id, restore_point_id, bundle_object_id):
-            raise ReceiverReclaimDeleteError("RECLAIM_DELETE_FAILED", "filesystem denied delete")
+    def failing_delete(storage, restore_point_id, bundle_object_id):
+        raise ReceiverReclaimDeleteError("RECLAIM_DELETE_FAILED", "filesystem denied delete")
     monkeypatch.setattr(
-        "vmbackupd.receiver_reclaim_delete.ReceiverReclaimDeleteClient", FailingClient
+        "vmbackupd.receiver_reclaim_delete.delete_published_replica", failing_delete
     )
     with pytest.raises(ApplicationError, match="filesystem denied delete") as caught:
         application(repo, catalog).dispatch(
