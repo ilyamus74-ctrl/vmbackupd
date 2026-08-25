@@ -5,8 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vmbackupd"
 version = "0.1.1"
-description = "Core domain layer for a KVM/libvirt backup management daemon"
+description = "KVM/libvirt backup management daemon"
+readme = "README.md"
 requires-python = ">=3.11"
+license = "GPL-3.0-or-later"
+authors = [{ name = "Illia Chykalov" }]
 dependencies = []
 
 [project.scripts]
@@ -23,3 +26,8 @@ where = ["src"]
 addopts = "-q"
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[project.urls]
+Homepage = "https://github.com/ilyamus74-ctrl/vmbackupd"
+Repository = "https://github.com/ilyamus74-ctrl/vmbackupd"
+Issues = "https://github.com/ilyamus74-ctrl/vmbackupd/issues"
