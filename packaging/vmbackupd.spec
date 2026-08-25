@@ -153,8 +153,19 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-resolver@.service \
 %{_mandir}/man8/vmbackupd.8*
 %{_mandir}/man1/vmbackupctl.1*
 
+%dir %{_sysconfdir}/vmbackupd
 %config(noreplace) %{_sysconfdir}/vmbackupd/vmbackupd.toml
 %config(noreplace) %{_sysconfdir}/vmbackupd/receiver_sshd_config
+
+%ghost %attr(2750,vmbackupd,vmbackupd-admin) %dir /run/vmbackupd
+%ghost %attr(0750,vmbackupd,vmbackupd) %dir /var/lib/vmbackupd
+%ghost %attr(0750,vmbackupd,vmbackupd) %dir /var/lib/vmbackupd/control
+%ghost %attr(0700,vmbackupd,vmbackupd) %dir /var/lib/vmbackupd/ssh
+%ghost %attr(0700,vmbackupd,vmbackupd) %dir /var/lib/vmbackupd/ssh/identities
+%ghost %attr(0700,vmbackupd,vmbackupd) %dir /var/lib/vmbackupd/receiver
+%ghost %attr(0700,root,root) %dir /var/lib/vmbackupd/receiver-host
+%ghost %attr(0750,vmbackupd,qemu) %dir /var/lib/libvirt/images/vmbackupd
+%ghost %attr(0750,vmbackupd-transfer,vmbackupd-transfer) %dir /srv/vmbackupd
 
 %{_datadir}/polkit-1/rules.d/60-vmbackupd-libvirt.rules
 
