@@ -1,4 +1,4 @@
-%{!?upstream_version:%global upstream_version 0.1.1}
+%{!?upstream_version:%global upstream_version 0.1.2}
 
 Name:           vmbackupd
 Version:        %{upstream_version}
@@ -185,6 +185,11 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-resolver@.service \
 %{_datadir}/cockpit/vmbackupd/
 
 %changelog
+* Tue Aug 25 2026 Illia Chykalov <ilyamus74@gmail.com> - 0.1.2-1
+- Add manual pages for vmbackupd and vmbackupctl
+- Add project and maintainer metadata
+- Clean up Fedora RPM packaging
+
 * Tue Aug 25 2026 Illia Chykalov <ilyamus74@gmail.com> - 0.1.1-1
 - Release vmbackupd 0.1.1
 - License the project under GPL-3.0-or-later
