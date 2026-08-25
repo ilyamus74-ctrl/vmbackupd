@@ -4,7 +4,8 @@ Name:           vmbackupd
 Version:        %{upstream_version}
 Release:        10%{?dist}
 Summary:        Local KVM/libvirt backup management daemon
-License:        LicenseRef-Proprietary
+License:        GPL-3.0-or-later
+URL:            https://github.com/ilyamus74-ctrl/vmbackupd
 Source0:        %{name}-%{version}.tar.gz
 Source1:        vmbackupd.service
 Source2:        vmbackupd.sysusers
@@ -134,6 +135,7 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-resolver@.service \
 %systemd_postun vmbackupd-receiver-resolver.socket
 
 %files -f %{pyproject_files}
+%license LICENSE
 %doc docs/*.md
 
 %{_bindir}/vmbackupd
