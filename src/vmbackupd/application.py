@@ -1927,17 +1927,27 @@ class VmbackupApplication:
         if not candidates:
             raise ApplicationError("NOT_FOUND", "received restore point not found")
 
-        # Do not delete receiver data directly from the main daemon.  The
-        # daemon is intentionally sandboxed and configured LOCAL storage roots
-        # may live outside its ReadWritePaths (for example /STOR).  Route the
-        # destructive operation through the restricted receiver resolver
-        # helper, which resolves the storage ID and performs the same checked
-        # publication delete used by SSH retention.
+        # This is a *local* administrator action against a published replica
+        # that already belongs to a registered LOCAL destination on this node.
+        # Do not bounce the request through receiver-resolver here: the resolver
+        # resolves storage IDs by calling storage.list back through the daemon's
+        # Unix API.  received.delete itself runs inside that daemon request, so
+        # a synchronous resolver round-trip deadlocks the event loop and the
+        # resolver's callback connection eventually breaks.
+        #
+        # Remote SSH retention still uses the restricted resolver path.  For
+        # this local action we call the same constrained physical-delete helper
+        # directly with the already-validated registered LOCAL root.  The helper
+        # still validates object IDs, publication marker identity and symlinks
+        # before removing anything.
         from .receiver_reclaim_delete import (
-            ReceiverReclaimDeleteClient,
             ReceiverReclaimDeleteError,
+            delete_published_replica,
         )
-        deleter = ReceiverReclaimDeleteClient()
+        storage = {
+            "storage_id": destination.id,
+            "backup_data_root": destination.backup_data_root,
+        }
         deleted = []
         for value in candidates:
             source_id = value.get("source_restore_point_id")
@@ -1948,7 +1958,7 @@ class VmbackupApplication:
                     "received backup is missing publication identity",
                 )
             try:
-                deleter.delete(destination.id, source_id, object_id)
+                delete_published_replica(storage, source_id, object_id)
             except ReceiverReclaimDeleteError as exc:
                 raise ApplicationError(exc.code, str(exc)) from exc
             deleted.append(value["id"])
