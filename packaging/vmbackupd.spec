@@ -1,11 +1,12 @@
-%{!?upstream_version:%global upstream_version 0.1.0}
+%{!?upstream_version:%global upstream_version 0.1.1}
 
 Name:           vmbackupd
 Version:        %{upstream_version}
-Release:        9%{?dist}
+Release:        1%{?dist}
 Summary:        Local KVM/libvirt backup management daemon
-License:        LicenseRef-Proprietary
-Source0:        %{name}-%{version}.tar.gz
+License:        GPL-3.0-or-later
+URL:            https://github.com/ilyamus74-ctrl/vmbackupd
+Source0:        %{url}/archive/refs/tags/v%{version}/%{name}-%{version}.tar.gz
 Source1:        vmbackupd.service
 Source2:        vmbackupd.sysusers
 Source3:        vmbackupd.tmpfiles
@@ -41,8 +42,8 @@ Obsoletes:      cockpit-vmbackupd < %{version}-%{release}
 %description
 vmbackupd is a persistent local daemon and UNIX-socket control plane for
 conservative KVM/libvirt backup orchestration. The package includes the
-vmbackupctl console client. The optional Cockpit frontend is shipped as the
-separate cockpit-vmbackupd binary package from this source build.
+vmbackupctl console client and the Cockpit web frontend for managing
+backups, storage destinations, replication, and restore operations.
 
 %prep
 %autosetup -p1
@@ -134,6 +135,7 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-resolver@.service \
 %systemd_postun vmbackupd-receiver-resolver.socket
 
 %files -f %{pyproject_files}
+%license LICENSE
 %doc docs/*.md
 
 %{_bindir}/vmbackupd
