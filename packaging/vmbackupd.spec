@@ -20,9 +20,8 @@ Requires:       python3
 Requires:       openssh-clients
 Requires:       openssh-server
 Requires:       cockpit-bridge >= 215
-Requires:       libvirt-client
+Requires:       /usr/bin/virsh
 Requires:       qemu-img
-Requires:       libvirt-daemon-driver-qemu
 Requires:       systemd
 Requires:       acl
 Requires:       polkit
@@ -53,6 +52,12 @@ backups, storage destinations, replication, and restore operations.
 
 %build
 %pyproject_wheel
+
+%check
+PYTHONPATH=src %{python3} -m compileall -q src/vmbackupd
+PYTHONPATH=src %{python3} -c "import vmbackupd"
+PYTHONPATH=src %{python3} -c "from vmbackupd.daemon import main"
+PYTHONPATH=src %{python3} -c "from vmbackupd.cli import main"
 
 %install
 %pyproject_install
@@ -173,6 +178,12 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-resolver@.service \
 %{_datadir}/cockpit/vmbackupd/
 
 %changelog
+* Tue Aug 25 2026 Illia Chykalov <packagers@example.invalid> - 0.1.1-1
+- Release vmbackupd 0.1.1
+- License the project under GPL-3.0-or-later
+- Publish upstream sources on GitHub
+- Include the Stage49 received-backup delete deadlock fix
+
 * Thu Aug 20 2026 vmbackupd packagers <packagers@example.invalid> - 0.1.0-7
 - Abort rejected PLANNED reclaim operations before destructive work begins
 - Prevent replica, policy, or snapshot safety refusals from leaving stale reclaim operations
