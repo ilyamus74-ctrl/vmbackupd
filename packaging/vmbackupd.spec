@@ -2,11 +2,11 @@
 
 Name:           vmbackupd
 Version:        %{upstream_version}
-Release:        10%{?dist}
+Release:        11%{?dist}
 Summary:        Local KVM/libvirt backup management daemon
 License:        GPL-3.0-or-later
 URL:            https://github.com/ilyamus74-ctrl/vmbackupd
-Source0:        %{name}-%{version}.tar.gz
+Source0:        %{url}/archive/refs/tags/v%{version}/%{name}-%{version}.tar.gz
 Source1:        vmbackupd.service
 Source2:        vmbackupd.sysusers
 Source3:        vmbackupd.tmpfiles
@@ -16,6 +16,7 @@ BuildArch:      noarch
 BuildRequires:  python3-devel
 BuildRequires:  pyproject-rpm-macros
 BuildRequires:  systemd-rpm-macros
+BuildRequires:  python3-pytest
 Requires:       python3
 Requires:       openssh-clients
 Requires:       openssh-server
@@ -53,6 +54,9 @@ separate cockpit-vmbackupd binary package from this source build.
 
 %build
 %pyproject_wheel
+
+%check
+%pytest
 
 %install
 %pyproject_install
@@ -173,6 +177,12 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-resolver@.service \
 %{_datadir}/cockpit/vmbackupd/
 
 %changelog
+* Tue Aug 25 2026 Illia Chykalov <packagers@example.invalid> - 0.1.0-11
+- License the project under GPL-3.0-or-later
+- Add upstream project URL and tagged source archive
+- Run the test suite during package builds
+- Prepare packaging for Fedora review
+
 * Thu Aug 20 2026 vmbackupd packagers <packagers@example.invalid> - 0.1.0-7
 - Abort rejected PLANNED reclaim operations before destructive work begins
 - Prevent replica, policy, or snapshot safety refusals from leaving stale reclaim operations
