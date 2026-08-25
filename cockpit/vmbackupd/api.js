@@ -39,6 +39,7 @@
         "restore_point.delete",
         "replica.retry",
         "received.list",
+        "received.delete",
         "received.restore.create",
         "restore.list",
         "recovery.list",

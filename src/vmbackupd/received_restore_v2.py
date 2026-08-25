@@ -135,7 +135,7 @@ class ReceivedRestoreRuntimeV2:
         if target.exists():
             raise ReceivedRestoreError("RESTORE_TARGET_EXISTS", "target folder already exists")
 
-        local_roots = []
+        local_destinations = []
         for destination in self.repository.list_storage_destinations(self.node_id):
             storage_type = getattr(destination.storage_type, "value", destination.storage_type)
             if str(storage_type).upper() != "LOCAL":
@@ -144,10 +144,11 @@ class ReceivedRestoreRuntimeV2:
             if not root.is_absolute() or not root.is_dir():
                 continue
             try:
-                local_roots.append(root.resolve(strict=True))
+                resolved_root = root.resolve(strict=True)
             except OSError:
                 continue
-        if not local_roots:
+            local_destinations.append((resolved_root, destination))
+        if not local_destinations:
             raise ReceivedRestoreError("RESTORE_TARGET_STORAGE_UNAVAILABLE", "no writable LOCAL storage root is available")
 
         # Walk through already-existing ancestors so a symlink cannot escape the
@@ -155,7 +156,7 @@ class ReceivedRestoreRuntimeV2:
         # and are created below that root.
         matching_root = None
         lexical = target.absolute()
-        for root in local_roots:
+        for root, _destination in local_destinations:
             try:
                 lexical.relative_to(root)
             except ValueError:
@@ -191,8 +192,8 @@ class ReceivedRestoreRuntimeV2:
             raise ReceivedRestoreError("RESTORE_TARGET_NOT_WRITABLE", "vmbackupd cannot write to target parent folder")
 
         destination = next(
-            item for item in self.repository.list_storage_destinations(self.node_id)
-            if str(Path(item.backup_data_root).resolve(strict=True)) == str(matching_root)
+            item for root, item in local_destinations
+            if root == matching_root
         )
         return target, matching_root, destination
 

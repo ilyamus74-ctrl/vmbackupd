@@ -460,7 +460,10 @@ def helper_main(
     )
 
     try:
-        if operation == "fetch_manifest":
+        if operation in {"fetch_manifest", "reclaim_delete"}:
+            # Immutable fetch and deletion address an already-published object.
+            # They need a registered LOCAL root, but must not depend on current
+            # transfer capacity or on the staging namespace being ready.
             storage = resolve_receiver_storage_readonly(
                 client,
                 request.get(

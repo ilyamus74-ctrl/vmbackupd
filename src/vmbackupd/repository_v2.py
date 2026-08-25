@@ -3547,6 +3547,57 @@ class RepositoryV2:
                 return value
         return None
 
+    def received_restore_delete_order_v2(self, restore_point_id, node_id):
+        """Return the selected received point and descendants, children first.
+
+        The compact schema stores received dependency identity in
+        restore_points.metadata_json.  Deletion follows those stable local
+        restore-point IDs rather than assuming that sequence numbers alone
+        describe a linear chain.
+        """
+        values = self.list_received_restore_points(node_id)
+        by_id = {value["id"]: value for value in values}
+        selected = by_id.get(restore_point_id)
+        if selected is None:
+            return []
+
+        storage_id = selected["storage_destination_id"]
+        chain_id = selected.get("chain_id")
+        children = {}
+        for value in values:
+            if (
+                value["storage_destination_id"] == storage_id
+                and value.get("chain_id") == chain_id
+            ):
+                parent_id = value.get("parent_restore_point_id")
+                if parent_id:
+                    children.setdefault(parent_id, []).append(value)
+
+        ordered = []
+        active = set()
+        visited = set()
+
+        def visit(value):
+            ident = value["id"]
+            if ident in active:
+                raise DomainInvariantError("RECEIVED_DELETE_CHAIN_CYCLE")
+            if ident in visited:
+                return
+            active.add(ident)
+            descendants = sorted(
+                children.get(ident, ()),
+                key=lambda item: (int(item.get("sequence", 0)), item["id"]),
+                reverse=True,
+            )
+            for child in descendants:
+                visit(child)
+            active.remove(ident)
+            visited.add(ident)
+            ordered.append(value)
+
+        visit(selected)
+        return ordered
+
     def received_restore_chain_v2(self, restore_point_id, node_id):
         values={value["id"]:value for value in self.list_received_restore_points(node_id)}
         current=values.get(restore_point_id)

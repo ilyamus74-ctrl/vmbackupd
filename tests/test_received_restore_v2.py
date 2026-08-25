@@ -117,3 +117,44 @@ def test_received_restore_rejects_target_outside_registered_local_storage(tmp_pa
     result=runtime.advance(op.id)
     assert result.state.value=="FAILED"
     assert "OUTSIDE_LOCAL_STORAGE" in (result.error or "")
+
+
+def test_received_restore_ignores_missing_ssh_system_staging_destination(tmp_path):
+    repo,root=setup(tmp_path)
+    missing_ssh_root=tmp_path/"ssh"/"system-staging"
+    now=datetime.now(timezone.utc).isoformat()
+    repo.connection.execute(
+        "INSERT INTO storage_destinations VALUES(?,?,?,?,?,?)",
+        (
+            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", NODE, "__system_ssh_identity__", "SSH",
+            json.dumps({
+                "backup_data_root":str(missing_ssh_root),
+                "backup_data_mode":"0750",
+                "backup_data_gid":os.getgid(),
+                "minimum_free_bytes":0,
+                "minimum_free_percent":0,
+                "ssh_host":"localhost",
+                "ssh_port":22022,
+                "ssh_user":"vmbackupd-transfer",
+                "ssh_remote_root":"/srv/vmbackupd",
+                "is_default":False,
+            }),
+            now,
+        ),
+    )
+    repo.connection.commit()
+    assert not missing_ssh_root.exists()
+
+    full_path=bundle(root,"full-no-system-staging",FULL,"FULL",0,None)
+    import_point(repo,root,"local-full-no-system-staging",FULL,"FULL",0,None,"local-run-no-system-staging",full_path)
+    target=root/"restored-vms"/"restored-no-system-staging"
+    op=repo.create_received_restore_operation_v2(
+        "local-full-no-system-staging",NODE,"restored-no-system-staging",str(target),Clock().now()
+    )
+    read=ReadDriver(); mutation=MutationDriver(read)
+    runtime=Runtime(repo,NODE,Runner(),read,mutation,Clock(),True)
+    result=runtime.advance(op.id)
+
+    assert result.state.value=="SUCCESS"
+    assert target.joinpath("disks/vda.qcow2").is_file()
+    assert not missing_ssh_root.exists()

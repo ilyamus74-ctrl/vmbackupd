@@ -527,7 +527,49 @@ def test_seeded_full_replica_renders_network_savings():
     assert "source_payload_bytes" in source
 
 
-def test_received_backup_delete_action_is_wired():
-    source = open("cockpit/vmbackupd/views.js", encoding="utf-8").read()
-    assert 'api.request("received.delete"' in source
-    assert 'actionButton("Delete", () => deleteReceivedBackup(point)' in source
+def test_received_backup_delete_calls_exact_rpc_refreshes_and_surfaces_failure():
+    run_node(r"""
+(async () => {
+    const calls = [];
+    let refreshCount = 0;
+    let confirmCount = 0;
+    context.window.confirm = () => { confirmCount += 1; return true; };
+    request = async (method, params) => {
+        calls.push([method, params]);
+        return { deleted_restore_point_ids: [params.restore_point_id] };
+    };
+    const views = context.window.VmbackupViews;
+    views.configure({ refresh: async () => { refreshCount += 1; } });
+    const point = {
+        id: "received-point-1", kind: "FULL", status: "AVAILABLE",
+        vm_name: "received-vm", storage_destination_id: "storage-1",
+        created_at: "2026-08-24T10:00:00+00:00", origin: {},
+    };
+    views.renderModel({
+        status: { runtime_state: "RUNNING", libvirt_mutation_enabled: true },
+        discoveredVms: [], registeredVms: [], storage: [], jobs: [], runs: [],
+        runPage: { total: 0, limit: 5, offset: 0 }, recovery: [], restores: [],
+        received: [point], vmById: new Map(), jobById: new Map(), now: new Date(),
+        successfulToday: 0, failedToday: 0, active: 0, recoveryRequired: 0,
+    });
+    const remove = buttons.find(button => button.textContent === "Delete");
+    if (!remove || typeof remove.listeners.click !== "function")
+        throw new Error("received Delete handler missing");
+    await remove.listeners.click();
+    if (confirmCount !== 1) throw new Error(`confirmation count ${confirmCount}`);
+    const deleteCalls = calls.filter(([method]) => method === "received.delete");
+    if (deleteCalls.length !== 1 || deleteCalls[0][1].restore_point_id !== point.id)
+        throw new Error(`wrong delete RPC ${JSON.stringify(calls)}`);
+    if (refreshCount !== 1) throw new Error(`refresh count ${refreshCount}`);
+
+    request = async () => { throw new ApiError("RECLAIM_DELETE_FAILED", "permission denied"); };
+    await remove.listeners.click();
+    const notice = nodes.get("notice");
+    if (!notice.textContent.includes("RECLAIM_DELETE_FAILED") ||
+        !notice.textContent.includes("permission denied"))
+        throw new Error(`backend error hidden: ${notice.textContent}`);
+    if (refreshCount !== 1) throw new Error("failed delete refreshed the catalog");
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+    api_source = open("cockpit/vmbackupd/api.js", encoding="utf-8").read()
+    assert '"received.delete"' in api_source

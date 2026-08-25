@@ -1917,18 +1917,15 @@ class VmbackupApplication:
         if destination.storage_type is not StorageType.LOCAL:
             raise ApplicationError("RECEIVED_DELETE_STORAGE_INVALID", "received backup storage must be LOCAL")
 
-        # Deleting a base or middle incremental must also remove all descendants
-        # so the receiver can never be left with an orphan chain.
-        values = self.repository.list_received_restore_points(self.node.id)
-        chain_id = point.get("chain_id")
-        selected_sequence = int(point.get("sequence", 0))
-        candidates = [
-            value for value in values
-            if value.get("storage_destination_id") == point.get("storage_destination_id")
-            and value.get("chain_id") == chain_id
-            and int(value.get("sequence", 0)) >= selected_sequence
-        ]
-        candidates.sort(key=lambda value: int(value.get("sequence", 0)), reverse=True)
+        # Delete only graph descendants of the selected received point.  This
+        # preserves its FULL/base when deleting a middle incremental and also
+        # handles a branched chain without relying on display names or sequence
+        # numbers as identity.
+        candidates = self.repository.received_restore_delete_order_v2(
+            point["id"], self.node.id
+        )
+        if not candidates:
+            raise ApplicationError("NOT_FOUND", "received restore point not found")
 
         # Do not delete receiver data directly from the main daemon.  The
         # daemon is intentionally sandboxed and configured LOCAL storage roots
