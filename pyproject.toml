@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vmbackupd"
-version = "0.1.2"
+version = "0.1.3"
 description = "KVM/libvirt backup management daemon"
 readme = "README.md"
 requires-python = ">=3.11"
-license = "GPL-3.0-or-later"
+license = { file = "LICENSE" }
 authors = [{ name = "Illia Chykalov", email = "ilyamus74@gmail.com" }]
 dependencies = []
 
