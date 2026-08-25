@@ -1,0 +1,21 @@
+.TH VMBACKUPD 8 "August 2026" "vmbackupd 0.1.1" "System Administration"
+.SH NAME
+vmbackupd \- KVM/libvirt virtual machine backup management daemon
+.SH SYNOPSIS
+.B vmbackupd
+.SH DESCRIPTION
+.B vmbackupd
+is a persistent local daemon for KVM/libvirt virtual machine backup,
+replication, retention, and restore orchestration.
+
+The daemon exposes a local control API and integrates with the vmbackupd
+Cockpit frontend.
+
+Configuration is stored in
+.IR /etc/vmbackupd/vmbackupd.toml .
+.SH SEE ALSO
+.BR vmbackupctl (1),
+.BR virsh (1),
+.BR systemctl (1)
+.SH LICENSE
+GPL-3.0-or-later.

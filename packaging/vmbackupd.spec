@@ -62,6 +62,10 @@ PYTHONPATH=src %{python3} -c "from vmbackupd.cli import main"
 %install
 %pyproject_install
 %pyproject_save_files vmbackupd
+install -Dpm 0644 docs/man/vmbackupd.8 \
+    %{buildroot}%{_mandir}/man8/vmbackupd.8
+install -Dpm 0644 docs/man/vmbackupctl.1 \
+    %{buildroot}%{_mandir}/man1/vmbackupctl.1
 install -Dpm 0644 %{SOURCE1} %{buildroot}%{_unitdir}/vmbackupd.service
 install -Dpm 0644 %{SOURCE2} %{buildroot}%{_sysusersdir}/vmbackupd.conf
 install -Dpm 0644 %{SOURCE3} %{buildroot}%{_tmpfilesdir}/vmbackupd.conf
@@ -146,6 +150,9 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-resolver@.service \
 %{_bindir}/vmbackupd
 %{_bindir}/vmbackupctl
 
+%{_mandir}/man8/vmbackupd.8*
+%{_mandir}/man1/vmbackupctl.1*
+
 %config(noreplace) %{_sysconfdir}/vmbackupd/vmbackupd.toml
 %config(noreplace) %{_sysconfdir}/vmbackupd/receiver_sshd_config
 
@@ -178,7 +185,7 @@ install -Dpm 0644 packaging/receiver/vmbackupd-receiver-resolver@.service \
 %{_datadir}/cockpit/vmbackupd/
 
 %changelog
-* Tue Aug 25 2026 Illia Chykalov <packagers@example.invalid> - 0.1.1-1
+* Tue Aug 25 2026 Illia Chykalov <ilyamus74@gmail.com> - 0.1.1-1
 - Release vmbackupd 0.1.1
 - License the project under GPL-3.0-or-later
 - Publish upstream sources on GitHub
